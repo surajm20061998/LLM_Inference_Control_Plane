@@ -1,0 +1,31 @@
+# Development overlay for the local kind cluster.
+#
+# It exists for exactly one reason: during development the operator image is
+# republished under a MUTABLE tag (:dev). Kubernetes defaults imagePullPolicy to
+# IfNotPresent for any tag other than :latest, so a node that has already pulled
+# :dev will keep running the old binary forever — `kubectl rollout restart`
+# included, because a restart re-creates pods but does not invalidate the node's
+# image cache.
+#
+# The failure mode is genuinely nasty: the deploy appears to succeed, the
+# rollout reports success, and the controller silently continues running
+# yesterday's code. Debugging that means suspecting your own source before
+# suspecting the cache.
+#
+# The base config/default deliberately does NOT set Always — pulling on every
+# pod start is the wrong default for a real cluster, where images are tagged
+# immutably and the registry is not one hop away.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../default
+
+patches:
+  - target:
+      kind: Deployment
+      name: controller-manager
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always

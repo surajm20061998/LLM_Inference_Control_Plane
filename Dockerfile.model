@@ -1,0 +1,23 @@
+# Model image: ships model weights as their own OCI artifact.
+#
+# The weights are a SEPARATE image from the engine, deliberately. Baking them
+# into the engine image would couple the model's version to the server's, so
+# "upgrade the engine, keep the model" and "swap the model, keep the engine"
+# would be the same operation — and a later sprint needs to canary each of those
+# changes independently.
+#
+# busybox rather than scratch: the operator delivers weights with an init
+# container that runs `cp`, so the image must provide that utility. The cost is
+# roughly 4 MB, which is noise next to any real model file.
+#
+# Build via `make model-image`, which stages the build context so that this
+# Dockerfile never has to copy the whole repository.
+FROM busybox:1.37
+
+# The weights live at /weights, NOT at /models. /models is where the operator
+# mounts the shared volume inside the engine container; if the source lived at
+# the same path, the mount would shadow the very file being copied.
+COPY model.gguf /weights/model.gguf
+
+# Nothing to run: this image exists to be read by an init container.
+CMD ["/bin/true"]

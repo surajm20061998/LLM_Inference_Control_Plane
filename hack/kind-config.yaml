@@ -1,0 +1,43 @@
+# kind cluster for the LLM Inference Control Plane local development loop.
+#
+# Three nodes rather than one: a single-node cluster hides scheduling entirely,
+# and this operator's whole purpose is rolling out and comparing replicas across
+# nodes. Two workers is the minimum that makes pod placement observable.
+#
+# The node image is pinned by digest. kind's default node image tracks the
+# kind release, so an unpinned cluster silently changes Kubernetes version when
+# kind is upgraded — which is exactly the kind of drift that turns a working
+# demo into a debugging session.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: llmcp
+
+# Point containerd at a per-registry config directory. This is what allows
+# hosts.toml files written by hack/kind-with-registry.sh to redirect
+# localhost:5001 to the registry container running on the kind network.
+#
+# Without this, every node would try to resolve localhost:5001 inside its own
+# network namespace, where nothing is listening.
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # Reserved for an ingress/gateway in a later sprint. Harmless until then.
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+  - role: worker
+  - role: worker

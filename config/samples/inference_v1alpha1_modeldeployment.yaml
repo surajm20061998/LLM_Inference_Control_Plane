@@ -1,0 +1,76 @@
+# Sprint 1 development sample.
+#
+# This runs the DETERMINISTIC STUB engine, not llama.cpp. The stub speaks the
+# same OpenAI-compatible surface and mimics llama.cpp's health semantics
+# (503 while loading, 200 once ready), so the operator's real llamacpp profile
+# code path is exercised unchanged — it is selected purely by overriding
+# spec.engine.image, which is why there is no `fake` engine type in the API.
+#
+# The point is reproducibility: a real model's latency varies enough that
+# rollout and, later, canary assertions become flaky. The stub's timings are
+# configured, not measured.
+#
+# Apply with:
+#   make kind-up dev-deploy
+#   kubectl apply -f config/samples/inference_v1alpha1_modeldeployment.yaml
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: demo
+  labels:
+    app.kubernetes.io/name: llmcp
+spec:
+  # Total replicas across all variants. This is the field the /scale
+  # subresource writes, so `kubectl scale` and any HPA land here.
+  replicas: 2
+
+  model:
+    # Echoed at GET /v1/models and used as the `model` label on metrics.
+    name: demo-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        # Where the file lives inside the model image (see Dockerfile.model).
+        path: /weights/model.gguf
+        # Always, because the :dev tag is mutable during development and
+        # IfNotPresent would pin every node to whatever it first pulled.
+        pullPolicy: Always
+
+  engine:
+    type: llamacpp
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 4
+    env:
+      # Stub timings. TTFT is deliberately well above ITL so that a proxy
+      # measuring time-to-first-token has something unambiguous to observe.
+      - name: LLMCP_FAKE_LOAD_MS
+        value: "2000"
+      - name: LLMCP_FAKE_TTFT_MS
+        value: "120"
+      - name: LLMCP_FAKE_ITL_MS
+        value: "15"
+      - name: LLMCP_FAKE_TOKENS
+        value: "24"
+      - name: LLMCP_FAKE_ERROR_RATE
+        value: "0"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        # The CPU limit is what the engine's thread count is derived from.
+        cpu: "1"
+        memory: 128Mi
+
+  serving:
+    port: 8080
+    startupTimeout: 120s
+
+  rollout:
+    type: RollingUpdate
+    maxSurge: 1
+    maxUnavailable: 0
+    progressDeadline: 300s
+    autoRollback: true

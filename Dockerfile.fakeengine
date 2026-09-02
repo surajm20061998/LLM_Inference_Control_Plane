@@ -1,0 +1,32 @@
+# Build the deterministic fake inference engine used by CI and the e2e tests.
+#
+# The builder stage is pinned to $BUILDPLATFORM and cross-compiles with GOARCH
+# instead of running under QEMU: emulated builds of the Go toolchain are an
+# order of magnitude slower, and nothing here needs CGO.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+# Copy the module manifests first so the dependency layer is cached across
+# source changes.
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+
+# Copy the Go source (relies on .dockerignore to filter)
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -a -o /out/fakeengine ./cmd/fakeengine
+
+# Distroless static: no shell, no package manager, nonroot by default.
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /out/fakeengine /fakeengine
+USER 65532:65532
+
+EXPOSE 8000
+
+ENTRYPOINT ["/fakeengine"]
