@@ -1,0 +1,10 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: scale-demo
+status:
+  # Asserted on STATUS, not on spec: spec.replicas changes the instant kubectl
+  # returns, whereas status.replicas only reaches 3 once the pods actually
+  # exist. Asserting on spec would pass before anything had happened.
+  replicas: 3
+  readyReplicas: 3

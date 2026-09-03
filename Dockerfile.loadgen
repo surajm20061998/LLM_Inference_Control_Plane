@@ -1,0 +1,38 @@
+# Build the streaming load generator.
+#
+# It runs both from a laptop (through a port-forward) and as a Job INSIDE the
+# cluster, and the in-cluster mode is not a convenience. kube-proxy balances
+# per connection, so any question about how traffic is distributed across a
+# Service's pods can only be answered by traffic that actually goes through a
+# ClusterIP. A port-forward resolves the Service to one pod and pins every
+# request to it, which would silently turn a traffic-split measurement into a
+# measurement of `kubectl`.
+#
+# The builder stage is pinned to $BUILDPLATFORM and cross-compiles with GOARCH
+# instead of running under QEMU: emulated builds of the Go toolchain are an
+# order of magnitude slower, and nothing here needs CGO.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+# Copy the module manifests first so the dependency layer is cached across
+# source changes.
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+
+# Copy the Go source (relies on .dockerignore to filter)
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -a -o /out/loadgen ./hack/loadgen
+
+# Distroless static: no shell, no package manager, nonroot by default.
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /out/loadgen /loadgen
+USER 65532:65532
+
+ENTRYPOINT ["/loadgen"]

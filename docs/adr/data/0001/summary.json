@@ -1,0 +1,124 @@
+{
+  "m1_memory": {
+    "pods": [
+      {
+        "model_deployment": "spike-primary",
+        "pod": "spike-primary-primary-7bdb964848-8cckp",
+        "memory_current_mib": 882.81,
+        "memory_peak_mib": 889.22,
+        "anon_mib": 875.92
+      },
+      {
+        "model_deployment": "spike-primary",
+        "pod": "spike-primary-primary-7bdb964848-ctskm",
+        "memory_current_mib": 896.95,
+        "memory_peak_mib": 901.6,
+        "anon_mib": 893.13
+      },
+      {
+        "model_deployment": "spike-canary",
+        "pod": "spike-canary-primary-7b9c5769b7-b9n59",
+        "memory_current_mib": 937.88,
+        "memory_peak_mib": 942.39,
+        "anon_mib": 933.34
+      }
+    ],
+    "max_current_mib": 937.88,
+    "kill_threshold_mib": 2048
+  },
+  "m2_throughput": {
+    "primary_rps": 7.37,
+    "canary_rps": 1.27,
+    "kill_threshold_canary_rps": 0.5
+  },
+  "m3_separation": {
+    "note": "one pod per side, equal concurrency; only the CPU limit differs",
+    "primary_ttft_p95_s": 0.06,
+    "canary_ttft_p95_s": 0.27,
+    "ttft_ratio": 4.54,
+    "primary_duration_p95_s": 1.11,
+    "canary_duration_p95_s": 4.13,
+    "duration_ratio": 3.72,
+    "kill_threshold_ratio": 2.0
+  },
+  "m4_noise": {
+    "primary_ttft_p95_cv": 0.204,
+    "windows": 15,
+    "kill_threshold_cv": 0.5
+  },
+  "m5_traffic_split": {
+    "two_pods_keep_alive_on": {
+      "keep_alive": true,
+      "total_prompt_tokens": 37488,
+      "pods": [
+        {
+          "pod": "spike-primary-primary-7bdb964848-ctskm",
+          "delta": 18552,
+          "share_pct": 49.5
+        },
+        {
+          "pod": "spike-primary-primary-7bdb964848-hd7nb",
+          "delta": 18936,
+          "share_pct": 50.5
+        }
+      ],
+      "skew": 1.02
+    },
+    "two_pods_keep_alive_off": {
+      "keep_alive": false,
+      "total_prompt_tokens": 35712,
+      "pods": [
+        {
+          "pod": "spike-primary-primary-7bdb964848-ctskm",
+          "delta": 18648,
+          "share_pct": 52.2
+        },
+        {
+          "pod": "spike-primary-primary-7bdb964848-hd7nb",
+          "delta": 17064,
+          "share_pct": 47.8
+        }
+      ],
+      "skew": 1.09
+    },
+    "four_pods_keep_alive_on": {
+      "keep_alive": true,
+      "total_prompt_tokens": 34728,
+      "pods": [
+        {
+          "pod": "spike-primary-primary-7bdb964848-8k6mb",
+          "delta": 8256,
+          "share_pct": 23.8
+        },
+        {
+          "pod": "spike-primary-primary-7bdb964848-ctskm",
+          "delta": 8304,
+          "share_pct": 23.9
+        },
+        {
+          "pod": "spike-primary-primary-7bdb964848-hd7nb",
+          "delta": 8616,
+          "share_pct": 24.8
+        },
+        {
+          "pod": "spike-primary-primary-7bdb964848-qbckl",
+          "delta": 9552,
+          "share_pct": 27.5
+        }
+      ],
+      "skew": 1.16
+    }
+  },
+  "m6_cold_start": {
+    "seconds": 9,
+    "kill_threshold_s": 90
+  },
+  "error_rate_pct": {
+    "sep_primary": 0,
+    "sep_canary": 0,
+    "noise_primary": 0
+  },
+  "anti_buffering": {
+    "sep_primary_ttft_p95_over_duration_p95": 0.05
+  }
+}

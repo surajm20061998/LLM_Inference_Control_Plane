@@ -30,9 +30,9 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 
-	v1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/engine"
-	"github.com/surajmishra/llmcp/internal/naming"
+	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/engine"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 )
 
 // cuRevision is the revision hash used throughout these tests. It is a fixed
@@ -86,7 +86,7 @@ func cuProfile(t *testing.T) engine.Profile {
 // cuBuild renders the children for md, failing the test on error.
 func cuBuild(t *testing.T, md *v1alpha1.ModelDeployment) desiredChildren {
 	t.Helper()
-	children, err := buildChildren(md, cuProfile(t), cuRevision)
+	children, err := buildChildren(md, cuProfile(t), singleVariant(md, cuRevision), nil, renderOptions{})
 	if err != nil {
 		t.Fatalf("buildChildren: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestOwnerReferenceIsControllerAndBlocksDeletion(t *testing.T) {
 		if got, want := cuDeref(t, ref.APIVersion, "ownerRef.apiVersion"), v1alpha1.GroupVersion.String(); got != want {
 			t.Errorf("%s ownerRef.apiVersion = %q, want %q", what, got, want)
 		}
-		if got, want := cuDeref(t, ref.Kind, "ownerRef.kind"), "ModelDeployment"; got != want {
+		if got, want := cuDeref(t, ref.Kind, "ownerRef.kind"), kindModelDeployment; got != want {
 			t.Errorf("%s ownerRef.kind = %q, want %q", what, got, want)
 		}
 		if got, want := cuDeref(t, ref.Name, "ownerRef.name"), md.Name; got != want {
@@ -423,14 +423,17 @@ func TestPodSpecDeliversModelThenRunsEngine(t *testing.T) {
 	t.Parallel()
 
 	md := cuNewMD()
-	podSpec, err := buildPodSpec(md, cuProfile(t), v1alpha1.VariantPrimary)
+	podSpec, err := buildPodSpec(md, cuProfile(t), v1alpha1.VariantPrimary, renderOptions{})
 	if err != nil {
 		t.Fatalf("buildPodSpec: %v", err)
 	}
 
-	t.Run("single init container copies the weights", func(t *testing.T) {
-		if len(podSpec.InitContainers) != 1 {
-			t.Fatalf("got %d init containers, want exactly 1", len(podSpec.InitContainers))
+	t.Run("the first init container copies the weights", func(t *testing.T) {
+		// Two entries: the model init container, then the shim as a native
+		// sidecar. The ORDER is the assertion — weights are staged before
+		// anything starts serving or measuring.
+		if len(podSpec.InitContainers) != 2 {
+			t.Fatalf("got %d init containers, want exactly 2 (model-init then shim)", len(podSpec.InitContainers))
 		}
 		init := podSpec.InitContainers[0]
 		if got := cuDeref(t, init.Name, "initContainer.name"); got != modelInitContainerName {
@@ -521,7 +524,7 @@ func TestProbesBudgetForSlowModelLoads(t *testing.T) {
 	md := cuNewMD()
 	md.Spec.Serving.StartupTimeout = cuDuration(120 * time.Second)
 
-	podSpec, err := buildPodSpec(md, cuProfile(t), v1alpha1.VariantPrimary)
+	podSpec, err := buildPodSpec(md, cuProfile(t), v1alpha1.VariantPrimary, renderOptions{})
 	if err != nil {
 		t.Fatalf("buildPodSpec: %v", err)
 	}
@@ -692,7 +695,7 @@ func TestBuildChildrenIsDeterministic(t *testing.T) {
 	// reconcile, the watch fires, and the controller and the API server
 	// hot-loop forever without ever converging.
 	prof := cuProfile(t)
-	first, err := buildChildren(md, prof, cuRevision)
+	first, err := buildChildren(md, prof, singleVariant(md, cuRevision), nil, renderOptions{})
 	if err != nil {
 		t.Fatalf("buildChildren: %v", err)
 	}
@@ -702,7 +705,7 @@ func TestBuildChildrenIsDeterministic(t *testing.T) {
 	}
 
 	for i := 1; i < 100; i++ {
-		got, err := buildChildren(md, prof, cuRevision)
+		got, err := buildChildren(md, prof, singleVariant(md, cuRevision), nil, renderOptions{})
 		if err != nil {
 			t.Fatalf("buildChildren (run %d): %v", i, err)
 		}

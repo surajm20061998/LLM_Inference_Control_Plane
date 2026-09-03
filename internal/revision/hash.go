@@ -35,7 +35,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/rand"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // revisionInput is the exact subset of ModelDeploymentSpec that defines a
@@ -103,6 +103,17 @@ type revisionServing struct {
 	// Port is the port the engine's Service — and therefore its container —
 	// listens on.
 	Port int32 `json:"port"`
+
+	// Shim is included whole because every field of it lands in the pod
+	// template: enabling it adds a container, its image and resources are that
+	// container's, and its log level is one of its arguments.
+	//
+	// Leaving it out would be a genuine bug rather than an omission. Toggling
+	// the shim changes the pods the Deployment runs, so if the revision hash did
+	// not move, the operator would record no new revision, the rollout would
+	// have no rollback target, and — worse — a canary triggered by "turn metrics
+	// on" would compare two variants the controller believes are identical.
+	Shim inferencev1alpha1.ShimSpec `json:"shim"`
 }
 
 // revisionPayload projects a ModelDeploymentSpec onto the fields that define a
@@ -119,6 +130,7 @@ func revisionPayload(spec *inferencev1alpha1.ModelDeploymentSpec) revisionInput 
 		Engine: spec.Engine,
 		Serving: revisionServing{
 			Port: spec.Serving.Port,
+			Shim: spec.Serving.Shim,
 		},
 	}
 }

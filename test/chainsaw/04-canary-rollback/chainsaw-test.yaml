@@ -1,0 +1,155 @@
+# A canary with an injected latency regression is rolled back automatically.
+#
+# This is the centrepiece of the entire project, and the one assertion that
+# justifies building a controller rather than using a Deployment. The canary's
+# pods are HEALTHY — they pass every readiness probe, they serve every request
+# successfully — and they are three times slower. Kubernetes has no opinion
+# about that. This operator rolls them back.
+#
+# The regression is injected by giving the canary a different LLMCP_FAKE_TTFT_MS
+# than the primary, which is exactly what makes the stub engine a required
+# deliverable rather than a convenience: a real model cannot be asked to be
+# reproducibly 3x slower.
+#
+# Requires kube-prometheus-stack: make monitoring-install
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: canary-rollback
+spec:
+  timeouts:
+    assert: 8m
+  steps:
+    - name: create
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: rollback-demo
+              status:
+                phase: Available
+                readyReplicas: 4
+
+    - name: record-the-known-good-revision
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE get modeldeployment rollback-demo \
+                -o jsonpath='{.status.lastGoodRevision}' | tee /dev/stderr | grep -q .
+
+    - name: drive-load
+      try:
+        - apply:
+            file: loadgen.yaml
+
+    - name: inject-a-latency-regression
+      try:
+        # 400ms against the primary's 60ms: a ratio of roughly 6.7x, comfortably
+        # past the 1.5x threshold and comfortably outside the noise the
+        # feasibility spike measured (a coefficient of variation of 0.13).
+        #
+        # Note what this does NOT do: it does not make the canary unhealthy.
+        # Every pod passes its readiness probe and every request succeeds. A
+        # Deployment would roll this out and consider the job done.
+        - script:
+            content: |
+              kubectl -n $NAMESPACE patch modeldeployment rollback-demo --type=merge -p '
+              {"spec":{"engine":{"env":[
+                {"name":"LLMCP_FAKE_TTFT_MS","value":"400"},
+                {"name":"LLMCP_FAKE_TOKENS","value":"24"}
+              ]}}}'
+
+    - name: the-canary-starts-and-is-judged
+      try:
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: rollback-demo
+              status:
+                phase: Canarying
+
+    - name: it-is-rolled-back
+      try:
+        - assert:
+            timeout: 8m
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: rollback-demo
+              status:
+                conditions:
+                  - type: CanaryHealthy
+                    status: "False"
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: rollback-demo-canary
+
+    - name: the-primary-still-serves-the-good-revision
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              # The revert restores what is RUNNING. The spec still names the
+              # slow configuration — a rollback is not an edit of the user's
+              # intent, it is a refusal to act on it.
+              args=$(kubectl -n $NAMESPACE get deploy rollback-demo-primary \
+                -o jsonpath='{.spec.template.spec.containers[?(@.name=="engine")].env}')
+              echo "engine env: ${args}"
+              echo "${args}" | grep -q '"value":"60"'
+
+    - name: the-rejected-revision-is-not-retried
+      try:
+        # Without the failedRevision guard the controller would start an
+        # identical canary on the very next reconcile — an infinite loop of
+        # failing rollouts, each costing a full analysis window and a Deployment
+        # churn. A rollback has to STICK until a human changes the spec.
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE get modeldeployment rollback-demo \
+                -o jsonpath='{.status.canary.failedRevision}' | tee /dev/stderr | grep -q .
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: rollback-demo-canary
+
+    - name: the-rollback-is-in-the-audit-trail
+      try:
+        # This is what `kubectl get events --field-selector reason=CanaryRolledBack`
+        # finds, and it is how the demo proves the rollback was automatic rather
+        # than staged.
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE get events \
+                --field-selector reason=CanaryRolledBack -o name | tee /dev/stderr | grep -q .
+      catch:
+        - events: {}
+        - describe:
+            apiVersion: inference.llmcp.io/v1alpha1
+            kind: ModelDeployment
+        - podLogs:
+            selector: app.kubernetes.io/name=llmcp
+      cleanup:
+        # Attached to the LAST step rather than to the test, because the load
+        # generator has to outlive every assertion that depends on traffic — a
+        # canary with no requests is Inconclusive by design, and tearing the job
+        # down early would make the suite fail for the wrong reason.
+        - delete:
+            ref:
+              apiVersion: batch/v1
+              kind: Job
+              name: rollback-load

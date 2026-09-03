@@ -20,11 +20,12 @@ import (
 	"errors"
 	"path"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
-	v1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/naming"
+	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 )
 
 // LlamaCPPDefaultImage is the image used when EngineSpec.Image is empty.
@@ -52,6 +53,13 @@ const LlamaCPPHealthPath = "/health"
 // so the secret never appears in the pod spec, in `kubectl describe`, or in a
 // process listing.
 const llamaCPPAPIKeyEnvVar = "LLAMA_ARG_API_KEY"
+
+// llamaCPPCacheEnvVar redirects llama.cpp's download cache. It is set only for
+// the huggingFace model source; with an image source nothing is downloaded.
+const llamaCPPCacheEnvVar = "LLAMA_CACHE"
+
+// llamaCPPHFTokenEnvVar carries a Hugging Face token for gated repositories.
+const llamaCPPHFTokenEnvVar = "HF_TOKEN"
 
 // Defaults mirroring the CRD's kubebuilder defaults. The API server normally
 // fills these in, but Build must also be correct when handed a spec that never
@@ -99,17 +107,30 @@ func (llamaCPP) Validate(spec *v1alpha1.ModelDeploymentSpec) error {
 
 	src := spec.Model.Source
 
-	if src.HuggingFace != nil {
-		return errors.New("llamacpp: model source .spec.model.source.huggingFace is not implemented yet; " +
-			"use .spec.model.source.image with a GGUF file baked into an OCI image")
-	}
 	if src.PersistentVolumeClaim != nil {
 		return errors.New("llamacpp: model source .spec.model.source.persistentVolumeClaim is not implemented yet; " +
-			"use .spec.model.source.image with a GGUF file baked into an OCI image")
+			"use .spec.model.source.image or .spec.model.source.huggingFace")
 	}
+
+	if hf := src.HuggingFace; hf != nil {
+		// A Hub repository holds every quantisation of a model side by side —
+		// Q4_K_M, Q8_0, BF16 — and llama-server picks one by guessing when it
+		// is not told which. That guess is silent, and it changes both the
+		// memory footprint and the latency of every pod. Since this operator's
+		// whole premise is comparing a canary against its primary on latency,
+		// an unpinned quantisation would make the two sides differ by something
+		// nobody declared. So the file is required here rather than defaulted.
+		if hf.File == "" {
+			return errors.New("llamacpp: .spec.model.source.huggingFace.file is required; " +
+				"llama.cpp serves a single GGUF file and a repository usually holds several " +
+				`quantisations (e.g. "Qwen3-0.6B-Q4_K_M.gguf")`)
+		}
+		return nil
+	}
+
 	if src.Image == nil {
-		return errors.New("llamacpp: .spec.model.source.image is required; " +
-			"it is currently the only implemented model source")
+		return errors.New("llamacpp: one of .spec.model.source.image or " +
+			".spec.model.source.huggingFace is required")
 	}
 
 	return nil
@@ -141,12 +162,17 @@ func (p llamaCPP) Build(bc BuildContext) (BuildResult, error) {
 		ImagePullPolicy: spec.Engine.ImagePullPolicy,
 		Args:            llamaCPPArgs(spec, bc, port),
 		Ports: []corev1.ContainerPort{{
-			Name:          naming.PortNameHTTP,
+			// Named "engine", not "http". The shim takes the "http" name when
+			// it is injected, and container port names must be unique within a
+			// pod — so the engine keeps its own name in both configurations
+			// rather than swapping between them, which would make the pod
+			// template depend on whether a sidecar happens to be present.
+			Name:          naming.PortNameEngine,
 			ContainerPort: port,
 			Protocol:      corev1.ProtocolTCP,
 		}},
-		Env:             llamaCPPEnv(spec),
-		VolumeMounts:    llamaCPPVolumeMounts(bc.ModelPath),
+		Env:             llamaCPPEnv(spec, bc.CacheDir),
+		VolumeMounts:    llamaCPPVolumeMounts(bc.ModelPath, bc.CacheDir),
 		Resources:       *spec.Engine.Resources.DeepCopy(),
 		SecurityContext: hardenedSecurityContext(),
 	}
@@ -174,10 +200,16 @@ func llamaCPPArgs(spec *v1alpha1.ModelDeploymentSpec, bc BuildContext, port int3
 	args = append(args, "--host", "0.0.0.0")
 	args = append(args, "--port", strconv.Itoa(int(port)))
 
-	// Omitted when the engine fetches its own weights, in which case the model
-	// is selected by whatever source-specific flags a future profile adds.
-	if bc.ModelPath != "" {
+	// Exactly one of these two branches runs. A pre-staged file is named
+	// directly; otherwise the engine is pointed at the Hub and downloads the
+	// weights itself into CacheDir (see llamaCPPEnv).
+	switch {
+	case bc.ModelPath != "":
 		args = append(args, "-m", bc.ModelPath)
+	case spec.Model.Source.HuggingFace != nil:
+		hf := spec.Model.Source.HuggingFace
+		args = append(args, "--hf-repo", hf.Repo)
+		args = append(args, "--hf-file", hf.File)
 	}
 
 	args = append(args, "-c", strconv.Itoa(int(int32OrDefault(spec.Engine.ContextSize, defaultContextSize))))
@@ -212,15 +244,18 @@ func llamaCPPArgs(spec *v1alpha1.ModelDeploymentSpec, bc BuildContext, port int3
 // The copy is deep because EnvVar contains pointers (ValueFrom): a shallow copy
 // would alias the caller's spec, and a later mutation of the built container
 // would reach back into the ModelDeployment in the informer cache.
-func llamaCPPEnv(spec *v1alpha1.ModelDeploymentSpec) []corev1.EnvVar {
-	if len(spec.Engine.Env) == 0 && spec.Engine.APIKeySecretRef == nil {
+func llamaCPPEnv(spec *v1alpha1.ModelDeploymentSpec, cacheDir string) []corev1.EnvVar {
+	hf := spec.Model.Source.HuggingFace
+	hfToken := hf != nil && hf.TokenSecretRef != nil
+
+	if len(spec.Engine.Env) == 0 && spec.Engine.APIKeySecretRef == nil && cacheDir == "" && !hfToken {
 		// nil rather than an empty slice: an empty slice and a nil slice
 		// serialize differently, and the API server would normalise one to the
 		// other, producing a permanent diff between applied and observed.
 		return nil
 	}
 
-	env := make([]corev1.EnvVar, 0, len(spec.Engine.Env)+1)
+	env := make([]corev1.EnvVar, 0, len(spec.Engine.Env)+3)
 	for i := range spec.Engine.Env {
 		env = append(env, *spec.Engine.Env[i].DeepCopy())
 	}
@@ -234,7 +269,44 @@ func llamaCPPEnv(spec *v1alpha1.ModelDeploymentSpec) []corev1.EnvVar {
 		})
 	}
 
+	// Redirect the download cache onto the mounted volume. Without this,
+	// llama.cpp caches under the user's home directory, which lives on the
+	// container's root filesystem — mounted read-only here — so the download
+	// would fail with a permission error that reads like a corrupt image.
+	if cacheDir != "" {
+		env = append(env, corev1.EnvVar{
+			Name: llamaCPPCacheEnvVar,
+			// The trailing separator is defensive. llama.cpp appends one
+			// itself before concatenating the file name onto this value, but
+			// the failure mode if a build ever did not is nasty and silent:
+			// "/models" would become "/modelsQwen3-0.6B-Q4_K_M.gguf", a write
+			// to the read-only root filesystem rather than to the volume, and
+			// the error surfaces as a puzzling permission denial at startup.
+			Value: ensureTrailingSlash(cacheDir),
+		})
+	}
+
+	// Passed by environment rather than as --hf-token so the credential never
+	// appears in the pod spec, in `kubectl describe`, or in a process listing.
+	if hfToken {
+		env = append(env, corev1.EnvVar{
+			Name: llamaCPPHFTokenEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: hf.TokenSecretRef.DeepCopy(),
+			},
+		})
+	}
+
 	return env
+}
+
+// ensureTrailingSlash appends a "/" when one is absent. See the LLAMA_CACHE
+// note above.
+func ensureTrailingSlash(dir string) string {
+	if strings.HasSuffix(dir, "/") {
+		return dir
+	}
+	return dir + "/"
 }
 
 // llamaCPPVolumeMounts mounts the model volume when there is a model file.
@@ -244,15 +316,26 @@ func llamaCPPEnv(spec *v1alpha1.ModelDeploymentSpec) []corev1.EnvVar {
 // multiple shards live as siblings that llama.cpp opens by scanning that
 // directory. Read-only both because weights are never written and because it
 // keeps the mount compatible with ReadOnlyRootFilesystem below.
-func llamaCPPVolumeMounts(modelPath string) []corev1.VolumeMount {
-	if modelPath == "" {
+func llamaCPPVolumeMounts(modelPath, cacheDir string) []corev1.VolumeMount {
+	switch {
+	case modelPath != "":
+		return []corev1.VolumeMount{{
+			Name:      ModelVolumeName,
+			MountPath: path.Dir(modelPath),
+			ReadOnly:  true,
+		}}
+	case cacheDir != "":
+		// Writable, necessarily: this is the directory the engine downloads
+		// into. It is the ONLY writable path in the container — the root
+		// filesystem stays read-only — so a compromised engine can still not
+		// modify its own binary.
+		return []corev1.VolumeMount{{
+			Name:      ModelVolumeName,
+			MountPath: cacheDir,
+		}}
+	default:
 		return nil
 	}
-	return []corev1.VolumeMount{{
-		Name:      ModelVolumeName,
-		MountPath: path.Dir(modelPath),
-		ReadOnly:  true,
-	}}
 }
 
 // hardenedSecurityContext returns the restricted-profile security context every

@@ -26,8 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	v1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/naming"
+	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 )
 
 // Fixture values shared by the tests below. Spelling each one once means two
@@ -38,6 +38,15 @@ const (
 
 	apiKeySecretName = "llm-api-key"
 	apiKeySecretKey  = "key"
+
+	// The real Hub coordinates for the model this project ships, so the
+	// huggingFace cases exercise a reference that actually resolves.
+	testHFRepo = "unsloth/Qwen3-0.6B-GGUF"
+	testHFFile = "Qwen3-0.6B-Q4_K_M.gguf"
+
+	// The directory the model volume is mounted at when the engine downloads
+	// its own weights.
+	testCacheDir = "/models"
 
 	// Two llama-server flags the builder knows nothing about, used to prove
 	// spec.engine.extraArgs reaches the command line untouched.
@@ -241,8 +250,10 @@ func TestLlamaCPPBuildContainerShape(t *testing.T) {
 	}
 
 	// Ports.
+	// Named "engine", not "http": the metrics shim takes the "http" name when
+	// it is injected, and container port names are unique within a pod.
 	wantPorts := []corev1.ContainerPort{{
-		Name:          naming.PortNameHTTP,
+		Name:          naming.PortNameEngine,
 		ContainerPort: naming.EnginePort,
 		Protocol:      corev1.ProtocolTCP,
 	}}
@@ -529,14 +540,6 @@ func TestLlamaCPPValidate(t *testing.T) {
 			},
 		},
 		{
-			name: "huggingface rejected as unimplemented",
-			source: v1alpha1.ModelSourceSpec{
-				HuggingFace: &v1alpha1.HuggingFaceModelSource{Repo: "unsloth/Qwen3-0.6B-GGUF"},
-			},
-			wantErr:     true,
-			wantContain: []string{"huggingFace", "not implemented"},
-		},
-		{
 			name: "pvc rejected as unimplemented",
 			source: v1alpha1.ModelSourceSpec{
 				PersistentVolumeClaim: &v1alpha1.PVCModelSource{ClaimName: "weights", Path: "/w/model.gguf"},
@@ -545,10 +548,32 @@ func TestLlamaCPPValidate(t *testing.T) {
 			wantContain: []string{"persistentVolumeClaim", "not implemented"},
 		},
 		{
-			name:        "nil image source rejected",
+			name:        "no source at all rejected",
 			source:      v1alpha1.ModelSourceSpec{},
 			wantErr:     true,
-			wantContain: []string{"image", "required"},
+			wantContain: []string{"image", "huggingFace", "required"},
+		},
+		{
+			name: "huggingface accepted with a pinned file",
+			source: v1alpha1.ModelSourceSpec{
+				HuggingFace: &v1alpha1.HuggingFaceModelSource{
+					Repo: testHFRepo,
+					File: testHFFile,
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// A repository holds several quantisations side by side. Letting
+			// llama.cpp guess would mean a canary and its primary could differ
+			// by a quantisation nobody declared, which is exactly the variable
+			// the rollout comparison assumes is held constant.
+			name: "huggingface without a file rejected",
+			source: v1alpha1.ModelSourceSpec{
+				HuggingFace: &v1alpha1.HuggingFaceModelSource{Repo: testHFRepo},
+			},
+			wantErr:     true,
+			wantContain: []string{"huggingFace.file", "required"},
 		},
 	}
 
@@ -655,4 +680,113 @@ func mustProfile(t *testing.T) Profile {
 // meaning the same thing compare equal.
 func apiEqual(a, b any) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
+}
+
+// TestLlamaCPPBuildHuggingFaceSource covers the pull-style model source: the
+// engine downloads its own weights, so it needs the Hub flags, a writable
+// mount, and a cache directory that is NOT on the read-only root filesystem.
+func TestLlamaCPPBuildHuggingFaceSource(t *testing.T) {
+	md := testModelDeployment()
+	md.Spec.Model.Source = v1alpha1.ModelSourceSpec{
+		HuggingFace: &v1alpha1.HuggingFaceModelSource{
+			Repo: testHFRepo,
+			File: testHFFile,
+		},
+	}
+
+	got, err := mustProfile(t).Build(BuildContext{MD: md, CacheDir: testCacheDir})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	args := strings.Join(got.Container.Args, " ")
+	if !strings.Contains(args, "--hf-repo unsloth/Qwen3-0.6B-GGUF") {
+		t.Errorf("args %q do not select the Hub repository", args)
+	}
+	if !strings.Contains(args, "--hf-file Qwen3-0.6B-Q4_K_M.gguf") {
+		t.Errorf("args %q do not pin the quantisation file", args)
+	}
+	// -m names a local file. Emitting it alongside the Hub flags would make
+	// llama.cpp load a file that does not exist yet.
+	if strings.Contains(args, " -m ") {
+		t.Errorf("args %q pass -m for a source that has no local file", args)
+	}
+
+	mounts := got.Container.VolumeMounts
+	if len(mounts) != 1 {
+		t.Fatalf("got %d volume mounts, want 1", len(mounts))
+	}
+	if mounts[0].MountPath != testCacheDir {
+		t.Errorf("mount path = %q, want %q", mounts[0].MountPath, testCacheDir)
+	}
+	if mounts[0].ReadOnly {
+		t.Error("model volume is mounted read-only, so the download cannot be written")
+	}
+
+	if v := envValue(got.Container.Env, llamaCPPCacheEnvVar); v != testCacheDir+"/" {
+		t.Errorf("%s = %q, want %q", llamaCPPCacheEnvVar, v, testCacheDir+"/")
+	}
+
+	// The download target is a mounted volume, so the root filesystem does not
+	// need to be writable and must not become so.
+	if got.Container.SecurityContext == nil ||
+		got.Container.SecurityContext.ReadOnlyRootFilesystem == nil ||
+		!*got.Container.SecurityContext.ReadOnlyRootFilesystem {
+		t.Error("root filesystem is not read-only")
+	}
+}
+
+// TestLlamaCPPHuggingFaceTokenIsNotInTheArgs proves a gated-repo credential
+// reaches the engine by environment reference and never as a command-line
+// argument, where it would be visible in `kubectl describe` and in `ps`.
+func TestLlamaCPPHuggingFaceTokenIsNotInTheArgs(t *testing.T) {
+	md := testModelDeployment()
+	md.Spec.Model.Source = v1alpha1.ModelSourceSpec{
+		HuggingFace: &v1alpha1.HuggingFaceModelSource{
+			Repo: "acme/private-gguf",
+			File: "model.gguf",
+			TokenSecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "hf"},
+				Key:                  "token",
+			},
+		},
+	}
+
+	got, err := mustProfile(t).Build(BuildContext{MD: md, CacheDir: testCacheDir})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	if strings.Contains(strings.Join(got.Container.Args, " "), "--hf-token") {
+		t.Error("the Hugging Face token was passed as a command-line argument")
+	}
+
+	var found *corev1.EnvVar
+	for i := range got.Container.Env {
+		if got.Container.Env[i].Name == llamaCPPHFTokenEnvVar {
+			found = &got.Container.Env[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no %s environment variable", llamaCPPHFTokenEnvVar)
+	}
+	if found.Value != "" {
+		t.Error("the token was inlined as a literal value rather than referenced")
+	}
+	if found.ValueFrom == nil || found.ValueFrom.SecretKeyRef == nil {
+		t.Fatal("the token is not a secret reference")
+	}
+	if got, want := found.ValueFrom.SecretKeyRef.Name, "hf"; got != want {
+		t.Errorf("secret name = %q, want %q", got, want)
+	}
+}
+
+// envValue returns the literal value of a named environment variable, or "".
+func envValue(env []corev1.EnvVar, name string) string {
+	for i := range env {
+		if env[i].Name == name {
+			return env[i].Value
+		}
+	}
+	return ""
 }

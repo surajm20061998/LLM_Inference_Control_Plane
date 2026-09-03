@@ -29,8 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/naming"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 )
 
 const testNamespace = "llmcp-test"

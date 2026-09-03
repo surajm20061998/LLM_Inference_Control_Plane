@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -24,13 +26,20 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	v1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // cuGeneration is the ModelDeployment generation used across these tests. It is
 // deliberately not 1, so that a status which hard-codes a generation or leaves
 // it at the zero value fails loudly.
 const cuGeneration int64 = 7
+
+// Hub coordinates shared by the huggingFace cases in this package. Real ones,
+// so the fixtures name a reference that actually resolves.
+const (
+	testHFRepo = "unsloth/Qwen3-0.6B-GGUF"
+	testHFFile = "Qwen3-0.6B-Q4_K_M.gguf"
+)
 
 // cuLastGood is the revision a previous reconcile banked as safe to roll back
 // to; cuObserved's revision is the one being rolled out now. They differ so a
@@ -157,7 +166,9 @@ func TestComputeStatusBeforeTheDeploymentExists(t *testing.T) {
 	cuAssertCondition(t, got, v1alpha1.ConditionAvailable, metav1.ConditionFalse, v1alpha1.ReasonReconciling)
 	cuAssertCondition(t, got, v1alpha1.ConditionProgressing, metav1.ConditionTrue, v1alpha1.ReasonNewRevisionDetected)
 	cuAssertCondition(t, got, v1alpha1.ConditionReady, metav1.ConditionFalse, "")
-	cuAssertCondition(t, got, v1alpha1.ConditionModelReady, metav1.ConditionFalse, v1alpha1.ReasonEngineUnhealthy)
+	// ModelLoading, not EngineUnhealthy: a rollout is in flight, so having no
+	// ready replica yet is the normal path rather than a fault.
+	cuAssertCondition(t, got, v1alpha1.ConditionModelReady, metav1.ConditionFalse, v1alpha1.ReasonModelLoading)
 
 	// Nothing has ever served, so this is a first rollout rather than a
 	// regression: Pending is normal and Degraded would warrant a page.
@@ -363,7 +374,7 @@ func TestDerivePhaseSeparatesFirstRolloutFromRegression(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := derivePhase(tc.available, tc.progressing, tc.stalled, tc.lastGood)
+			got := derivePhase(tc.available, tc.progressing, tc.stalled, tc.lastGood, rollout{})
 			if got != tc.want {
 				t.Errorf("derivePhase(available=%t, progressing=%t, stalled=%t, lastGood=%q) = %q, want %q",
 					tc.available, tc.progressing, tc.stalled, tc.lastGood, got, tc.want)
@@ -472,21 +483,131 @@ func TestStatusConditionsAccumulateWithoutDuplicating(t *testing.T) {
 		}
 	}
 
-	wantTypes := []string{
-		v1alpha1.ConditionSpecValid,
-		v1alpha1.ConditionAvailable,
-		v1alpha1.ConditionProgressing,
-		v1alpha1.ConditionModelReady,
-		v1alpha1.ConditionReady,
-	}
+	// The expected set is DERIVED from the API package rather than repeated
+	// here. A hard-coded list has to be edited every time a condition is added
+	// — it was, twice, while the canary work was being written — and each edit
+	// is an opportunity to "fix" the test by loosening it. Deriving it means
+	// declaring a condition type and never setting it fails immediately, which
+	// is the bug worth catching.
+	wantTypes := v1alpha1.AllConditionTypes()
 	for _, condType := range wantTypes {
 		if _, ok := seen[condType]; !ok {
-			t.Errorf("condition %s is missing after a full lifecycle; present: %v",
-				condType, cuCondTypes(status))
+			t.Errorf("condition %s is declared in AllConditionTypes but was never set "+
+				"during a full lifecycle; present: %v", condType, cuCondTypes(status))
 		}
 	}
-	if len(status.Conditions) != len(wantTypes) {
-		t.Errorf("got %d conditions (%v), want exactly %d", len(status.Conditions),
-			cuCondTypes(status), len(wantTypes))
+	for condType := range seen {
+		if !slices.Contains(wantTypes, condType) {
+			t.Errorf("condition %s is set but not declared in AllConditionTypes; "+
+				"anything a consumer can observe belongs in that list", condType)
+		}
 	}
+}
+
+// TestModelReadySeparatesLoadingFromUnhealthy is the reason ModelReady has two
+// distinct False reasons at all.
+//
+// With a real model these two states are minutes apart and call for opposite
+// responses: one is "wait", the other is "investigate". Collapsing them — which
+// is what a single "no replica is ready" reason does — is how a condition stops
+// carrying information, because it spends the whole normal startup window
+// claiming something is wrong.
+func TestModelReadySeparatesLoadingFromUnhealthy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		dep        *appsv1.Deployment
+		desired    int32
+		wantReason string
+	}{
+		{
+			// A rollout is in flight and no replica is ready yet. Expected.
+			name:       "mid rollout is loading",
+			dep:        cuDeployment(2, 0, 2, 0),
+			desired:    2,
+			wantReason: v1alpha1.ReasonModelLoading,
+		},
+		{
+			// Every replica exists and is up to date, yet none passes its
+			// health check. Nothing is in flight to explain it, so this is the
+			// state that warrants attention.
+			name:       "settled but no replica healthy is unhealthy",
+			dep:        cuDeploymentStalled(2, 0, 2, 0),
+			desired:    2,
+			wantReason: v1alpha1.ReasonEngineUnhealthy,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := computeStatus(cuStatusMD(), cuObserved(tc.dep, tc.desired), v1alpha1.ModelDeploymentStatus{})
+			cuAssertCondition(t, got, v1alpha1.ConditionModelReady, metav1.ConditionFalse, tc.wantReason)
+		})
+	}
+}
+
+// TestModelReadyMessageNamesTheModelSource proves the message points at what is
+// actually being waited on. The two sources hang for different reasons — a
+// registry or a wrong path for an image, egress or a rate limit for the Hub —
+// and this message is usually the only thing distinguishing them.
+func TestModelReadyMessageNamesTheModelSource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		source   v1alpha1.ModelSourceSpec
+		wantSubs []string
+	}{
+		{
+			name: "image source names the image",
+			source: v1alpha1.ModelSourceSpec{
+				Image: &v1alpha1.ImageModelSource{Image: "localhost:5001/llmcp-model:qwen3", Path: "/weights/model.gguf"},
+			},
+			wantSubs: []string{"localhost:5001/llmcp-model:qwen3"},
+		},
+		{
+			name: "hugging face source names the repository and file",
+			source: v1alpha1.ModelSourceSpec{
+				HuggingFace: &v1alpha1.HuggingFaceModelSource{
+					Repo: testHFRepo,
+					File: testHFFile,
+				},
+			},
+			wantSubs: []string{testHFRepo, testHFFile},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			md := cuStatusMD()
+			md.Spec.Model.Source = tc.source
+
+			// Mid-rollout: the state in which the loading message is reported.
+			got := computeStatus(md, cuObserved(cuDeployment(2, 0, 2, 0), 2), v1alpha1.ModelDeploymentStatus{})
+
+			msg := cuCond(t, got, v1alpha1.ConditionModelReady).Message
+			for _, want := range tc.wantSubs {
+				if !strings.Contains(msg, want) {
+					t.Errorf("ModelReady message %q does not mention %q", msg, want)
+				}
+			}
+		})
+	}
+}
+
+// cuDeploymentStalled is cuDeployment plus the Progressing=False/
+// ProgressDeadlineExceeded condition the Deployment controller sets when a
+// rollout stops making progress.
+func cuDeploymentStalled(replicas, ready, updated, available int32) *appsv1.Deployment {
+	dep := cuDeployment(replicas, ready, updated, available)
+	dep.Status.Conditions = append(dep.Status.Conditions, appsv1.DeploymentCondition{
+		Type:   appsv1.DeploymentProgressing,
+		Status: corev1.ConditionFalse,
+		Reason: v1alpha1.ReasonProgressDeadlineExceeded,
+	})
+	return dep
 }

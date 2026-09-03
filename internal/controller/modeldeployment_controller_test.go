@@ -39,10 +39,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/engine"
-	"github.com/surajmishra/llmcp/internal/naming"
-	"github.com/surajmishra/llmcp/test/helpers"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/engine"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/test/helpers"
 )
 
 // # Why this suite does not start a manager
@@ -320,13 +320,13 @@ var _ = Describe("ModelDeployment controller", func() {
 		It("fails terminally without creating children", func() {
 			md := helpers.NewModelDeployment(name, namespace)
 			// Valid per the CEL union rule (exactly one source is set), but the
-			// llamacpp profile rejects it: Hugging Face downloads are not
+			// llamacpp profile rejects it: PVC-mounted weights are not
 			// implemented. This is precisely the class of error CEL cannot
 			// express — it depends on which engine was selected.
 			md.Spec.Model.Source.Image = nil
-			md.Spec.Model.Source.HuggingFace = &inferencev1alpha1.HuggingFaceModelSource{
-				Repo: "unsloth/Qwen3-0.6B-GGUF",
-				File: "Qwen3-0.6B-Q4_K_M.gguf",
+			md.Spec.Model.Source.PersistentVolumeClaim = &inferencev1alpha1.PVCModelSource{
+				ClaimName: "weights",
+				Path:      "/weights/model.gguf",
 			}
 			mdtCreate(md)
 
@@ -342,11 +342,52 @@ var _ = Describe("ModelDeployment controller", func() {
 			By("saying so in the status")
 			specValid := mdtExpectCondition(mdtGet(mdKey), inferencev1alpha1.ConditionSpecValid, metav1.ConditionFalse)
 			Expect(specValid.Reason).To(Equal(inferencev1alpha1.ReasonInvalidSpec))
-			Expect(specValid.Message).To(ContainSubstring("huggingFace"))
+			Expect(specValid.Message).To(ContainSubstring("persistentVolumeClaim"))
 
 			By("creating no children")
 			err = k8sClient.Get(ctx, depKey, &appsv1.Deployment{})
 			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "a Deployment was created for an invalid spec")
+		})
+	})
+
+	Context("when the model source is huggingFace", func() {
+		// The two implemented sources deliver weights in opposite directions,
+		// and the whole difference lives in buildModelDelivery. This asserts
+		// the shape of the pod that comes out, because getting it wrong
+		// produces a pod that starts and then fails minutes later on a
+		// permission error rather than anything that points at the cause.
+		It("builds a pod with no init container and a writable model volume", func() {
+			md := helpers.NewModelDeployment(name, namespace)
+			md.Spec.Model.Source.Image = nil
+			md.Spec.Model.Source.HuggingFace = &inferencev1alpha1.HuggingFaceModelSource{
+				Repo: testHFRepo,
+				File: testHFFile,
+			}
+			mdtCreate(md)
+			mdtReconcile(r, mdKey)
+
+			pod := mdtGetDeployment(depKey).Spec.Template.Spec
+
+			By("omitting the MODEL init container, because the engine is the downloader")
+			// The shim is still there: it is a native sidecar, which lives in
+			// initContainers regardless of how weights arrive.
+			Expect(pod.InitContainers).To(HaveLen(1))
+			Expect(pod.InitContainers[0].Name).To(Equal(naming.ShimContainerName))
+
+			By("mounting the model volume writable, because it is the download target")
+			Expect(pod.Containers).To(HaveLen(1))
+			mounts := pod.Containers[0].VolumeMounts
+			Expect(mounts).To(HaveLen(1))
+			Expect(mounts[0].Name).To(Equal(engine.ModelVolumeName))
+			Expect(mounts[0].ReadOnly).To(BeFalse(),
+				"a read-only mount would fail the download with a permission error")
+
+			By("pointing llama.cpp's cache at that volume rather than at $HOME")
+			// $HOME is on the root filesystem, which is mounted read-only.
+			Expect(pod.Containers[0].Env).To(ContainElement(HaveField("Name", "LLAMA_CACHE")))
+
+			By("keeping the root filesystem read-only all the same")
+			Expect(*pod.Containers[0].SecurityContext.ReadOnlyRootFilesystem).To(BeTrue())
 		})
 	})
 
@@ -374,8 +415,8 @@ var _ = Describe("ModelDeployment controller", func() {
 			}, false),
 			Entry("two sources", func(md *inferencev1alpha1.ModelDeployment) {
 				md.Spec.Model.Source.HuggingFace = &inferencev1alpha1.HuggingFaceModelSource{
-					Repo: "unsloth/Qwen3-0.6B-GGUF",
-					File: "Qwen3-0.6B-Q4_K_M.gguf",
+					Repo: testHFRepo,
+					File: testHFFile,
 				}
 			}, false),
 			Entry("exactly one source", func(_ *inferencev1alpha1.ModelDeployment) {}, true),
@@ -448,8 +489,19 @@ var _ = Describe("ModelDeployment controller", func() {
 			// Rounded UP, so the configured budget is never under-honoured.
 			Expect(engineC.StartupProbe.FailureThreshold).To(Equal((timeout + period - 1) / period))
 
-			By("delivering the model with an init container")
-			Expect(pod.InitContainers).To(HaveLen(1))
+			By("delivering the model with an init container, then starting the shim sidecar")
+			// Order matters: weights are staged first, then the sidecar starts,
+			// then the engine. Reversing the first two would have the shim
+			// answering health checks for the minutes a model image takes to
+			// copy — reporting a variant as "not ready yet" when it has not
+			// begun to exist.
+			Expect(pod.InitContainers).To(HaveLen(2))
+			Expect(pod.InitContainers[1].Name).To(Equal(naming.ShimContainerName))
+			Expect(pod.InitContainers[1].RestartPolicy).NotTo(BeNil(),
+				"restartPolicy: Always is what makes this a native sidecar rather than "+
+					"an init container the kubelet waits forever for")
+			Expect(*pod.InitContainers[1].RestartPolicy).To(Equal(corev1.ContainerRestartPolicyAlways))
+
 			initC := pod.InitContainers[0]
 			Expect(initC.Name).To(Equal(modelInitContainerName))
 			Expect(initC.Image).To(Equal(helpers.FixtureModelImage))
@@ -583,7 +635,7 @@ func mdtExpectOwnedBy(refs []metav1.OwnerReference, md *inferencev1alpha1.ModelD
 		}
 	}
 	Expect(controller).NotTo(BeNil(), "no controller owner reference")
-	Expect(controller.Kind).To(Equal("ModelDeployment"))
+	Expect(controller.Kind).To(Equal(kindModelDeployment))
 	Expect(controller.APIVersion).To(Equal(inferencev1alpha1.GroupVersion.String()))
 	Expect(controller.Name).To(Equal(md.Name))
 	// The UID is what makes the reference resolvable. A stale or empty one

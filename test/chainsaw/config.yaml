@@ -1,0 +1,44 @@
+# Chainsaw configuration for this project's end-to-end suites.
+apiVersion: chainsaw.kyverno.io/v1alpha2
+kind: Configuration
+metadata:
+  name: llmcp
+spec:
+  timeouts:
+    # Generous, because these run against a real cluster on a laptop where an
+    # image pull and a pod start are genuinely slow. The number is a CEILING for
+    # a hung test, never a wait: Chainsaw polls until an assertion holds, so a
+    # fast cluster finishes fast regardless.
+    apply: 1m
+    assert: 5m
+    delete: 2m
+    cleanup: 2m
+    exec: 2m
+
+  execution:
+    # Serial. The suites share one operator and one kind node with a handful of
+    # CPUs; running them concurrently would have them competing for the same
+    # cores and turn latency-sensitive assertions into coin flips.
+    parallel: 1
+
+  namespace:
+    # One generated namespace per test, torn down afterwards.
+    template:
+      metadata:
+        labels:
+          llmcp.io/e2e: "true"
+
+  cleanup:
+    # Keep the namespace when a test fails, so the evidence is still there.
+    # Nothing is more expensive than an e2e failure that deleted its own logs.
+    skipDelete: false
+
+  error:
+    # Collected automatically on any failure.
+    catch:
+      - podLogs:
+          selector: app.kubernetes.io/name=llmcp
+      - events: {}
+      - describe:
+          apiVersion: inference.llmcp.io/v1alpha1
+          kind: ModelDeployment

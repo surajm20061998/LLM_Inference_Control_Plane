@@ -1,0 +1,26 @@
+{
+  "keep_alive": true,
+  "total_prompt_tokens": 34728,
+  "pods": [
+    {
+      "pod": "spike-primary-primary-7bdb964848-8k6mb",
+      "delta": 8256,
+      "share_pct": 23.8
+    },
+    {
+      "pod": "spike-primary-primary-7bdb964848-ctskm",
+      "delta": 8304,
+      "share_pct": 23.9
+    },
+    {
+      "pod": "spike-primary-primary-7bdb964848-hd7nb",
+      "delta": 8616,
+      "share_pct": 24.8
+    },
+    {
+      "pod": "spike-primary-primary-7bdb964848-qbckl",
+      "delta": 9552,
+      "share_pct": 27.5
+    }
+  ]
+}

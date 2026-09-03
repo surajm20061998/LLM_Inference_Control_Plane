@@ -32,7 +32,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // dns1123LabelRe is the pattern the API server applies to every object name

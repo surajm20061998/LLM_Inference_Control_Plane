@@ -7,7 +7,7 @@ domain: llmcp.io
 layout:
 - go.kubebuilder.io/v4
 projectName: llmcp
-repo: github.com/surajmishra/llmcp
+repo: github.com/surajm20061998/LLM_Inference_Control_Plane
 resources:
 - api:
     crdVersion: v1
@@ -16,6 +16,6 @@ resources:
   domain: llmcp.io
   group: inference
   kind: ModelDeployment
-  path: github.com/surajmishra/llmcp/api/v1alpha1
+  path: github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1
   version: v1alpha1
 version: "3"

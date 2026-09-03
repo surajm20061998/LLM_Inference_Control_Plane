@@ -37,7 +37,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -93,8 +93,19 @@ var _ = BeforeSuite(func() {
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")
+	// Two CRD directories. The first is this project's own; the second holds a
+	// minimal ServiceMonitor definition so that the operator's prometheus-operator
+	// path can be exercised against a real API server.
+	//
+	// The absence case is covered too, but with a fake discovery prober rather
+	// than a second envtest — installing and uninstalling a CRD mid-suite means
+	// waiting for the API server to re-establish discovery, which is slow and
+	// flaky, whereas the prober is the exact seam the controller consults.
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "..", "config", "crd", "bases"),
+			filepath.Join("..", "..", "test", "crds"),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 

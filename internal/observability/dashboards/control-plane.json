@@ -1,0 +1,1685 @@
+{
+  "uid": "llmcp-control-plane",
+  "title": "LLMCP \u2014 Control Plane",
+  "description": "Operator health and fleet-wide serving SLIs for the Mini LLM Inference Control Plane. The llmcp_* series come from the metrics shim injected beside every engine; they are the canonical SLIs that canary analysis, autoscaling and alerting read.",
+  "tags": [
+    "llmcp",
+    "inference",
+    "control-plane"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(llmcp_shim_info, model)",
+          "refId": "model"
+        },
+        "definition": "label_values(llmcp_shim_info, model)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Control plane",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Reconciles / s",
+      "description": "Sustained reconcile throughput for the ModelDeployment controller. A steady nonzero rate while nothing is changing in the cluster is the signature of a Server-Side Apply idempotency bug: the controller writes an object, the watch fires, and it reconciles again forever.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(controller_runtime_reconcile_total{controller=\"modeldeployment\"}[$__rate_interval]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Reconcile errors / s",
+      "description": "Reconciles that returned an error. Terminal errors (an invalid spec) are counted here too but are not requeued, so a flat nonzero line usually means one broken resource rather than an outage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(controller_runtime_reconcile_errors_total{controller=\"modeldeployment\"}[$__rate_interval]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Workqueue depth",
+      "description": "Items waiting to be reconciled. Anything persistently above zero means the controller is not keeping up, which delays every rollout decision by the length of the backlog.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(workqueue_depth{name=\"modeldeployment\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Active workers",
+      "description": "Concurrent reconciles in flight.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(controller_runtime_active_workers{controller=\"modeldeployment\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Models scraped",
+      "description": "Distinct models reporting through a shim. Lower than the number of ModelDeployments in the cluster means some are running without metrics \u2014 check their MetricsRegistered condition.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "count(count by (model) (llmcp_shim_info{model=~\"$model\"}))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Serving pods",
+      "description": "Shim instances reporting, i.e. serving pods across every variant.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "count(llmcp_shim_info{model=~\"$model\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Reconcile latency",
+      "description": "How long one reconcile takes end to end. This bounds how quickly a canary step or an automatic rollback can be acted on.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(controller_runtime_reconcile_time_seconds_bucket{controller=\"modeldeployment\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(controller_runtime_reconcile_time_seconds_bucket{controller=\"modeldeployment\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(controller_runtime_reconcile_time_seconds_bucket{controller=\"modeldeployment\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "instant": false,
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Reconcile outcomes",
+      "description": "Reconcile results by outcome. 'requeue_after' dominating is normal during a canary; 'error' should be flat at zero.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(controller_runtime_reconcile_total{controller=\"modeldeployment\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(controller_runtime_reconcile_errors_total{controller=\"modeldeployment\"}[$__rate_interval]))",
+          "legendFormat": "error",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Serving \u2014 canonical SLIs (llmcp_*)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Request rate",
+      "description": "Requests per second across every variant, as measured by the shim.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(llmcp_inference_requests_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Error rate",
+      "description": "Share of requests answered with 5xx. The denominator is clamped away from zero so an idle deployment reports 0%, not NaN \u2014 a NaN renders as 'No data', which on a health panel is indistinguishable from healthy.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "100 * sum(rate(llmcp_inference_requests_total{model=~\"$model\",code=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(llmcp_inference_requests_total{model=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "TTFT p95",
+      "description": "Time to first token, 95th percentile. The primary latency SLI: unlike end-to-end duration it does not scale with how many tokens the client asked for.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "TPOT p95",
+      "description": "Mean time per output token after the first, 95th percentile. Length-independent, and the signal that separates 'slow to start' from 'slow to generate'.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_tpot_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 4
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Output tokens / s",
+      "description": "Generated tokens per second across the fleet \u2014 the throughput number that reflects work actually done, as opposed to requests per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(llmcp_inference_output_tokens_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Queue depth",
+      "description": "In-flight requests beyond what the engines can work on concurrently. This is the autoscaling signal: it crosses its threshold at the moment work starts waiting, whereas CPU utilisation stays unremarkable long past that point.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(llmcp_inference_queue_depth{model=~\"$model\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2
+              },
+              {
+                "color": "red",
+                "value": 8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "TTFT percentiles by variant",
+      "description": "The overlay a canary decision is made on. During a rollout the canary and primary series should track each other; a persistent gap is exactly what the analysis threshold measures.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, variant) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, variant) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Request duration percentiles by variant",
+      "description": "End-to-end duration. Deliberately NOT the primary SLI: it scales with output length, so a change here can mean the request mix changed rather than the server did.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, variant) (rate(llmcp_inference_request_duration_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, variant) (rate(llmcp_inference_request_duration_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "TTFT as a fraction of duration",
+      "description": "The anti-buffering check, and the exit criterion of the sprint that built the shim. If response streaming were buffered \u2014 a missing FlushInterval: -1, or gzip on the upstream hop \u2014 the first token would arrive with the last and this ratio would sit at 1.0. Under real streaming load it must stay below 0.5.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval]))) / clamp_min(histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_request_duration_seconds_bucket{model=~\"$model\"}[$__rate_interval]))), 1e-9)",
+          "legendFormat": "ttft_p95 / duration_p95",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Request rate by status code",
+      "description": "Every completed request, split by the status the client actually saw.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (code) (rate(llmcp_inference_requests_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{code}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "In-flight and queued",
+      "description": "Concurrency the shim is proxying, and how much of it the engines cannot start on yet.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (variant) (llmcp_inference_requests_in_flight{model=~\"$model\"})",
+          "legendFormat": "in flight {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (variant) (llmcp_inference_queue_depth{model=~\"$model\"})",
+          "legendFormat": "queued {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Upstream failures",
+      "description": "Failures reaching or reading from the engine, as distinct from errors the engine returned. 'client_canceled' is counted separately on purpose: a load generator timing out is not an engine fault, and folding the two together would roll back a canary on the caller's behaviour.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(llmcp_shim_upstream_errors_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Engine diagnostics \u2014 llama.cpp slots",
+      "description": "The engine's own view, scraped as diagnostics only. Note the underscore: llama.cpp exports these as 'llamacpp:requests_processing' and the ServiceMonitor rewrites the reserved colon at scrape time. Nothing automated is ever gated on these series \u2014 only llmcp_* metrics are.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (variant) (llamacpp_requests_processing)",
+          "legendFormat": "processing {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (variant) (llamacpp_requests_deferred)",
+          "legendFormat": "deferred {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

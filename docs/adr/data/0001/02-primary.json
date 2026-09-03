@@ -1,0 +1,135 @@
+{
+  "config": {
+    "url": "http://spike-primary.default.svc:8080",
+    "model": "qwen3-0.6b",
+    "concurrency": 8,
+    "duration_s": 150,
+    "max_tokens": 64,
+    "prompt": "Explain what a Kubernetes operator does, in two sentences.",
+    "keep_alive": true,
+    "window_s": 10,
+    "timeout_s": 120,
+    "label": "primary"
+  },
+  "overall": {
+    "requests": 1106,
+    "errors": 0,
+    "rps": 7.373226975271537,
+    "ttft_p50_s": 0.068284667,
+    "ttft_p95_s": 0.745500459,
+    "ttft_p99_s": 0.983786542,
+    "duration_p50_s": 1.014311209,
+    "duration_p95_s": 1.8121691260000001,
+    "duration_p99_s": 2.206467376,
+    "ttft_p95_over_duration_p95": 0.41138569701026895,
+    "output_tokens": 41383
+  },
+  "windows": [
+    {
+      "start_s": 0,
+      "requests": 79,
+      "errors": 0,
+      "rps": 7.9,
+      "ttft_p95_s": 0.72269675
+    },
+    {
+      "start_s": 10,
+      "requests": 77,
+      "errors": 0,
+      "rps": 7.7,
+      "ttft_p95_s": 0.760967417
+    },
+    {
+      "start_s": 20,
+      "requests": 80,
+      "errors": 0,
+      "rps": 8,
+      "ttft_p95_s": 0.601524126
+    },
+    {
+      "start_s": 30,
+      "requests": 65,
+      "errors": 0,
+      "rps": 6.5,
+      "ttft_p95_s": 0.771013709
+    },
+    {
+      "start_s": 40,
+      "requests": 72,
+      "errors": 0,
+      "rps": 7.2,
+      "ttft_p95_s": 0.745500459
+    },
+    {
+      "start_s": 50,
+      "requests": 66,
+      "errors": 0,
+      "rps": 6.6,
+      "ttft_p95_s": 0.915292375
+    },
+    {
+      "start_s": 60,
+      "requests": 65,
+      "errors": 0,
+      "rps": 6.5,
+      "ttft_p95_s": 0.820715334
+    },
+    {
+      "start_s": 70,
+      "requests": 73,
+      "errors": 0,
+      "rps": 7.3,
+      "ttft_p95_s": 0.91896025
+    },
+    {
+      "start_s": 80,
+      "requests": 75,
+      "errors": 0,
+      "rps": 7.5,
+      "ttft_p95_s": 0.755874417
+    },
+    {
+      "start_s": 90,
+      "requests": 78,
+      "errors": 0,
+      "rps": 7.8,
+      "ttft_p95_s": 0.555072042
+    },
+    {
+      "start_s": 100,
+      "requests": 78,
+      "errors": 0,
+      "rps": 7.8,
+      "ttft_p95_s": 0.778812751
+    },
+    {
+      "start_s": 110,
+      "requests": 77,
+      "errors": 0,
+      "rps": 7.7,
+      "ttft_p95_s": 0.522304042
+    },
+    {
+      "start_s": 120,
+      "requests": 73,
+      "errors": 0,
+      "rps": 7.3,
+      "ttft_p95_s": 0.721006875
+    },
+    {
+      "start_s": 130,
+      "requests": 78,
+      "errors": 0,
+      "rps": 7.8,
+      "ttft_p95_s": 0.440077625
+    },
+    {
+      "start_s": 140,
+      "requests": 70,
+      "errors": 0,
+      "rps": 7,
+      "ttft_p95_s": 0.867125166
+    }
+  ],
+  "ttft_p95_cv": 0.2040162284459486
+}

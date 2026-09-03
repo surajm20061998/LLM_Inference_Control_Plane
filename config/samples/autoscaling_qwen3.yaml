@@ -1,0 +1,106 @@
+# Sprint 5 sample: the built-in autoscaler, driven by queue depth.
+#
+# # Why not CPU
+#
+# This is the thesis of the whole project in one field. An inference server
+# saturates its fixed number of decode slots long before it saturates the CPU:
+# requests start queueing while utilisation still reads 45%, and by the time CPU
+# is high enough to trip a utilisation target, tail latency has been bad for
+# minutes. Queue depth crosses its threshold at the moment work actually starts
+# waiting — which is the moment more capacity would have helped.
+#
+# The same control law is what the GPU-scale ecosystem converged on. This
+# applies it to a 0.6B model on a laptop.
+#
+# Prerequisites:
+#   make kind-up dev-images dev-deploy monitoring-install
+#
+# Then:
+#   kubectl apply -f config/samples/autoscaling_qwen3.yaml
+#   kubectl wait modeldeployment/qwen3-auto --for=condition=Ready --timeout=300s
+#
+#   # Watch it react to load:
+#   kubectl get modeldeployment qwen3-auto -w -o custom-columns=\
+# 'DESIRED:.spec.replicas,READY:.status.readyReplicas,METRIC:.status.autoscaling.currentMetricPerPod'
+#
+#   make load MD=qwen3-auto CONCURRENCY=24 DURATION=10m
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3-auto
+  labels:
+    app.kubernetes.io/name: llmcp
+spec:
+  # The STARTING count. The autoscaler owns this field from the first reconcile
+  # onward, exactly as an external HPA would — which is the point of routing
+  # both through the /scale subresource.
+  replicas: 2
+
+  model:
+    name: qwen3-0.6b
+    source:
+      image:
+        image: localhost:5001/llmcp-model:qwen3-0.6b-q4km
+        path: /weights/model.gguf
+        pullPolicy: IfNotPresent
+
+  engine:
+    type: llamacpp
+    contextSize: 4096
+    # This number and the autoscaling target below are related, and getting the
+    # relationship wrong is the most common way to misconfigure this. maxConcurrency
+    # is how many requests a pod can WORK ON; anything beyond it queues. So the
+    # queue-depth target says "how much waiting is acceptable per pod", and it
+    # only means anything relative to a pod that is already busy with four.
+    maxConcurrency: 4
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+
+  serving:
+    port: 8080
+    startupTimeout: 180s
+
+  autoscaling:
+    mode: Builtin
+    minReplicas: 1
+    # A ceiling is required, not optional: an autoscaler without one is a budget
+    # incident waiting for a traffic spike. Six 2-CPU pods is already more than
+    # a 8-CPU Docker VM can run well, which is the real constraint here.
+    maxReplicas: 6
+
+    metric: queue-depth
+    # Two requests waiting per pod. Zero is not achievable — a queue of zero
+    # means the fleet is over-provisioned by definition — and a large target
+    # trades latency for cost.
+    target: "2"
+
+    # The dead band, and it is not decoration. Without it a queue depth of 2.1
+    # against a target of 2 is a scale event, and so is 1.9 fifteen seconds
+    # later. The fleet then oscillates forever, each change costing a model
+    # load, reacting mostly to the noise created by its own churn.
+    tolerance: "100m"
+
+    pollInterval: 15s
+    window: 60s
+
+    # ASYMMETRIC, deliberately. Adding capacity late costs latency the user
+    # experiences; removing it early costs a cold start on the next spike. For a
+    # pod that has to load 400 MB of weights before it can serve, five minutes
+    # of patience on the way down is cheap insurance.
+    scaleUpStabilization: 0s
+    scaleDownStabilization: 300s
+
+    provider:
+      type: Prometheus
+      address: http://prometheus-operated.monitoring.svc:9090
+      timeout: 10s
+
+  observability:
+    serviceMonitor:
+      enabled: true
+      interval: 15s

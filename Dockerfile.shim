@@ -1,0 +1,44 @@
+# Build the llmcp metrics shim: the reverse proxy injected as a native sidecar
+# beside every inference engine.
+#
+# The builder stage is pinned to $BUILDPLATFORM and cross-compiles with GOARCH
+# instead of running under QEMU: emulated builds of the Go toolchain are an
+# order of magnitude slower, and nothing here needs CGO.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+# VERSION is stamped into the llmcp_shim_info gauge, which is how a running
+# fleet can be checked for version skew between the shim and the controller
+# that queries the metrics it emits.
+ARG VERSION=dev
+
+WORKDIR /workspace
+
+# Module manifests first, so the dependency layer survives source changes.
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -a -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/shim ./cmd/shim
+
+# Distroless static: no shell, no package manager, nonroot by default.
+#
+# This container terminates untrusted client connections on behalf of the
+# engine, so it gets the same treatment the engine does — and the operator
+# additionally runs it with a read-only root filesystem and every capability
+# dropped.
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /out/shim /shim
+USER 65532:65532
+
+# 8080 proxies inference traffic, 9090 serves /metrics. They are separate
+# listeners so scrape traffic and client traffic cannot reach each other's
+# endpoints.
+EXPOSE 8080 9090
+
+ENTRYPOINT ["/shim"]

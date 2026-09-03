@@ -39,7 +39,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/rand"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 const (
@@ -101,6 +101,27 @@ const (
 	ComponentRouter          = "router"
 )
 
+// ShimContainerName is the name of the metrics sidecar in every pod template.
+//
+// Like the engine container's name this is stable API: `kubectl logs -c shim`
+// appears in runbooks, and Server-Side Apply matches containers by name, so a
+// rename would orphan the old container rather than update it.
+const ShimContainerName = "shim"
+
+// GrafanaDashboardLabel is the label the Grafana sidecar watches ConfigMaps
+// for. Its VALUE is the string "1", not the boolean true: the sidecar compares
+// the label value against a configured string, and YAML's `true` serialises to
+// a label value of "true", which does not match.
+const (
+	GrafanaDashboardLabel = "grafana_dashboard"
+	GrafanaDashboardValue = "1"
+
+	// GrafanaFolderAnnotation places dashboards in a named Grafana folder
+	// rather than scattering them at the root.
+	GrafanaFolderAnnotation = "grafana_folder"
+	GrafanaFolder           = "LLM Inference"
+)
+
 // Ports. Fixed in Sprint 1 so that nothing downstream has to move.
 //
 // The engine listens on EnginePort. Once the metrics shim is introduced it
@@ -114,18 +135,59 @@ const (
 	// EnginePort is the container port the inference engine serves on.
 	EnginePort int32 = 8000
 
-	// ShimPort is the container port the metrics shim will serve on.
+	// ShimPort is the container port the metrics shim serves proxied traffic on.
 	ShimPort int32 = 8080
 
-	// ShimMetricsPort is where the shim will expose Prometheus metrics.
+	// ShimMetricsPort is where the shim exposes Prometheus metrics.
+	//
+	// A separate port, not a path on ShimPort, and the Service that fronts it
+	// is a different Service from the serving one. Sharing a listener would
+	// publish /metrics to every client that can reach the inference endpoint,
+	// and — worse for this project specifically — would let a client bypass the
+	// proxy path whose measurements are the point of the sidecar.
 	ShimMetricsPort int32 = 9090
 )
 
-// Port names. Stable forever: ServiceMonitor selects by name.
+// Port names. Stable forever: ServiceMonitor selects endpoints by port NAME,
+// and renaming one silently stops scraping with no error anywhere.
 const (
-	PortNameHTTP    = "http"
-	PortNameEngine  = "engine"
+	// PortNameHTTP is the client-facing OpenAI-compatible port. It is the shim
+	// when the shim is enabled and the engine when it is not, which is exactly
+	// why the Service targets it by name rather than by number.
+	PortNameHTTP = "http"
+
+	// PortNameEngine is the engine's own port. When the shim is enabled this is
+	// reachable only inside the pod and through the headless metrics Service —
+	// never through the serving Service, or clients could bypass the proxy that
+	// produces every measurement this project makes decisions on.
+	PortNameEngine = "engine"
+
+	// PortNameMetrics is the shim's Prometheus endpoint.
 	PortNameMetrics = "metrics"
+)
+
+// HTTP paths the shim serves on its own behalf, alongside the proxied engine
+// surface. They are under /llmcp/ so they cannot collide with an engine route,
+// present or future.
+const (
+	// ShimHealthPath proxies the engine's health endpoint. It is what the
+	// shim's READINESS probe targets, so the pod is only Ready when both the
+	// shim is listening and the engine behind it has loaded its model.
+	ShimHealthPath = "/llmcp/healthz"
+
+	// ShimLivePath reports only that the shim's own listener is up, without
+	// touching the engine.
+	//
+	// The distinction is load-bearing for a native sidecar. The kubelet starts
+	// the main container only after the sidecar's STARTUP probe passes, so a
+	// startup probe that proxied to the engine would wait for a container that
+	// has not been started yet — a deadlock that presents as a pod stuck in Init
+	// forever. Startup targets this path; readiness targets ShimHealthPath.
+	ShimLivePath = "/llmcp/livez"
+
+	// ShimMetricsPath is the Prometheus scrape path, served on the metrics
+	// listener only.
+	ShimMetricsPath = "/metrics"
 )
 
 // maxNameLen is the longest name we will generate. Kubernetes allows 253
@@ -218,6 +280,36 @@ func Service(mdName string) string {
 // Endpoint is the OpenAI-compatible base URL published in status.
 func Endpoint(mdName, namespace string) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d/v1", Service(mdName), namespace, ServicePort)
+}
+
+// MetricsService is the headless Service that Prometheus scrapes.
+//
+// It is deliberately a SECOND Service rather than extra ports on the serving
+// one. Two reasons, both practical: the engine's own /metrics has to be
+// reachable for the diagnostics scrape, and exposing the engine's port on the
+// serving Service would let any in-cluster client address the engine directly,
+// skipping the shim — at which point that traffic contributes to no metric and
+// the canary analysis is quietly reasoning about a subset of the load. Headless
+// (clusterIP: None) because a scraper wants individual pod addresses, not one
+// load-balanced VIP that lands on a different pod every scrape.
+func MetricsService(mdName string) string {
+	return withSuffix(mdName, "-metrics")
+}
+
+// ServiceMonitor is the prometheus-operator ServiceMonitor name.
+func ServiceMonitor(mdName string) string {
+	return withSuffix(mdName, "")
+}
+
+// PrometheusRule is the recording- and alerting-rule object's name.
+//
+// Suffixed rather than sharing the ServiceMonitor's name, even though they are
+// different kinds and could collide safely. Two reasons: `kubectl get
+// prometheusrules` is legible without cross-referencing, and prometheus-operator
+// derives the generated rule FILE name from this, so a distinct name keeps the
+// two apart in Prometheus's own config directory.
+func PrometheusRule(mdName string) string {
+	return withSuffix(mdName, "-slo")
 }
 
 // ControllerRevision names a revision history entry.

@@ -35,6 +35,13 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.canary.currentWeight
+      name: Weight
+      type: integer
+    - jsonPath: .status.canary.failedChecks
+      name: Failed
+      priority: 1
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -74,6 +81,148 @@ spec:
           spec:
             description: spec is the desired state.
             properties:
+              autoscaling:
+                description: |-
+                  Autoscaling configures the built-in autoscaler.
+
+                  Nil means off, and something else owns .spec.replicas: a human with
+                  `kubectl scale`, a GitOps commit, or an external HorizontalPodAutoscaler
+                  writing through the /scale subresource. All three work without any
+                  configuration here, which is why this is a pointer rather than a struct
+                  with a defaulted `mode: Off`.
+                properties:
+                  maxReplicas:
+                    description: |-
+                      MaxReplicas is the ceiling. Required: an autoscaler without one is a
+                      budget incident waiting for a traffic spike.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  metric:
+                    default: queue-depth
+                    description: Metric is the signal to track.
+                    enum:
+                    - queue-depth
+                    - concurrency
+                    type: string
+                  minReplicas:
+                    default: 1
+                    description: |-
+                      MinReplicas is the floor.
+
+                      It is not 0: scale-to-zero is explicitly out of scope for this project,
+                      and a floor of zero on an engine with a multi-minute cold start would
+                      turn the first request after a quiet period into a timeout rather than a
+                      slow response.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  mode:
+                    default: Builtin
+                    description: Mode selects who owns .spec.replicas.
+                    enum:
+                    - "Off"
+                    - Builtin
+                    type: string
+                  pollInterval:
+                    default: 15s
+                    description: PollInterval is how often the metric is sampled.
+                    type: string
+                  provider:
+                    description: |-
+                      Provider points at the metric backend.
+
+                      Separate from the canary's provider block even though both normally name
+                      the same Prometheus. They fail independently and for different reasons —
+                      a rollout can be over while autoscaling runs forever — and sharing one
+                      field would mean a ModelDeployment with no canary could not configure an
+                      autoscaler at all.
+                    properties:
+                      address:
+                        description: |-
+                          Address is the base URL of the metric backend, e.g.
+                          http://prometheus-operated.monitoring.svc:9090
+
+                          It has no default. A wrong-but-plausible default would make every canary
+                          report Error for a reason nobody would think to check, and unlike most
+                          misconfigurations this one is silent until a rollout is already in
+                          flight.
+                        type: string
+                      timeout:
+                        default: 10s
+                        description: Timeout bounds a single query.
+                        type: string
+                      type:
+                        default: Prometheus
+                        description: Type selects the backend implementation.
+                        enum:
+                        - Prometheus
+                        type: string
+                    type: object
+                  scaleDownStabilization:
+                    default: 300s
+                    description: |-
+                      ScaleDownStabilization is how far back to look when scaling DOWN.
+
+                      Five minutes, and for an inference workload that is if anything short: a
+                      pod removed here has to load its weights again to come back, which for a
+                      real model is minutes of unavailable capacity bought to save seconds of
+                      idle capacity.
+                    type: string
+                  scaleUpStabilization:
+                    default: 0s
+                    description: |-
+                      ScaleUpStabilization is how far back to look when scaling UP.
+
+                      Zero by default, deliberately asymmetric with ScaleDownStabilization.
+                      Adding capacity late costs latency the user experiences; removing it
+                      early costs a cold start on the next spike. The asymmetry says which
+                      mistake is cheaper, and it is the same asymmetry the HPA ships with.
+                    type: string
+                  target:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: "2"
+                    description: |-
+                      Target is the desired value of Metric, PER POD.
+
+                      A Quantity rather than a float because the Kubernetes API convention
+                      forbids floats in a spec: they serialise inconsistently across language
+                      bindings and cannot round-trip through protobuf. Write "2" or "1500m".
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  tolerance:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    default: 100m
+                    description: |-
+                      Tolerance is the fraction by which the measured ratio may differ from 1.0
+                      before any scaling happens.
+
+                      0.1 is the HPA's own default and it is not decoration. Without a
+                      tolerance band, a queue depth of 4.1 against a target of 4 is a scale
+                      event — and so is 3.9 fifteen seconds later. The fleet then oscillates
+                      forever, each change costing a model load, and the metric it is reacting
+                      to is mostly the noise created by its own churn.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  window:
+                    default: 60s
+                    description: |-
+                      Window is the PromQL lookback the metric is averaged over.
+
+                      Averaged, not instantaneous: queue depth is spiky by nature — it is the
+                      difference between arrivals and a fixed number of decode slots — and an
+                      instant read samples whichever microsecond the scrape landed on.
+                    type: string
+                required:
+                - maxReplicas
+                type: object
+                x-kubernetes-validations:
+                - message: maxReplicas must be greater than or equal to minReplicas
+                  rule: self.maxReplicas >= self.minReplicas
               engine:
                 description: Engine selects and configures the inference server.
                 properties:
@@ -515,6 +664,161 @@ spec:
                 - name
                 - source
                 type: object
+              observability:
+                description: |-
+                  Observability configures what the operator publishes for Prometheus and
+                  Grafana to consume.
+                properties:
+                  prometheusRule:
+                    description: |-
+                      PrometheusRule configures the recording rules and burn-rate alerts the
+                      controller creates.
+                    properties:
+                      enabled:
+                        default: true
+                        description: Enabled creates the PrometheusRule. Defaults
+                          to true.
+                        type: boolean
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Labels are added to the PrometheusRule's metadata, for a Prometheus whose
+                          ruleSelector is not empty. Same escape hatch, and same silent failure
+                          mode, as ServiceMonitorSpec.Labels.
+                        type: object
+                      longWindowAlerts:
+                        default: false
+                        description: |-
+                          LongWindowAlerts emits the slow-burn tier as well: 3x over 1d and 1x over
+                          3d, the two rungs of the Google SRE ladder that catch a budget being
+                          consumed steadily rather than suddenly.
+
+                          Off by default, and the reason is honesty rather than laziness. A demo
+                          cluster is minutes old, so a 3d window has no data and every panel and
+                          alert built on it shows "No Data" — which looks worse than not having
+                          them and trains a viewer to ignore the alert list. Being explicit that
+                          the SLO window is compressed for the demo is more credible than shipping
+                          rules that cannot evaluate.
+
+                          Turn this on for a real deployment, where the windows mean what they say.
+                        type: boolean
+                    type: object
+                  serviceMonitor:
+                    description: |-
+                      ServiceMonitor configures the prometheus-operator ServiceMonitor the
+                      controller creates for this ModelDeployment.
+
+                      If the prometheus-operator CRDs are not installed in the cluster, no
+                      ServiceMonitor is created and the MetricsRegistered condition explains
+                      why. That is reported as a fact, not an error: a cluster without
+                      Prometheus is a legitimate configuration, and failing the reconcile over
+                      it would make the whole resource unusable.
+                    properties:
+                      enabled:
+                        default: true
+                        description: Enabled creates the ServiceMonitor. Defaults
+                          to true.
+                        type: boolean
+                      interval:
+                        default: 15s
+                        description: |-
+                          Interval is the scrape interval.
+
+                          The default is deliberately tighter than Prometheus's own 30s default.
+                          Canary analysis evaluates a rate() over a short window — 60s by
+                          measurement — and a rate over a window holding two samples is not a rate,
+                          it is a difference between two points with no way to tell a trend from a
+                          blip. 15s puts four samples in that window.
+                        type: string
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Labels are added to the ServiceMonitor's metadata.
+
+                          This is the escape hatch for a Prometheus whose serviceMonitorSelector is
+                          not empty: prometheus-operator only picks up ServiceMonitors matching
+                          that selector, and the failure mode when it does not match is total
+                          silence — no error, no event, simply no metrics. Setting the label the
+                          local Prometheus selects on is how a user fixes that without patching the
+                          operator.
+                        type: object
+                      scrapeEngineMetrics:
+                        default: true
+                        description: |-
+                          ScrapeEngineMetrics also scrapes the inference engine's own metrics
+                          endpoint, in addition to the shim's. Defaults to true.
+
+                          The two are not interchangeable and neither replaces the other. The
+                          shim's llmcp_* metrics are the canonical SLIs: they mean the same thing
+                          under any engine, and they are what analysis and alerting consume. The
+                          engine's native metrics are DIAGNOSTICS — KV-cache occupancy, slot
+                          counts, tokens per second as the engine itself counts them — which are
+                          invaluable when a human is debugging why a canary failed and useless as
+                          something to gate a promotion on, because their names and semantics
+                          change with the engine.
+                        type: boolean
+                      scrapeTimeout:
+                        default: 10s
+                        description: |-
+                          ScrapeTimeout bounds a single scrape. It must not exceed Interval;
+                          Prometheus rejects a ServiceMonitor where it does.
+                        type: string
+                    type: object
+                  slo:
+                    description: SLO defines the objectives those alerts are written
+                      against.
+                    properties:
+                      availabilityObjective:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 995m
+                        description: |-
+                          AvailabilityObjective is the fraction of requests that must not fail with
+                          a 5xx.
+
+                          5xx only: a 4xx is the caller's fault — a malformed prompt, a model name
+                          that does not exist, a context overflow — and counting one against the
+                          service would let a single misbehaving client burn an error budget the
+                          service is not responsible for.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ttftObjective:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 990m
+                        description: |-
+                          TTFTObjective is the fraction of requests that must beat TTFTThreshold,
+                          as a value in (0, 1).
+
+                          0.99 means a 1% error budget. Note the budget is what the burn-rate
+                          alerts are scaled against, so a stricter objective makes every alert more
+                          sensitive rather than merely raising a bar.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      ttftThreshold:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 1500m
+                        description: |-
+                          TTFTThreshold is the latency a request must beat to count as good.
+
+                          It is SNAPPED to the nearest histogram bucket boundary at or above the
+                          value, and the snapped figure is what the rules use. That is not a
+                          rounding convenience: a latency SLI is a ratio over the bucket at an
+                          exact `le` label, Prometheus matches `le` as a string, and a boundary the
+                          histogram does not have returns an empty vector rather than an error. The
+                          recording rule would then produce nothing and the burn-rate alert would
+                          never fire — an SLO that cannot alert, which is worse than none because
+                          it is believed.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                type: object
               replicas:
                 default: 1
                 description: |-
@@ -541,9 +845,318 @@ spec:
                     default: true
                     description: |-
                       AutoRollback reverts to the last known-good revision when the deadline is
-                      exceeded. Consumed from the sprint that implements rollback; declared
-                      here so the field is stable.
+                      exceeded.
+
+                      This applies to EVERY strategy, not just Canary. A stalled RollingUpdate
+                      is the more common failure in practice — a bad image reference, a missing
+                      secret, a model file that will not parse — and a Deployment left in that
+                      state stays there indefinitely with no further signal.
                     type: boolean
+                  canary:
+                    description: |-
+                      Canary configures progressive delivery. Required when Type is Canary and
+                      ignored otherwise.
+                    properties:
+                      analysis:
+                        description: Analysis configures the metric checks that gate
+                          each step.
+                        properties:
+                          consecutiveErrorLimit:
+                            default: 5
+                            description: |-
+                              ConsecutiveErrorLimit is how many consecutive provider ERRORS abort the
+                              rollout.
+
+                              Errors are counted separately from failures and are reset by any
+                              successful check, because a Prometheus that is unreachable says nothing
+                              whatsoever about the canary. Rolling back on it would mean a monitoring
+                              outage causes a production rollback — the exact inversion of what the
+                              monitoring is for.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          failureThreshold:
+                            default: 3
+                            description: |-
+                              FailureThreshold is how many FAILED checks trigger a rollback.
+
+                              The counter is NOT reset by an intervening pass, matching Flagger. A
+                              canary that fails, passes, fails, passes, fails is not healthy — it is
+                              intermittently broken, which for a latency SLI is the more common shape
+                              of a real regression than a clean step change.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          inconclusiveLimit:
+                            default: 5
+                            description: |-
+                              InconclusiveLimit is how many consecutive INCONCLUSIVE rounds trigger
+                              OnInconclusive.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          initialDelay:
+                            default: 60s
+                            description: |-
+                              InitialDelay is how long to wait after the canary becomes available
+                              before the first check.
+
+                              Not politeness — correctness. A freshly started inference pod has a cold
+                              KV cache and, on the very first requests, is still faulting the model's
+                              pages in. Its first few seconds of TTFT are genuinely terrible and
+                              genuinely unrepresentative, and measuring them would fail every canary
+                              that was ever going to be fine.
+                            type: string
+                          interval:
+                            default: 30s
+                            description: Interval is how often an analysis round runs.
+                            type: string
+                          metrics:
+                            description: |-
+                              Metrics are the checks evaluated each round. When empty, a sensible
+                              default set is used — see DefaultMetrics.
+                            items:
+                              description: AnalysisMetric is one gate a canary must
+                                pass.
+                              properties:
+                                builtin:
+                                  description: Builtin selects a query this operator
+                                    writes.
+                                  enum:
+                                  - ttft-p95
+                                  - ttft-p99
+                                  - request-duration-p95
+                                  - error-rate
+                                  - success-rate
+                                  - queue-depth
+                                  - output-token-rate
+                                  type: string
+                                compareToPrimary:
+                                  default: false
+                                  description: |-
+                                    CompareToPrimary evaluates the RATIO of the canary's value to the
+                                    primary's rather than the canary's absolute value.
+
+                                    Usually the better gate for latency. An absolute TTFT threshold has to be
+                                    re-tuned for every model, every node type and every prompt length, and
+                                    one that is stale fires on a busy afternoon rather than on a bad release.
+                                    A ratio asks the only question that matters — is the new version worse
+                                    than the one it is replacing? — and answers it under whatever conditions
+                                    happen to be true right now.
+                                  type: boolean
+                                name:
+                                  description: |-
+                                    Name identifies the check in status and events. It is the list map key,
+                                    so it must be unique within the spec.
+                                  maxLength: 63
+                                  minLength: 1
+                                  type: string
+                                query:
+                                  description: |-
+                                    Query is raw PromQL, for checks the built-ins do not cover.
+
+                                    Two template variables are substituted before execution: {{.Variant}} and
+                                    {{.Model}} for the label values, and {{.Window}} for the analysis window.
+                                    A query returning more than one series is an Error, not a silent
+                                    first-match — picking arbitrarily from an ambiguous result is how a gate
+                                    ends up measuring the wrong pod.
+                                  type: string
+                                thresholdRange:
+                                  description: ThresholdRange is the band the value
+                                    must fall inside to Pass.
+                                  properties:
+                                    max:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      description: Max is the inclusive upper bound.
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                    min:
+                                      anyOf:
+                                      - type: integer
+                                      - type: string
+                                      description: Min is the inclusive lower bound.
+                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                      x-kubernetes-int-or-string: true
+                                  type: object
+                              required:
+                              - name
+                              - thresholdRange
+                              type: object
+                              x-kubernetes-validations:
+                              - message: set exactly one of builtin and query
+                                rule: has(self.builtin) != has(self.query)
+                              - message: thresholdRange must set at least one of min
+                                  and max
+                                rule: has(self.thresholdRange.min) || has(self.thresholdRange.max)
+                            maxItems: 10
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          minRequestRate:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            default: 500m
+                            description: |-
+                              MinRequestRate is the request rate, per second and per variant, below
+                              which a check is Inconclusive rather than Pass.
+
+                              This is a first-class field rather than a PromQL idiom buried in a query
+                              template, because without it the entire demo is a lie: with no traffic,
+                              error rate is 0 and every latency percentile is absent, so a canary
+                              "passes" every check and is promoted having served nothing. Anyone who
+                              has run a homegrown canary controller has shipped this bug at least once.
+
+                              Expressed as a Quantity because the Kubernetes API convention forbids
+                              floats: write "500m" for half a request per second, or "2" for two.
+                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                            x-kubernetes-int-or-string: true
+                          onInconclusive:
+                            default: Wait
+                            description: OnInconclusive is what to do once InconclusiveLimit
+                              is reached.
+                            enum:
+                            - Wait
+                            - Rollback
+                            - Promote
+                            type: string
+                          provider:
+                            description: Provider points at the metric backend.
+                            properties:
+                              address:
+                                description: |-
+                                  Address is the base URL of the metric backend, e.g.
+                                  http://prometheus-operated.monitoring.svc:9090
+
+                                  It has no default. A wrong-but-plausible default would make every canary
+                                  report Error for a reason nobody would think to check, and unlike most
+                                  misconfigurations this one is silent until a rollout is already in
+                                  flight.
+                                type: string
+                              timeout:
+                                default: 10s
+                                description: Timeout bounds a single query.
+                                type: string
+                              type:
+                                default: Prometheus
+                                description: Type selects the backend implementation.
+                                enum:
+                                - Prometheus
+                                type: string
+                            type: object
+                          window:
+                            default: 60s
+                            description: |-
+                              Window is the PromQL lookback each metric is evaluated over.
+
+                              It must be comfortably larger than the scrape interval, or a rate() over
+                              it is computed from two samples — a difference between two points, with
+                              no way to tell a trend from a blip.
+                            type: string
+                        type: object
+                      maxWeight:
+                        default: 50
+                        description: |-
+                          MaxWeight is the traffic share at which the canary is promoted rather
+                          than stepped further. Ignored when StepWeights is set.
+
+                          It is deliberately below 100 by default. Once a canary is carrying half
+                          the traffic and every check has passed, additional steps buy very little
+                          information and cost real time; promotion at that point is a decision,
+                          not a gamble.
+                        format: int32
+                        maximum: 100
+                        minimum: 1
+                        type: integer
+                      requireApproval:
+                        default: false
+                        description: |-
+                          RequireApproval pauses before the final promotion until an operator sets
+                          the llmcp.io/promote annotation to "true".
+
+                          The gate is on PROMOTION, not on each step. A human asked to approve
+                          every 20% increment stops reading and starts clicking, which is worse
+                          than no gate at all; asked once, at the point of no return, they actually
+                          look.
+                        type: boolean
+                      scale:
+                        description: |-
+                          Scale decouples the canary's replica count from its traffic weight.
+
+                          Borrowed from Argo Rollouts' canaryScale, and it earns its place for
+                          inference specifically: a model server has a long, expensive warm-up, so
+                          a canary that is scaled up in lockstep with its weight spends the first
+                          analysis window of every step loading a model rather than serving. Fixing
+                          the replica count up front means the canary is warm before it is
+                          measured.
+                        properties:
+                          matchTrafficWeight:
+                            description: |-
+                              MatchTrafficWeight sizes the canary in proportion to its weight. This is
+                              the default behaviour.
+                            type: boolean
+                          replicas:
+                            description: |-
+                              Replicas pins the canary to a fixed number of pods for the whole
+                              rollout, regardless of its traffic weight.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                        type: object
+                        x-kubernetes-validations:
+                        - message: set at most one of replicas and matchTrafficWeight
+                          rule: '[has(self.replicas), has(self.matchTrafficWeight)].filter(x,
+                            x).size() <= 1'
+                      stepWeight:
+                        description: |-
+                          StepWeight is the traffic share added at each step: 20 produces the
+                          ladder 20, 40, 60, ... up to MaxWeight. Defaults to 20 when unset.
+
+                          Deliberately NOT given a kubebuilder default, even though every other
+                          optional field here has one. A defaulted field is always "present" to
+                          CEL, which would make the mutual-exclusion rule above unsatisfiable: a
+                          user who set only stepWeights would be rejected for also setting a
+                          stepWeight they never wrote. The default lives in StepLadder instead,
+                          where it can coexist with the validation that matters more.
+                        format: int32
+                        maximum: 100
+                        minimum: 1
+                        type: integer
+                      stepWeights:
+                        description: |-
+                          StepWeights is an explicit, strictly increasing ladder, e.g. [5, 20, 50].
+                          It overrides StepWeight and MaxWeight entirely.
+
+                          An explicit ladder exists because a uniform step is the wrong shape for
+                          most real rollouts: the interesting information arrives in the first few
+                          percent of traffic, so a small first step followed by larger ones spends
+                          the risk budget where it buys the most.
+                        items:
+                          format: int32
+                          type: integer
+                        maxItems: 20
+                        type: array
+                      trafficRouting:
+                        description: TrafficRouting selects how traffic is divided
+                          between the variants.
+                        properties:
+                          mode:
+                            default: Replica
+                            description: Mode selects the splitting mechanism.
+                            enum:
+                            - Replica
+                            type: string
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: set at most one of stepWeight and stepWeights
+                      rule: '!(has(self.stepWeight) && has(self.stepWeights))'
+                    - message: every entry in stepWeights must be between 1 and 100
+                      rule: '!has(self.stepWeights) || self.stepWeights.all(w, w >=
+                        1 && w <= 100)'
                   maxSurge:
                     anyOf:
                     - type: integer
@@ -572,8 +1185,13 @@ spec:
                     enum:
                     - RollingUpdate
                     - Recreate
+                    - Canary
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: spec.rollout.canary is required when spec.rollout.type
+                    is Canary
+                  rule: self.type != 'Canary' || has(self.canary)
               serving:
                 description: Serving configures the network surface in front of the
                   engine.
@@ -586,6 +1204,106 @@ spec:
                     maximum: 65535
                     minimum: 1
                     type: integer
+                  shim:
+                    description: Shim configures the llmcp metrics sidecar.
+                    properties:
+                      enabled:
+                        default: true
+                        description: |-
+                          Enabled injects the shim. Defaults to true.
+
+                          Turning it off leaves the engine serving directly and is supported, but
+                          it disables every llmcp_* metric — which means canary analysis, the
+                          built-in autoscaler and the SLO alerts all lose their inputs. The
+                          MetricsRegistered condition says so out loud rather than leaving an
+                          operator to discover it from empty graphs.
+                        type: boolean
+                      image:
+                        description: |-
+                          Image overrides the shim container image.
+
+                          The operator's own build-pinned shim image is used when this is empty,
+                          which is almost always what is wanted: the shim's metric names are the
+                          contract the operator's analysis code reads, so running a shim from a
+                          different build than the controller is a version skew with silent
+                          consequences.
+                        type: string
+                      logLevel:
+                        default: info
+                        description: LogLevel sets the shim's log verbosity.
+                        enum:
+                        - debug
+                        - info
+                        - warn
+                        - error
+                        type: string
+                      resources:
+                        description: |-
+                          Resources are the shim container's compute resources.
+
+                          The shim is a streaming byte pump with a histogram attached; it is
+                          deliberately given a small, explicit default rather than left
+                          unconstrained, because an unbounded sidecar sharing a pod with a
+                          CPU-starved inference engine can steal exactly the cycles whose absence
+                          the metrics are supposed to be measuring.
+                        properties:
+                          claims:
+                            description: |-
+                              Claims lists the names of resources, defined in spec.resourceClaims,
+                              that are used by this container.
+
+                              This field depends on the
+                              DynamicResourceAllocation feature gate.
+
+                              This field is immutable. It can only be set for containers.
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: |-
+                                    Name must match the name of one entry in pod.spec.resourceClaims of
+                                    the Pod where this field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                                request:
+                                  description: |-
+                                    Request is the name chosen for a request in the referenced claim.
+                                    If empty, everything from the claim is made available, otherwise
+                                    only the result of this request.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Limits describes the maximum amount of compute resources allowed.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests describes the minimum amount of compute resources required.
+                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                        type: object
+                    type: object
                   startupTimeout:
                     default: 300s
                     description: |-
@@ -605,12 +1323,210 @@ spec:
           status:
             description: status is the observed state.
             properties:
+              autoscaling:
+                description: |-
+                  Autoscaling reports what the built-in autoscaler is doing. Nil when it is
+                  not enabled.
+                properties:
+                  currentMetric:
+                    description: |-
+                      CurrentMetric is the measured value, aggregated across the whole fleet,
+                      rendered as a string.
+
+                      A string, not a Quantity: this is an observation rather than a
+                      specification, so it is not bound by the no-floats convention, and it
+                      must be able to stay empty when there was no measurement at all. A zero
+                      would be indistinguishable from a measured zero — which is precisely the
+                      confusion that makes an autoscaler freeze a fleet while load climbs.
+                    type: string
+                  currentMetricPerPod:
+                    description: |-
+                      CurrentMetricPerPod is CurrentMetric divided by the ready pods — the
+                      number actually compared against the target.
+                    type: string
+                  desiredReplicas:
+                    description: DesiredReplicas is the count the autoscaler most
+                      recently asked for.
+                    format: int32
+                    type: integer
+                  lastScaleTime:
+                    description: |-
+                      LastScaleTime is when .spec.replicas last changed because of this
+                      autoscaler.
+                    format: date-time
+                    type: string
+                  message:
+                    description: |-
+                      Message explains the most recent decision, including the decision not to
+                      act.
+                    type: string
+                  recommendations:
+                    description: |-
+                      Recommendations is the recent decision history that stabilization reads.
+
+                      It lives in status rather than in memory for the same reason the canary's
+                      position does: a leader-election handover, a crash or an operator upgrade
+                      must not reset it. An in-memory window silently forgets that the fleet
+                      was scaled up ninety seconds ago, and the replacement process is free to
+                      scale it straight back down.
+                    items:
+                      description: ScaleRecommendation is one autoscaler decision,
+                        kept for stabilization.
+                      properties:
+                        replicas:
+                          description: |-
+                            Replicas is the raw recommendation, before stabilization and before
+                            clamping to the current value.
+                          format: int32
+                          type: integer
+                        time:
+                          description: Time is when the recommendation was computed.
+                          format: date-time
+                          type: string
+                      required:
+                      - replicas
+                      - time
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
               availableReplicas:
                 description: |-
                   AvailableReplicas is the number of pods that have been ready long enough
                   to count as available.
                 format: int32
                 type: integer
+              canary:
+                description: |-
+                  Canary reports the state of an in-flight or just-finished canary. It is
+                  nil when no canary has ever run.
+                properties:
+                  availableSince:
+                    description: |-
+                      AvailableSince is when the canary's pods first became ready.
+
+                      The warm-up delay is measured from here rather than from StartTime,
+                      because a canary that spent four minutes pulling a model image has not
+                      been warm for four minutes — and measuring a cold inference pod's first
+                      requests would fail every canary that was ever going to be fine.
+                    format: date-time
+                    type: string
+                  checks:
+                    description: Checks is the most recent round's per-metric outcomes.
+                    items:
+                      description: MetricCheck records one metric's outcome for status.
+                      properties:
+                        message:
+                          description: Message explains a non-Pass verdict.
+                          type: string
+                        name:
+                          description: Name is the AnalysisMetric this check evaluated.
+                          type: string
+                        threshold:
+                          description: |-
+                            Threshold restates the band that was applied, so a status read weeks
+                            later still explains itself without the spec beside it.
+                          type: string
+                        value:
+                          description: |-
+                            Value is the observed value, rendered as a string.
+
+                            A string rather than a Quantity: this is an observation, not a
+                            specification, so it is not bound by the no-floats convention, and it
+                            must be able to say "NaN" or stay empty when there was no value at all.
+                            A zero here would be indistinguishable from a measured zero.
+                          type: string
+                        verdict:
+                          description: Verdict is the outcome.
+                          enum:
+                          - Pass
+                          - Fail
+                          - Inconclusive
+                          - Error
+                          type: string
+                      required:
+                      - name
+                      - verdict
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  consecutiveErrors:
+                    description: |-
+                      ConsecutiveErrors counts back-to-back provider failures. Reset by any
+                      round that reaches a verdict.
+                    format: int32
+                    type: integer
+                  consecutiveInconclusive:
+                    description: ConsecutiveInconclusive counts back-to-back unusable
+                      rounds.
+                    format: int32
+                    type: integer
+                  currentWeight:
+                    description: |-
+                      CurrentWeight is the share actually achieved after quantisation.
+
+                      Reported separately from DesiredWeight, and this honesty is the point.
+                      Replica-based splitting cannot express 20% with 3 pods: the nearest
+                      achievable value is 33%. Showing only the requested number would let an
+                      operator believe the blast radius is smaller than it is, and would make
+                      the analysis appear to be measuring a 20% exposure when it is measuring a
+                      third of production.
+                    format: int32
+                    type: integer
+                  desiredWeight:
+                    description: DesiredWeight is the traffic share the current step
+                      asked for.
+                    format: int32
+                    type: integer
+                  failedChecks:
+                    description: |-
+                      FailedChecks counts rounds that produced a Fail. Not reset by a
+                      subsequent Pass.
+                    format: int32
+                    type: integer
+                  failedRevision:
+                    description: |-
+                      FailedRevision is the revision the most recent rollback rejected.
+
+                      Without it the controller would immediately re-canary the same revision
+                      it just rolled back from: the spec still names it, so the target and the
+                      stable revision still differ, and the state machine would dutifully start
+                      again — producing an infinite loop of identical failing rollouts, each
+                      one costing a full analysis window and a Deployment churn.
+
+                      Recording the rejection makes a rollback STICK until a human changes the
+                      spec, which is exactly the semantics people expect from one.
+                    type: string
+                  lastAnalysisTime:
+                    description: |-
+                      LastAnalysisTime is when the last round ran. It is what the interval is
+                      measured from.
+                    format: date-time
+                    type: string
+                  message:
+                    description: Message is a human-readable summary of the current
+                      state.
+                    type: string
+                  revision:
+                    description: Revision is the revision hash under evaluation.
+                    type: string
+                  stableRevision:
+                    description: StableRevision is what a rollback would revert to.
+                    type: string
+                  startTime:
+                    description: StartTime is when this canary began.
+                    format: date-time
+                    type: string
+                  step:
+                    description: Step is the zero-based index into the weight ladder.
+                    format: int32
+                    type: integer
+                  steps:
+                    description: Steps is how many steps the ladder has.
+                    format: int32
+                    type: integer
+                type: object
               conditions:
                 description: Conditions follow the standard Kubernetes condition contract.
                 items:
@@ -692,6 +1608,10 @@ spec:
                 - Pending
                 - Progressing
                 - Available
+                - Canarying
+                - Promoting
+                - RollingBack
+                - Paused
                 - Degraded
                 type: string
               readyReplicas:

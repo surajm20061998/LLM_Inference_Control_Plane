@@ -1,0 +1,21 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hpa-demo
+spec:
+  scaleTargetRef:
+    # A CRD target, resolved through the /scale subresource. Nothing here knows
+    # what a ModelDeployment is; it only knows the resource exposes /scale with
+    # a replica count and a label selector.
+    apiVersion: inference.llmcp.io/v1alpha1
+    kind: ModelDeployment
+    name: hpa-demo
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

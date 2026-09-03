@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rollback-load
+spec:
+  # No retries: a load generator that restarts produces a second overlapping run
+  # whose samples merge into the first, and the resulting percentiles describe
+  # neither.
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: localhost:5001/llmcp-loadgen:dev
+          imagePullPolicy: Always
+          args:
+            - --url=http://rollback-demo:8080
+            - --model=stub-model
+            - --duration=10m
+            - --concurrency=8
+            - --tokens=24
+            # See the suite comment: per-connection load balancing makes a
+            # keep-alive client pin itself to one pod.
+            - --keepalive=false
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

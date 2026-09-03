@@ -1,0 +1,22 @@
+# Let Prometheus read the operator's metrics endpoint.
+#
+# controller-runtime protects /metrics with a SubjectAccessReview against the
+# nonResourceURL /metrics. Prometheus's service account has no such permission
+# by default, so without this binding the scrape returns 403 and the control
+# plane dashboard is empty — with the only evidence being a target error page
+# nobody thinks to open.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: llmcp-prometheus-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    # The service account kube-prometheus-stack creates for its Prometheus when
+    # installed as release "kps" in the "monitoring" namespace, which is what
+    # `make monitoring-install` does.
+    name: kps-kube-prometheus-stack-prometheus
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: llmcp-metrics-reader
+  apiGroup: rbac.authorization.k8s.io

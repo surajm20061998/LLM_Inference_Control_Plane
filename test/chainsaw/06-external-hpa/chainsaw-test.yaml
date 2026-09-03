@@ -1,0 +1,119 @@
+# A stock HorizontalPodAutoscaler drives this CRD.
+#
+# This suite is the reason `spec.autoscaling.mode` has no `HPA` value. An
+# external HPA writes .spec.replicas through the /scale subresource and the
+# controller reconciles that like any other spec change, so an enum value would
+# change exactly zero lines of behaviour while implying the operator does
+# something special for it.
+#
+# Proving the claim is worth more than encoding it. And this is the one
+# assertion no other tier can make: envtest has no HPA controller at all, so it
+# can only show that the subresource this operator publishes has the right
+# shape — not that the real thing consumes it.
+#
+# The HPA here targets CPU deliberately. metrics-server ships in kind and CPU is
+# the one metric it always has, which keeps the suite about the SCALE CONTRACT
+# rather than about custom-metrics plumbing. The project's own thesis — that CPU
+# is the wrong signal for inference — is demonstrated by the built-in
+# autoscaler; what is being tested here is only that a foreign scaler can drive
+# the resource at all.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: external-hpa
+spec:
+  timeouts:
+    apply: 1m
+    assert: 6m
+    cleanup: 2m
+  steps:
+    - name: create
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: hpa-demo
+              status:
+                replicas: 1
+                readyReplicas: 1
+                conditions:
+                  - type: Ready
+                    status: "True"
+
+    - name: the-scale-subresource-is-readable
+      try:
+        # The precondition for everything below. A CRD whose status.selector is
+        # a marshalled LabelSelector rather than a serialized string still
+        # validates, still scales by hand, and fails ONLY here — by leaving the
+        # HPA unable to find any pods.
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE get --raw \
+                "/apis/inference.llmcp.io/v1alpha1/namespaces/$NAMESPACE/modeldeployments/hpa-demo/scale" \
+                | tee /dev/stderr | grep -q '"replicas":1'
+        - script:
+            content: |
+              set -euo pipefail
+              selector=$(kubectl -n $NAMESPACE get modeldeployment hpa-demo -o jsonpath='{.status.selector}')
+              echo "selector: ${selector}"
+              # It must be a selector STRING, not JSON.
+              case "${selector}" in
+                *matchLabels*) echo "status.selector is a marshalled LabelSelector, not a string"; exit 1 ;;
+                "")            echo "status.selector is empty"; exit 1 ;;
+              esac
+              # And it must actually select the serving pods.
+              found=$(kubectl -n $NAMESPACE get pods -l "${selector}" --no-headers | wc -l | tr -d ' ')
+              echo "pods matched: ${found}"
+              [ "${found}" -ge 1 ]
+
+    - name: an-hpa-adopts-it
+      try:
+        - apply:
+            file: hpa.yaml
+        - assert:
+            # `currentReplicas` becoming non-zero and ScalingActive going True is
+            # exactly the difference between `kubectl get hpa` showing <unknown>
+            # and showing a number. It is the assertion the exit criterion names.
+            resource:
+              apiVersion: autoscaling/v2
+              kind: HorizontalPodAutoscaler
+              metadata:
+                name: hpa-demo
+              status:
+                currentReplicas: 1
+                conditions:
+                  - type: ScalingActive
+                    status: "True"
+
+    - name: the-hpa-can-write-back
+      try:
+        # Driving real CPU load through a stub engine is slow and noisy, so the
+        # write path is exercised directly against the same subresource the HPA
+        # uses. What the previous step proved is that the HPA can READ; this
+        # proves the resource accepts the corresponding write.
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE patch --subresource=scale modeldeployment/hpa-demo \
+                --type=merge -p '{"spec":{"replicas":2}}'
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: hpa-demo
+              status:
+                replicas: 2
+                readyReplicas: 2
+      catch:
+        - describe:
+            apiVersion: autoscaling/v2
+            kind: HorizontalPodAutoscaler
+        - describe:
+            apiVersion: inference.llmcp.io/v1alpha1
+            kind: ModelDeployment

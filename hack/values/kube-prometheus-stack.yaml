@@ -1,0 +1,156 @@
+# Slimmed kube-prometheus-stack values for the local kind cluster.
+#
+#   helm upgrade -i kps prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace --version 88.6.2 \
+#     -f hack/values/kube-prometheus-stack.yaml
+#
+# The stack ships assuming a real cluster with real capacity. On a laptop kind
+# cluster that also has to run three llama.cpp replicas, the defaults are the
+# difference between a demo that works and one that spends its time being
+# evicted — so several components are turned off outright rather than merely
+# resized. Everything disabled here is disabled because nothing in this project
+# reads it.
+
+# ---------------------------------------------------------------------------
+# THE MOST IMPORTANT SETTING IN THIS FILE
+#
+# By default prometheus-operator only adopts ServiceMonitors carrying the
+# chart's own release label. Every ServiceMonitor this operator creates would
+# therefore be ignored — and ignored SILENTLY: no error, no event, no entry in
+# Prometheus's targets page. The symptom is empty graphs and a canary that never
+# gets any data, which is the single most expensive way for this stack to be
+# misconfigured.
+#
+# Setting the *SelectorNilUsesHelmValues flags to false makes an unset selector
+# mean "match everything", which is what a single-tenant demo cluster wants.
+# ---------------------------------------------------------------------------
+prometheus:
+  prometheusSpec:
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    # 15s globally, matching the ServiceMonitor default the operator writes.
+    # Canary analysis evaluates a rate() over a 60s window, and a rate computed
+    # from two samples is not a rate — it is a difference between two points
+    # with no way to tell a trend from a blip.
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+
+    # Short retention: this is a demo cluster, and 10 GiB of TSDB on a laptop is
+    # 10 GiB the model images cannot have.
+    retention: 6h
+    retentionSize: 2GB
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        memory: 1500Mi
+
+    # emptyDir. Deliberate: a PVC would survive `kind delete cluster` only to be
+    # orphaned, and every demo starts from a clean cluster anyway.
+    storageSpec: {}
+
+grafana:
+  adminPassword: admin
+  defaultDashboardsTimezone: browser
+
+  # The sidecar is what discovers this operator's embedded dashboards. It
+  # watches ConfigMaps for the grafana_dashboard label and loads every JSON
+  # value it finds.
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      # The VALUE is the string "1". Writing `true` here would make the sidecar
+      # look for the label value "true", which nothing sets, and the dashboards
+      # would silently never appear.
+      labelValue: "1"
+      # ALL namespaces: the operator publishes into its own namespace
+      # (llmcp-system), not into monitoring. Leaving this at the default would
+      # mean the dashboards exist and are never read.
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 384Mi
+
+  persistence:
+    enabled: false
+
+# ---------------------------------------------------------------------------
+# Turned off. Each one costs memory on a 12 GiB VM and none of them is read by
+# anything this project builds.
+# ---------------------------------------------------------------------------
+
+# Alertmanager: the SLO sprint asserts that an alert FIRES, which is visible in
+# Prometheus's own /alerts. Routing it somewhere is a different problem and not
+# one this project is demonstrating.
+alertmanager:
+  enabled: false
+
+# The bundled Kubernetes control-plane alerts and dashboards. They are about
+# kube-apiserver and etcd, not about inference, and on kind most of them are
+# permanently firing or permanently absent — which trains you to ignore the
+# alert list exactly when this project wants you reading it.
+defaultRules:
+  create: false
+
+# Control-plane scrape targets that kind does not expose on a reachable address.
+# Left enabled they appear as permanently-down targets.
+kubeApiServer:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+
+# kube-state-metrics stays: pod and deployment state is genuinely useful next to
+# the inference metrics when a rollout misbehaves.
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# node-exporter is host-level metrics for a single kind node inside a Docker VM.
+# The numbers describe the VM, not the workload, and reading them as if they
+# described the workload is actively misleading.
+nodeExporter:
+  enabled: false
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  # Admission webhooks validate PrometheusRule syntax. Useful, but they add a
+  # cert-manager-shaped dependency and a pod, and a malformed rule fails loudly
+  # enough without them on a cluster with one user.
+  admissionWebhooks:
+    enabled: false
+    patch:
+      enabled: false
+  tls:
+    enabled: false

@@ -1,0 +1,93 @@
+{
+  "config": {
+    "url": "http://spike-primary.default.svc:8080",
+    "model": "qwen3-0.6b",
+    "concurrency": 4,
+    "duration_s": 90,
+    "max_tokens": 64,
+    "prompt": "Explain what a Kubernetes operator does, in two sentences.",
+    "keep_alive": true,
+    "window_s": 10,
+    "timeout_s": 120,
+    "label": "sep-primary"
+  },
+  "overall": {
+    "requests": 414,
+    "errors": 0,
+    "rps": 4.599940234867614,
+    "ttft_p50_s": 0.0521375,
+    "ttft_p95_s": 0.058723625,
+    "ttft_p99_s": 0.088618666,
+    "duration_p50_s": 0.758360167,
+    "duration_p95_s": 1.107828918,
+    "duration_p99_s": 1.435461084,
+    "ttft_p95_over_duration_p95": 0.05300784628913252,
+    "output_tokens": 16338
+  },
+  "windows": [
+    {
+      "start_s": 0,
+      "requests": 46,
+      "errors": 0,
+      "rps": 4.6,
+      "ttft_p95_s": 0.411639542
+    },
+    {
+      "start_s": 10,
+      "requests": 46,
+      "errors": 0,
+      "rps": 4.6,
+      "ttft_p95_s": 0.05712575
+    },
+    {
+      "start_s": 20,
+      "requests": 48,
+      "errors": 0,
+      "rps": 4.8,
+      "ttft_p95_s": 0.055575083
+    },
+    {
+      "start_s": 30,
+      "requests": 46,
+      "errors": 0,
+      "rps": 4.6,
+      "ttft_p95_s": 0.057020416
+    },
+    {
+      "start_s": 40,
+      "requests": 46,
+      "errors": 0,
+      "rps": 4.6,
+      "ttft_p95_s": 0.057895625
+    },
+    {
+      "start_s": 50,
+      "requests": 48,
+      "errors": 0,
+      "rps": 4.8,
+      "ttft_p95_s": 0.055670625
+    },
+    {
+      "start_s": 60,
+      "requests": 48,
+      "errors": 0,
+      "rps": 4.8,
+      "ttft_p95_s": 0.057905209
+    },
+    {
+      "start_s": 70,
+      "requests": 44,
+      "errors": 0,
+      "rps": 4.4,
+      "ttft_p95_s": 0.080752709
+    },
+    {
+      "start_s": 80,
+      "requests": 42,
+      "errors": 0,
+      "rps": 4.2,
+      "ttft_p95_s": 0.059755708
+    }
+  ],
+  "ttft_p95_cv": 0.15059524767337523
+}

@@ -1,0 +1,14 @@
+# Point the operator at the locally-built shim image.
+#
+# The compiled-in default is a published reference, which is right for anyone
+# installing a release but wrong here: the local kind cluster pulls from the
+# registry on its own network, and the whole point of the development loop is to
+# run the shim you just built rather than the last one that was released.
+#
+# The shim and the controller are two halves of one build — the shim's metric
+# names are the contract the controller's analysis queries — so running a stale
+# shim against a fresh controller is a version skew whose symptom is an empty
+# query result, which analysis is obliged to read as "no data".
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --shim-image=localhost:5001/llmcp-shim:dev

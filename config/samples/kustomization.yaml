@@ -1,4 +1,7 @@
 ## Append samples of your project ##
 resources:
 - inference_v1alpha1_modeldeployment.yaml
+- qwen3_llamacpp.yaml
+- canary_qwen3.yaml
+- autoscaling_qwen3.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

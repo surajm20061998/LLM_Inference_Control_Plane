@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -24,8 +25,9 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/naming"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/canary"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 )
 
 // observed is the cluster state one reconcile pass acted on.
@@ -37,14 +39,41 @@ type observed struct {
 	// Deployment is the primary variant's Deployment, or nil if it does not
 	// exist yet.
 	Deployment *appsv1.Deployment
+
+	// CanaryDeployment is the canary variant's, or nil when none is running.
+	CanaryDeployment *appsv1.Deployment
+
 	// DesiredReplicas is the total desired across all variants.
 	DesiredReplicas int32
-	// Revision is the target revision hash for the current spec.
+
+	// Revision is the TARGET revision hash — what the current spec describes.
 	Revision string
+
+	// PrimaryRevision is what the primary Deployment is actually being run at.
+	//
+	// During a canary these differ: the primary keeps serving the last
+	// known-good revision while the canary carries the target. Conflating them
+	// would let lastGoodRevision advance to a revision that has only ever run
+	// as a canary, which is precisely the revision a rollback needs to escape.
+	PrimaryRevision string
+
 	// Selector is the serialized /scale label selector.
 	Selector string
+
 	// Endpoint is the in-cluster OpenAI-compatible base URL.
 	Endpoint string
+
+	// Rollout is the plan this pass acted on.
+	Rollout rollout
+
+	// Scaling is the autoscaler's verdict for this pass.
+	Scaling autoscaleVerdict
+
+	// Metrics is the verdict from reconciling metric collection. The zero value
+	// means "not evaluated", which is reported as Unknown rather than False —
+	// a consumer must be able to tell "we have not looked" from "we looked and
+	// there is nothing".
+	Metrics metricsVerdict
 }
 
 // computeStatus derives the full status from observed cluster state.
@@ -59,27 +88,60 @@ func computeStatus(
 	obs observed,
 	prev inferencev1alpha1.ModelDeploymentStatus,
 ) inferencev1alpha1.ModelDeploymentStatus {
+	// An unset PrimaryRevision means "the primary is running the target", which
+	// is the case for every non-canary rollout. Normalising once here keeps
+	// every use below from repeating the fallback — and, more usefully, keeps a
+	// caller that has no canary from having to know the field exists.
+	primaryRevision := firstNonEmpty(obs.PrimaryRevision, obs.Revision)
+
 	status := inferencev1alpha1.ModelDeploymentStatus{
 		ObservedGeneration: md.Generation,
 		Selector:           obs.Selector,
 		Endpoint:           obs.Endpoint,
-		StableRevision:     obs.Revision,
-		LastGoodRevision:   prev.LastGoodRevision,
-		Conditions:         prev.Conditions,
+		// The revision actually serving as primary, which during a canary is
+		// NOT the target.
+		StableRevision:   primaryRevision,
+		LastGoodRevision: prev.LastGoodRevision,
+		Conditions:       prev.Conditions,
 	}
 
-	if obs.Deployment != nil {
-		ds := obs.Deployment.Status
-		status.Replicas = ds.Replicas
-		status.ReadyReplicas = ds.ReadyReplicas
-		status.UpdatedReplicas = ds.UpdatedReplicas
-		status.AvailableReplicas = ds.AvailableReplicas
+	// Replica counters SUM both variants.
+	//
+	// This is the /scale subresource's contract — .spec.replicas is the total
+	// across all variants, so .status.replicas must be too — and an HPA divides
+	// its metric by this number. Reporting only the primary's during a canary
+	// would make the autoscaler compute its target from two thirds of the
+	// fleet and scale up to compensate for capacity that already exists.
+	for _, dep := range []*appsv1.Deployment{obs.Deployment, obs.CanaryDeployment} {
+		if dep == nil {
+			continue
+		}
+		status.Replicas += dep.Status.Replicas
+		status.ReadyReplicas += dep.Status.ReadyReplicas
+		status.AvailableReplicas += dep.Status.AvailableReplicas
+	}
+
+	// updatedReplicas counts pods on the TARGET revision, which is the canary's
+	// during a rollout and the primary's otherwise. Summing both would report a
+	// rollout as complete while most pods still run the old version.
+	if obs.Deployment != nil && primaryRevision == obs.Revision {
+		status.UpdatedReplicas += obs.Deployment.Status.UpdatedReplicas
+	}
+	if obs.CanaryDeployment != nil {
+		status.UpdatedReplicas += obs.CanaryDeployment.Status.UpdatedReplicas
 	}
 
 	setSpecValid(&status, md.Generation)
+	setMetricsRegistered(&status, obs.Metrics, md.Generation)
 	available := setAvailable(&status, obs, md.Generation)
 	progressing, stalled := setProgressing(&status, obs, md.Generation)
-	setModelReady(&status, available, md.Generation)
+	setModelReady(md, &status, available, progressing, md.Generation)
+
+	status.Canary = canaryStatusFrom(obs.Rollout.Output, obs.Rollout.Round, prev.Canary)
+	status.Autoscaling = obs.Scaling.Autoscaling
+	canaryActive := setCanaryHealthy(&status, obs, md.Generation)
+	setTrafficRoutingReady(&status, obs, md.Generation)
+	setAutoscalingReady(&status, obs.Scaling, md.Generation)
 
 	// Only a revision that actually reached availability is a safe rollback
 	// target. Recording it any earlier would let a broken revision become the
@@ -91,14 +153,124 @@ func computeStatus(
 	// without this term a stalled rollout would bank the very revision that
 	// failed, and an automatic rollback would then "recover" to the broken
 	// version it was trying to escape.
-	if available && !progressing && !stalled && obs.Revision != "" {
-		status.LastGoodRevision = obs.Revision
+	//
+	// The !canaryActive term is the canary-era addition. While a canary is in
+	// flight the primary is serving the OLD revision perfectly well, so
+	// available is true and progressing is false — and without this term the
+	// controller would re-bank the revision it already had, harmlessly, on
+	// every reconcile, while the actual promotion decision was still pending.
+	// More importantly it keeps lastGoodRevision from ever advancing to a
+	// revision that has only run as a canary.
+	if available && !progressing && !stalled && !canaryActive && primaryRevision != "" {
+		status.LastGoodRevision = primaryRevision
 	}
 
 	setReady(&status, available, progressing, md.Generation)
-	status.Phase = derivePhase(available, progressing, stalled, status.LastGoodRevision)
+	status.Phase = derivePhase(available, progressing, stalled, status.LastGoodRevision, obs.Rollout)
 
 	return status
+}
+
+// setCanaryHealthy reports the most recent analysis verdict, and returns
+// whether a canary is in flight.
+//
+// It is Unknown — not True — when nothing is running. True would claim a
+// healthy canary exists, and `kubectl wait --for=condition=CanaryHealthy` would
+// then return immediately against a ModelDeployment that has never canaried
+// anything, which is the sort of green tick that makes a whole status surface
+// untrustworthy.
+func setCanaryHealthy(
+	status *inferencev1alpha1.ModelDeploymentStatus,
+	obs observed,
+	generation int64,
+) bool {
+	out := obs.Rollout.Output
+
+	cond := metav1.Condition{
+		Type:               inferencev1alpha1.ConditionCanaryHealthy,
+		ObservedGeneration: generation,
+		Reason:             firstNonEmpty(out.Reason, inferencev1alpha1.ReasonCanaryNotRunning),
+		Message:            firstNonEmpty(out.Message, "No canary in flight"),
+	}
+
+	active := false
+
+	switch out.Action {
+	case canary.ActionRollback:
+		cond.Status = metav1.ConditionFalse
+
+	case canary.ActionStart, canary.ActionAdvance, canary.ActionPause:
+		cond.Status = metav1.ConditionTrue
+		active = out.Action != canary.ActionPause || out.Canary > 0
+
+	case canary.ActionWait:
+		active = true
+		// A hold is not a pass. It happens for three quite different reasons —
+		// a failed check below the threshold, a provider error, or too little
+		// traffic — and only the first is a statement about the canary's
+		// health. Reporting True for all three would let the condition say the
+		// canary is healthy while Prometheus is down.
+		switch out.Reason {
+		case inferencev1alpha1.ReasonCanaryChecksFailed:
+			cond.Status = metav1.ConditionFalse
+		case inferencev1alpha1.ReasonAnalysisError, inferencev1alpha1.ReasonAnalysisInconclusive:
+			cond.Status = metav1.ConditionUnknown
+		default:
+			cond.Status = metav1.ConditionTrue
+		}
+
+	case canary.ActionPromote:
+		cond.Status = metav1.ConditionTrue
+
+	default:
+		cond.Status = metav1.ConditionUnknown
+	}
+
+	setCondition(status, cond)
+	return active
+}
+
+// setTrafficRoutingReady reports whether the requested split is in place.
+//
+// Separate from CanaryHealthy because the two fail for unrelated reasons and
+// have unrelated remedies. Analysis can be perfectly healthy while the canary
+// is receiving no traffic at all, and that combination looks exactly like
+// success — a canary that passes every check having served nothing. Surfacing
+// the split as its own condition is what makes that state visible.
+func setTrafficRoutingReady(
+	status *inferencev1alpha1.ModelDeploymentStatus,
+	obs observed,
+	generation int64,
+) {
+	out := obs.Rollout.Output
+
+	cond := metav1.Condition{
+		Type:               inferencev1alpha1.ConditionTrafficRoutingReady,
+		ObservedGeneration: generation,
+		Status:             metav1.ConditionTrue,
+		Reason:             inferencev1alpha1.ReasonTrafficSplit,
+	}
+
+	switch {
+	case status.Canary == nil || out.Canary == 0:
+		cond.Reason = inferencev1alpha1.ReasonCanaryNotRunning
+		cond.Message = "All traffic is served by the primary variant"
+
+	case canary.IsQuantized(out.DesiredWeight, out.RealizedWeight):
+		// True, not False: the split IS in place, it is simply not the one that
+		// was asked for, and that is a property of integer pod counts rather
+		// than a fault. Reporting False would make a perfectly working rollout
+		// look broken at every step. The reason and message carry the nuance.
+		cond.Reason = inferencev1alpha1.ReasonWeightQuantized
+		cond.Message = fmt.Sprintf(
+			"Requested %d%% to the canary; %d replicas can only express %d%%",
+			out.DesiredWeight, out.Primary+out.Canary, out.RealizedWeight)
+
+	default:
+		cond.Message = fmt.Sprintf("%d%% of traffic is served by the canary variant", out.RealizedWeight)
+	}
+
+	setCondition(status, cond)
 }
 
 // setSpecValid marks the spec accepted. Rejection is handled on the error path
@@ -111,6 +283,74 @@ func setSpecValid(status *inferencev1alpha1.ModelDeploymentStatus, generation in
 		Message:            "Specification accepted",
 		ObservedGeneration: generation,
 	})
+}
+
+// setMetricsRegistered reports whether metric collection is wired up.
+//
+// Deliberately NOT folded into Ready. A ModelDeployment with no metrics serves
+// traffic correctly, so failing the readiness rollup over it would make
+// `kubectl wait --for=condition=Ready` hang on a cluster that simply has no
+// Prometheus — and every e2e test in this repository would then require a
+// monitoring stack to pass. Keeping it separate says "serving, but not
+// observable" without conflating the two.
+func setMetricsRegistered(
+	status *inferencev1alpha1.ModelDeploymentStatus,
+	verdict metricsVerdict,
+	generation int64,
+) {
+	cond := metav1.Condition{
+		Type:               inferencev1alpha1.ConditionMetricsRegistered,
+		Status:             verdict.Status,
+		Reason:             verdict.Reason,
+		Message:            verdict.Message,
+		ObservedGeneration: generation,
+	}
+
+	// A zero verdict means nothing evaluated it — a reconciler built without a
+	// discovery prober, most often in a unit test. Report Unknown rather than
+	// writing an empty reason, which apimeta.SetStatusCondition rejects and
+	// which would in any case assert something that was never checked.
+	if cond.Status == "" {
+		cond.Status = metav1.ConditionUnknown
+		cond.Reason = inferencev1alpha1.ReasonReconciling
+		cond.Message = "Metric collection has not been evaluated"
+	}
+
+	setCondition(status, cond)
+}
+
+// setAutoscalingReady reports whether the built-in autoscaler can act.
+//
+// Deliberately not folded into Ready, on the same reasoning as
+// MetricsRegistered: a ModelDeployment whose autoscaler is blind still serves
+// traffic correctly at whatever size it currently is, so failing the readiness
+// rollup would make `kubectl wait --for=condition=Ready` hang on a cluster that
+// simply has no Prometheus. Keeping it separate says "serving, but not
+// scaling" without conflating the two.
+func setAutoscalingReady(
+	status *inferencev1alpha1.ModelDeploymentStatus,
+	verdict autoscaleVerdict,
+	generation int64,
+) {
+	cond := metav1.Condition{
+		Type:               inferencev1alpha1.ConditionAutoscalingReady,
+		Status:             verdict.Status,
+		Reason:             verdict.Reason,
+		Message:            verdict.Message,
+		ObservedGeneration: generation,
+	}
+
+	// A zero verdict means nothing evaluated it — a reconciler assembled
+	// without the autoscaling path, which is the shape a focused unit test
+	// constructs. Report Unknown rather than writing an empty reason, which
+	// apimeta.SetStatusCondition rejects outright.
+	if cond.Status == "" {
+		cond.Status = metav1.ConditionUnknown
+		cond.Reason = inferencev1alpha1.ReasonReconciling
+		cond.Message = "Autoscaling has not been evaluated"
+	}
+
+	setCondition(status, cond)
 }
 
 // setAvailable reports whether the workload is serving, and returns that answer.
@@ -205,21 +445,59 @@ func setProgressing(
 // setModelReady reports whether the engine loaded its model and reported
 // healthy. Readiness is the signal: the engine's own /health returns 503 until
 // the model is resident, so a ready replica is proof the model loaded.
-func setModelReady(status *inferencev1alpha1.ModelDeploymentStatus, available bool, generation int64) {
+//
+// The False case is split in two, and the split earns its keep once a real
+// model is in play. Loading Qwen3 from a local volume takes seconds; pulling it
+// from the Hugging Face Hub first takes minutes. For that entire window there
+// is legitimately no ready replica, and reporting "EngineUnhealthy" would be
+// describing the normal path as a fault — which is how an operator learns to
+// ignore the condition that is supposed to tell them something is wrong.
+func setModelReady(
+	md *inferencev1alpha1.ModelDeployment,
+	status *inferencev1alpha1.ModelDeploymentStatus,
+	available, progressing bool,
+	generation int64,
+) {
 	cond := metav1.Condition{
 		Type:               inferencev1alpha1.ConditionModelReady,
 		ObservedGeneration: generation,
 	}
-	if available {
+
+	switch {
+	case available:
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = inferencev1alpha1.ReasonModelResolved
 		cond.Message = "Model loaded and the engine is serving"
-	} else {
+	case progressing:
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = inferencev1alpha1.ReasonModelLoading
+		cond.Message = modelLoadingMessage(md)
+	default:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = inferencev1alpha1.ReasonEngineUnhealthy
 		cond.Message = "No engine replica has reported healthy"
 	}
+
 	setCondition(status, cond)
+}
+
+// modelLoadingMessage names what is actually being waited on.
+//
+// The two sources fail in different places and the message is often the only
+// thing pointing at which: an image source that hangs is a registry or a
+// missing path, whereas a huggingFace source that hangs is usually egress or a
+// rate limit. Naming the source and the artifact turns a support question into
+// a one-line answer.
+func modelLoadingMessage(md *inferencev1alpha1.ModelDeployment) string {
+	switch src := md.Spec.Model.Source; {
+	case src.HuggingFace != nil:
+		return "Downloading " + src.HuggingFace.File +
+			" from Hugging Face repository " + src.HuggingFace.Repo + " and loading it"
+	case src.Image != nil:
+		return "Loading the model from image " + src.Image.Image
+	default:
+		return "Waiting for the model to load"
+	}
 }
 
 // setReady is the top-level rollup that `kubectl wait --for=condition=Ready`
@@ -252,7 +530,30 @@ func setReady(status *inferencev1alpha1.ModelDeploymentStatus, available, progre
 // It deliberately takes only the condition verdicts, not the observed state
 // they were derived from: phase must be a function of the conditions alone, or
 // `kubectl get` and the conditions can disagree about the same reconcile.
-func derivePhase(available, progressing, stalled bool, lastGood string) inferencev1alpha1.Phase {
+func derivePhase(
+	available, progressing, stalled bool,
+	lastGood string,
+	plan rollout,
+) inferencev1alpha1.Phase {
+	// A rollout decision outranks the replica-count view. While a canary is in
+	// flight the primary is serving normally, so the availability signals alone
+	// would report Available — which is true, and useless: it hides the fact
+	// that a release is being evaluated right now.
+	switch plan.Output.Action {
+	case canary.ActionStart, canary.ActionAdvance:
+		return inferencev1alpha1.PhaseCanarying
+	case canary.ActionWait:
+		if plan.Active {
+			return inferencev1alpha1.PhaseCanarying
+		}
+	case canary.ActionPause:
+		return inferencev1alpha1.PhasePaused
+	case canary.ActionPromote:
+		return inferencev1alpha1.PhasePromoting
+	case canary.ActionRollback:
+		return inferencev1alpha1.PhaseRollingBack
+	}
+
 	switch {
 	case stalled:
 		return inferencev1alpha1.PhaseDegraded

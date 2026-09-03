@@ -30,9 +30,10 @@ import (
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/utils/ptr"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/engine"
-	"github.com/surajmishra/llmcp/internal/naming"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/engine"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/observability"
 )
 
 const (
@@ -86,27 +87,120 @@ func runtimeModelPath(src *inferencev1alpha1.ImageModelSource) string {
 type desiredChildren struct {
 	Deployment *appsv1ac.DeploymentApplyConfiguration
 	Service    *corev1ac.ServiceApplyConfiguration
+
+	// MetricsService is the headless Service Prometheus scrapes. It is separate
+	// from Service on purpose — see naming.MetricsService.
+	MetricsService *corev1ac.ServiceApplyConfiguration
+
+	// CanaryDeployment is the variant under evaluation, or nil when no canary
+	// should exist. Nil means "delete it if present", which the caller does —
+	// an apply cannot express absence.
+	CanaryDeployment *appsv1ac.DeploymentApplyConfiguration
 }
 
-// buildChildren renders the full desired state for a ModelDeployment at a given
-// revision.
+// renderOptions carries operator-level settings into the pure builders.
+//
+// They are OPERATOR settings, not spec fields: the shim image is a property of
+// the controller's own build, and a user should not have to know it exists to
+// get working metrics. Threading it through a struct rather than reading it off
+// the reconciler keeps buildChildren a pure function of its arguments, which is
+// what makes the whole child-rendering surface table-testable.
+type renderOptions struct {
+	// ShimImage is the default metrics sidecar image. An empty value falls back
+	// to DefaultShimImage, so a zero-valued renderOptions is still usable in a
+	// test.
+	ShimImage string
+}
+
+// shimImage resolves the sidecar image for these options.
+func (o renderOptions) shimImage() string {
+	if o.ShimImage == "" {
+		return DefaultShimImage
+	}
+	return o.ShimImage
+}
+
+// variantPlan is one variant's rendering instructions.
+type variantPlan struct {
+	// Spec is the SPEC AT THAT REVISION, which during a canary is not the same
+	// for both variants: the primary runs the last known-good revision's spec
+	// while the canary runs the target's. Reading both from md.Spec would make
+	// the two sides of the comparison identical, which is to say it would make
+	// the comparison meaningless.
+	Spec inferencev1alpha1.ModelDeploymentSpec
+
+	// Revision is that spec's hash.
+	Revision string
+
+	// Replicas is this variant's share of spec.replicas.
+	Replicas int32
+}
+
+// buildChildren renders the full desired state for a ModelDeployment.
 //
 // It is a pure function: no client, no clock, no I/O. That is what makes it
 // exhaustively testable, and it is also what makes Server-Side Apply safe —
 // see the byte-stability note on applyConfigFrom.
+//
+// The canary plan is optional. When nil, only the primary Deployment is
+// rendered and the caller is responsible for removing any canary that exists.
 func buildChildren(
 	md *inferencev1alpha1.ModelDeployment,
 	prof engine.Profile,
-	revision string,
+	primary variantPlan,
+	canary *variantPlan,
+	opts renderOptions,
 ) (desiredChildren, error) {
-	dep, err := buildDeployment(md, prof, revision, inferencev1alpha1.VariantPrimary, replicasFor(md))
+	primaryMD := withSpec(md, primary.Spec)
+
+	dep, err := buildDeployment(primaryMD, prof, primary.Revision,
+		inferencev1alpha1.VariantPrimary, primary.Replicas, opts)
 	if err != nil {
-		return desiredChildren{}, err
+		return desiredChildren{}, fmt.Errorf("rendering the primary variant: %w", err)
 	}
-	return desiredChildren{
+
+	children := desiredChildren{
 		Deployment: dep,
-		Service:    buildService(md),
-	}, nil
+		// Both Services are rendered from the CURRENT spec, never from a
+		// revision's. A Service is not versioned: its port and selector are the
+		// stable address clients hold, and swapping them mid-rollback would
+		// break every caller for the duration of the recovery.
+		Service:        buildService(md),
+		MetricsService: buildMetricsService(md),
+	}
+
+	if canary == nil {
+		return children, nil
+	}
+
+	canaryMD := withSpec(md, canary.Spec)
+	canaryDep, err := buildDeployment(canaryMD, prof, canary.Revision,
+		inferencev1alpha1.VariantCanary, canary.Replicas, opts)
+	if err != nil {
+		return desiredChildren{}, fmt.Errorf("rendering the canary variant: %w", err)
+	}
+	children.CanaryDeployment = canaryDep
+
+	return children, nil
+}
+
+// withSpec returns a shallow copy of md carrying a different spec.
+//
+// A copy, not a mutation. md comes out of the informer cache and is shared with
+// every other reader in the process; writing to it would corrupt what the next
+// reconcile — and any other controller in the same manager — sees.
+func withSpec(
+	md *inferencev1alpha1.ModelDeployment,
+	spec inferencev1alpha1.ModelDeploymentSpec,
+) *inferencev1alpha1.ModelDeployment {
+	out := *md
+	out.Spec = spec
+	return &out
+}
+
+// singleVariant is the plan for a ModelDeployment with no canary in flight.
+func singleVariant(md *inferencev1alpha1.ModelDeployment, revision string) variantPlan {
+	return variantPlan{Spec: md.Spec, Revision: revision, Replicas: replicasFor(md)}
 }
 
 // replicasFor returns the desired replica count, defaulting to 1 when unset.
@@ -128,8 +222,9 @@ func buildDeployment(
 	revision string,
 	variant inferencev1alpha1.Variant,
 	replicas int32,
+	opts renderOptions,
 ) (*appsv1ac.DeploymentApplyConfiguration, error) {
-	podSpec, err := buildPodSpec(md, prof, variant)
+	podSpec, err := buildPodSpec(md, prof, variant, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -200,24 +295,31 @@ func progressDeadlineSeconds(md *inferencev1alpha1.ModelDeployment) int32 {
 }
 
 // buildPodSpec assembles the serving pod: model delivery, then the engine.
+//
+// The two implemented model sources deliver weights in opposite directions, and
+// the difference is confined to this function. An image source PUSHES: an init
+// container copies the file onto the shared volume before the engine starts, so
+// the engine sees a ready file and needs no network. A huggingFace source PULLS:
+// there is no init container at all, and the engine downloads into the same
+// volume itself, because llama.cpp already implements Hub downloads and
+// reimplementing that in an init container would mean owning retry, resume and
+// checksum logic that upstream has already written.
 func buildPodSpec(
 	md *inferencev1alpha1.ModelDeployment,
 	prof engine.Profile,
 	variant inferencev1alpha1.Variant,
+	opts renderOptions,
 ) (*corev1ac.PodSpecApplyConfiguration, error) {
-	src := md.Spec.Model.Source.Image
-	if src == nil {
-		// Validate() should have caught this; failing loudly here rather than
-		// producing a pod that cannot possibly start.
-		return nil, fmt.Errorf("model source image is required")
+	modelPath, cacheDir, initContainers, err := buildModelDelivery(md)
+	if err != nil {
+		return nil, err
 	}
-
-	modelPath := runtimeModelPath(src)
 
 	built, err := prof.Build(engine.BuildContext{
 		MD:        md,
 		Variant:   variant,
 		ModelPath: modelPath,
+		CacheDir:  cacheDir,
 		Threads:   engine.ThreadsFor(&md.Spec, 1),
 		Port:      naming.EnginePort,
 	})
@@ -233,10 +335,19 @@ func buildPodSpec(
 		return nil, fmt.Errorf("converting engine container: %w", err)
 	}
 
-	initAC, err := applyConfigFrom[corev1ac.ContainerApplyConfiguration](
-		buildModelInitContainer(src))
-	if err != nil {
-		return nil, fmt.Errorf("converting model init container: %w", err)
+	// The shim is appended AFTER the model init container, and the ordering is
+	// meaningful: init containers run in sequence, so the weights are staged
+	// first and the sidecar starts second. Putting the sidecar first would work
+	// too, but it would leave the shim answering health checks for several
+	// minutes while a model image is still being copied — reporting a variant
+	// as merely "not ready yet" when it has not begun to exist.
+	if md.Spec.Serving.ShimEnabled() {
+		shimAC, convErr := applyConfigFrom[corev1ac.ContainerApplyConfiguration](
+			buildShimContainer(md, variant, built.HealthPath, opts.shimImage()))
+		if convErr != nil {
+			return nil, fmt.Errorf("converting shim container: %w", convErr)
+		}
+		initContainers = append(initContainers, shimAC)
 	}
 
 	return corev1ac.PodSpec().
@@ -257,11 +368,52 @@ func buildPodSpec(
 			WithFSGroup(nonRootGID).
 			WithSeccompProfile(corev1ac.SeccompProfile().
 				WithType(corev1.SeccompProfileTypeRuntimeDefault))).
-		WithInitContainers(initAC).
+		WithInitContainers(initContainers...).
 		WithContainers(engineAC).
 		WithVolumes(corev1ac.Volume().
 			WithName(engine.ModelVolumeName).
 			WithEmptyDir(corev1ac.EmptyDirVolumeSource())), nil
+}
+
+// buildModelDelivery resolves how weights reach the pod for the configured
+// model source.
+//
+// It returns at most one of modelPath and cacheDir. modelPath names a file that
+// will already exist when the engine starts; cacheDir names a writable
+// directory the engine is expected to download into. Which one is set is what
+// tells the engine profile whether to mount the model volume read-only, so
+// returning both — or neither, for an implemented source — would be a bug.
+func buildModelDelivery(
+	md *inferencev1alpha1.ModelDeployment,
+) (modelPath, cacheDir string, initContainers []*corev1ac.ContainerApplyConfiguration, err error) {
+	src := md.Spec.Model.Source
+
+	switch {
+	case src.Image != nil:
+		initAC, convErr := applyConfigFrom[corev1ac.ContainerApplyConfiguration](
+			buildModelInitContainer(src.Image))
+		if convErr != nil {
+			return "", "", nil, fmt.Errorf("converting model init container: %w", convErr)
+		}
+		return runtimeModelPath(src.Image), "", []*corev1ac.ContainerApplyConfiguration{initAC}, nil
+
+	case src.HuggingFace != nil:
+		// No init container: the engine is the downloader. The volume is still
+		// an emptyDir, so weights are re-fetched on every pod start — that cost
+		// is the documented trade-off of this source, and is why the image
+		// source is the recommended one.
+		return "", modelMountPath, nil, nil
+
+	default:
+		// CEL enforces exactly-one-of on the union and the engine profile
+		// rejects sources it cannot serve, so reaching here means a source was
+		// added to the API without being wired up. Failing loudly beats
+		// emitting a pod with no weights, which would fail its startup probe
+		// several minutes later with nothing pointing at the cause.
+		return "", "", nil, fmt.Errorf(
+			"no implemented model source in .spec.model.source: " +
+				"set .image or .huggingFace")
+	}
 }
 
 // buildModelInitContainer copies model weights out of the model image into the
@@ -367,16 +519,83 @@ func buildService(md *inferencev1alpha1.ModelDeployment) *corev1ac.ServiceApplyC
 		WithSpec(corev1ac.ServiceSpec().
 			WithType(corev1.ServiceTypeClusterIP).
 			// Spans every variant, so one endpoint serves both sides of a
-			// future canary.
+			// canary.
 			WithSelector(naming.ServiceSelector(md.Name)).
 			WithPorts(corev1ac.ServicePort().
 				WithName(naming.PortNameHTTP).
 				WithPort(port).
 				WithProtocol(corev1.ProtocolTCP).
-				// Targeted BY NAME, not by number. When the metrics shim is
-				// introduced it takes over the "http" container port and this
-				// Service needs no change at all.
-				WithTargetPort(intstr.FromString(naming.PortNameHTTP))))
+				// Targeted BY NAME, not by number. With the shim injected,
+				// "http" resolves to the sidecar; without it, to the engine.
+				// That single indirection is the entire mechanism by which
+				// turning metrics on or off changes no client, no Service port
+				// and no endpoint URL.
+				WithTargetPort(intstr.FromString(servingTargetPort(md)))))
+}
+
+// servingTargetPort is the container port name the serving Service resolves to.
+func servingTargetPort(md *inferencev1alpha1.ModelDeployment) string {
+	if md.Spec.Serving.ShimEnabled() {
+		return naming.PortNameHTTP
+	}
+	return naming.PortNameEngine
+}
+
+// buildMetricsService renders the headless Service Prometheus scrapes.
+//
+// # Why this is a second Service
+//
+// Two reasons, and the second is the one that matters.
+//
+// The engine's own /metrics has to be reachable for the diagnostics scrape, and
+// adding the engine's port to the SERVING Service would publish it to every
+// in-cluster client. Any of them could then address the engine directly and
+// bypass the shim — at which point that traffic contributes to no llmcp_* series
+// at all, and the canary analysis is quietly reasoning about a subset of the
+// load while believing it sees all of it. Keeping the engine port off the
+// serving Service makes the bypass unavailable rather than merely discouraged.
+//
+// It is HEADLESS (clusterIP: None) because a scraper wants one target per pod.
+// A normal ClusterIP would give prometheus-operator a single VIP that
+// load-balances to a different pod on every scrape, producing one series whose
+// value jumps between pods — which for a per-pod gauge like queue depth is not
+// merely imprecise, it is meaningless.
+func buildMetricsService(md *inferencev1alpha1.ModelDeployment) *corev1ac.ServiceApplyConfiguration {
+	labels := naming.CommonLabels(md.Name)
+	// Overridden so the ServiceMonitor's selector can pick this Service out
+	// from the serving one. Both carry the same model-deployment label; the
+	// component is what distinguishes them.
+	labels[naming.LabelComponent] = observability.ComponentMetrics
+
+	ports := []*corev1ac.ServicePortApplyConfiguration{}
+
+	if md.Spec.Serving.ShimEnabled() {
+		ports = append(ports, corev1ac.ServicePort().
+			WithName(naming.PortNameMetrics).
+			WithPort(naming.ShimMetricsPort).
+			WithProtocol(corev1.ProtocolTCP).
+			WithTargetPort(intstr.FromString(naming.PortNameMetrics)))
+	}
+
+	ports = append(ports, corev1ac.ServicePort().
+		WithName(naming.PortNameEngine).
+		WithPort(naming.EnginePort).
+		WithProtocol(corev1.ProtocolTCP).
+		WithTargetPort(intstr.FromString(naming.PortNameEngine)))
+
+	return corev1ac.Service(naming.MetricsService(md.Name), md.Namespace).
+		WithLabels(labels).
+		WithOwnerReferences(ownerReference(md)).
+		WithSpec(corev1ac.ServiceSpec().
+			WithType(corev1.ServiceTypeClusterIP).
+			WithClusterIP(corev1.ClusterIPNone).
+			// PublishNotReadyAddresses so that a pod which is still loading its
+			// model is still scraped. Without it the first minutes of every
+			// rollout are a hole in the data — precisely the window in which
+			// someone is watching to see whether the rollout is working.
+			WithPublishNotReadyAddresses(true).
+			WithSelector(naming.ServiceSelector(md.Name)).
+			WithPorts(ports...))
 }
 
 // ownerReference builds the controller owner reference for child objects.
@@ -388,7 +607,7 @@ func buildService(md *inferencev1alpha1.ModelDeployment) *corev1ac.ServiceApplyC
 func ownerReference(md *inferencev1alpha1.ModelDeployment) *metav1ac.OwnerReferenceApplyConfiguration {
 	return metav1ac.OwnerReference().
 		WithAPIVersion(inferencev1alpha1.GroupVersion.String()).
-		WithKind("ModelDeployment").
+		WithKind(kindModelDeployment).
 		WithName(md.Name).
 		WithUID(md.UID).
 		WithController(true).

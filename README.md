@@ -1,135 +1,176 @@
-# llmcp
-// TODO(user): Add simple overview of use/purpose
+# Mini LLM Inference Control Plane
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Go Kubernetes operator that deploys an LLM inference server, health-checks it,
+autoscales it, runs **canary releases gated on metric analysis**, and
+**automatically rolls back on regression** — with Prometheus/Grafana
+observability, running locally on kind against a 0.6B CPU model.
 
-## Getting Started
+**The thesis:** apply the same control law the GPU-scale ecosystem converged on
+— scale on **queue depth**, gate promotion on **TTFT and error rate**, never on
+CPU utilization — to a tiny CPU model on a laptop, and add the one thing the
+closest prior art (KubeAI) lacks: **canary with metric-driven automated
+rollback**, with model version and engine version independently canary-able.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/llmcp:tag
+```yaml
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3
+spec:
+  replicas: 4
+  model:
+    name: qwen3-0.6b
+    source:
+      image: { image: localhost:5001/llmcp-model:qwen3-0.6b-q4km, path: /weights/model.gguf }
+  engine:
+    type: llamacpp
+    resources:
+      limits: { cpu: "2", memory: 2Gi }     # -t is derived from this
+  rollout:
+    type: Canary
+    canary:
+      stepWeights: [25, 50, 75]
+      analysis:
+        metrics:
+          - name: ttft-vs-primary
+            builtin: ttft-p95
+            compareToPrimary: true          # a ratio, not an absolute threshold
+            thresholdRange: { max: "1500m" }
+  autoscaling:
+    mode: Builtin
+    maxReplicas: 6
+    metric: queue-depth                     # not CPU
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+---
 
-**Install the CRDs into the cluster:**
+## Why a controller and not a Deployment
 
-```sh
-make install
+Kubernetes already does rolling updates correctly, and this operator delegates
+them to the Deployment controller unchanged. What a Deployment cannot do is
+notice that the new pods are **healthy but worse** — passing every readiness
+probe, returning 200 to every request, and serving three times the latency — and
+undo itself.
+
+That is the gap this project fills, and everything else exists to make it
+possible:
+
+| Piece | Exists because |
+|---|---|
+| **`cmd/shim`**, a native sidecar | llama.cpp exposes **gauges only**. No histograms, no TTFT, no status-code counter — so p95 latency and success rate are not awkward to compute, they are *impossible*. A canary would have nothing to gate on. |
+| **Four-valued verdicts** | `Pass \| Fail \| Inconclusive \| Error` with **disjoint counters**, so a Prometheus outage yields `Error` and can never cause a production rollback. |
+| **`minRequestRate`** | With no traffic, error rate is 0 and every percentile is absent — so an ungated canary passes every check having served *nothing*. |
+| **Queue depth** | An inference server saturates its decode slots long before its CPU. By the time utilization trips a 70% target, tail latency has been bad for minutes. |
+| **A pure state machine** | `canary.Next` and `autoscale.Recommend` take a value and return a value. A five-step rollout with a 60s warm-up replays in **microseconds** on a fake clock. |
+
+---
+
+## Quick start
+
+```bash
+make kind-up                 # 3-node kind cluster + local registry
+make model-image-real        # ~400 MB of Qwen3 weights, checksum-verified
+make dev-images dev-deploy   # controller, shim, stub engine, load generator
+make monitoring-install      # kube-prometheus-stack, slimmed
+
+kubectl apply -f config/samples/qwen3_llamacpp.yaml
+kubectl wait modeldeployment/qwen3 --for=condition=Ready --timeout=300s
+
+make load MD=qwen3 &         # in-cluster streaming load
+make grafana                 # three dashboards, imported by nobody
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+**→ [`docs/demo.md`](docs/demo.md) is the 10-minute walkthrough**, including the
+canary rolling itself back and the proof that a monitoring outage does not
+trigger one.
 
-```sh
-make deploy IMG=<some-registry>/llmcp:tag
+---
+
+## Architecture
+
+```
+        ┌─────────────────────────── ModelDeployment (CRD) ───────────────────────────┐
+        │  spec.replicas is the TOTAL across variants — the /scale subresource target  │
+        └──────────────────────────────────────┬──────────────────────────────────────┘
+                                               │
+              autoscale.Recommend ──► desiredTotal ──► canary.Split ──► (primary, canary)
+                     ▲                                                          │
+                     │ queue depth                                              ▼
+                     │                                    ┌──────────────┬──────────────┐
+                     │                                    │  <md>-primary│  <md>-canary │
+                     │                                    │  (stable rev)│ (target rev) │
+                     │                                    └──────┬───────┴──────┬───────┘
+                     │                                           │              │
+                     │                          ┌────────────────▼──────────────▼──────┐
+                     │                          │  pod: [shim] ──► [engine]            │
+                     │                          │  native sidecar, starts first,       │
+                     │                          │  terminates last, owns readiness     │
+                     │                          └────────────────┬─────────────────────┘
+                     │                                           │ llmcp_*
+                     └───────────── Prometheus ◄──────────────────┘
+                                        │
+                     canary.Next ◄──────┘  analysis.Evaluate → Pass|Fail|Inconclusive|Error
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Five decisions carry the design — each has an ADR:
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+- [**0001**](docs/adr/0001-spike-closed-loop.md) — the feasibility spike, with real numbers
+- [**0002**](docs/adr/0002-model-weight-delivery.md) — weights as an OCI image, not `ImageVolume`
+- [**0003**](docs/adr/0003-metrics-shim.md) — the shim, and the three things that fail *silently*
+- [**0004**](docs/adr/0004-canary-analysis.md) — four verdicts, disjoint counters, a pure core
+- [**0005**](docs/adr/0005-autoscaling.md) — queue depth, `/scale`, and no `mode: HPA`
+- [**0006**](docs/adr/0006-slo-and-dashboards.md) — TTFT as the SLI, and why not duration
+- [**0007**](docs/adr/0007-hardening-and-ci.md) — lint rules that encode the lessons
 
-```sh
-kubectl apply -k config/samples/
+Also: [`docs/api.md`](docs/api.md) (generated, drift-checked) ·
+[`docs/slo.md`](docs/slo.md) (the runbook every alert links to) ·
+[`research.md`](research.md) (the verified stack, with the rejected options)
+
+---
+
+## Testing
+
+Three tiers, with explicit jobs. The distinction matters because **envtest runs
+no controllers and no kubelet** — a Deployment created there never creates a
+ReplicaSet, never schedules a pod, and its status stays at zero forever.
+
+| Tier | Has | Proves | Runtime |
+|---|---|---|---|
+| unit | nothing | `canary.Next`, `autoscale.Recommend`, `analysis.Evaluate`, every generated query | ms |
+| envtest | a real API server + etcd | CEL, defaulting, `/scale`, SSA idempotency, conditions, GC | ~20 s |
+| [Chainsaw](test/chainsaw/) | a real cluster | pods actually start, the HPA controller acts, traffic reaches the shim | minutes |
+
+```bash
+make verify          # everything that needs no cluster
+make e2e-up          # cluster + operator + images
+make e2e-chainsaw    # the six suites
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+Determinism comes from three mechanisms, not from retries:
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+1. **An injected `clock.PassiveClock`**, with `time.Now()` banned by lint outside
+   `main`. An entire five-step canary runs in microseconds via `fakeClock.Step()`.
+2. **A scripted `MetricProvider`** — `"pass, pass, fail, fail"` asserts that
+   rollback fires on *exactly* the second failure, which is impossible against a
+   live Prometheus.
+3. **`RequeueAfter` as a return value**, so a test asserts on rollout timing
+   instead of measuring how long the controller slept.
 
-```sh
-kubectl delete -k config/samples/
-```
+---
 
-**Delete the APIs(CRDs) from the cluster:**
+## Status
 
-```sh
-make uninstall
-```
+Sprints 0–7 complete. The vLLM engine profile (Sprint 8, committed stretch) is
+the remaining work — it proves `EngineSpec` is a real abstraction rather than a
+fiction, since the canary demo should run unchanged across an engine swap.
 
-**UnDeploy the controller from the cluster:**
+**Not yet proven:** the Chainsaw suites are written and schema-validated
+(`make chainsaw-lint`, part of `make verify` and of CI) but have not been
+executed against a live cluster — Docker was unavailable. Everything that runs
+without a cluster is green, and is what every other claim here rests on.
 
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/llmcp:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/llmcp/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+---
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Copyright 2026. Licensed under the Apache License, Version 2.0.

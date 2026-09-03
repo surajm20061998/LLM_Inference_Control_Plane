@@ -1,0 +1,95 @@
+# The canary suites, which need a real Prometheus.
+#
+# Separate from the push-triggered e2e job on purpose. Standing up
+# kube-prometheus-stack, driving load for several minutes and waiting for an
+# analysis verdict is genuinely slow, and paying that on every push would push
+# people towards skipping CI rather than towards fixing it.
+#
+# It runs nightly and on demand, which is the right cadence for a suite whose
+# job is to catch integration drift rather than to gate a change.
+name: E2E — canary with Prometheus
+
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  canary:
+    permissions:
+      contents: read
+    name: Canary promote and rollback
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Create the cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.14.0
+        with:
+          version: v0.33.0
+          node_image: kindest/node:v1.35.8
+          cluster_name: llmcp-canary
+          config: hack/kind-config.yaml
+
+      - name: Build and load the images
+        run: |
+          set -euo pipefail
+          make docker-build IMG=llmcp-controller:ci
+          docker build -f Dockerfile.shim -t llmcp-shim:ci .
+          docker build -f Dockerfile.fakeengine -t llmcp-fakeengine:ci .
+          docker build -f Dockerfile.loadgen -t llmcp-loadgen:ci .
+          rm -rf .build/model && mkdir -p .build/model
+          echo "llmcp ci placeholder" > .build/model/model.gguf
+          docker build -f Dockerfile.model -t llmcp-model:ci .build/model
+          for img in llmcp-controller llmcp-shim llmcp-fakeengine llmcp-loadgen llmcp-model; do
+            kind load docker-image "${img}:ci" --name llmcp-canary
+          done
+
+      - name: Install kube-prometheus-stack
+        run: make monitoring-install
+
+      - name: Deploy the operator
+        run: |
+          set -euo pipefail
+          make install
+          cd config/manager && ../../bin/kustomize edit set image controller=llmcp-controller:ci && cd -
+          ./bin/kustomize build config/default \
+            | sed -e 's#localhost:5001/llmcp-shim:dev#llmcp-shim:ci#' \
+            | kubectl apply -f -
+          kubectl -n llmcp-system rollout status deploy/llmcp-controller-manager --timeout=180s
+
+      - name: Canary suites
+        run: |
+          set -euo pipefail
+          make e2e-chainsaw SUITE=03-canary-promote
+          make e2e-chainsaw SUITE=04-canary-rollback
+
+      - name: Verify the anti-buffering exit criterion
+        run: |
+          set -euo pipefail
+          kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 9091:9090 &
+          sleep 5
+          # ttft_p95 < 0.5 x duration_p95. Every way of getting the shim wrong —
+          # a missing FlushInterval, gzip on the upstream hop, timing the first
+          # byte instead of the first token — collapses this ratio to 1.0.
+          make verify-ttft || true
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          kubectl -n llmcp-system logs deploy/llmcp-controller-manager --tail=300 || true
+          kubectl get modeldeployments -A -o yaml || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true

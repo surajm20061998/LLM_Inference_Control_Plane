@@ -1,0 +1,11 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: scale-demo
+status:
+  phase: Available
+  replicas: 1
+  readyReplicas: 1
+  conditions:
+    - type: Ready
+      status: "True"

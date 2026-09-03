@@ -1,0 +1,41 @@
+# A MINIMAL PrometheusRule CRD, for envtest only.
+#
+# Not prometheus-operator's real CRD, and it must never be applied to a cluster.
+# It exists so that the operator's rule-generation path can be exercised against
+# a real API server without vendoring a large upstream schema and its Go module
+# into a project that writes exactly two kinds from it.
+#
+# spec is x-kubernetes-preserve-unknown-fields, so the API server stores what
+# the controller sends without validating its shape. That is the right trade
+# here: these tests assert on what the OPERATOR produced, and pinning a copy of
+# upstream's schema would make them start failing when prometheus-operator adds
+# a field, for reasons unrelated to this code.
+#
+# The suite deliberately exercises the ABSENT case too, with a fake discovery
+# prober rather than by uninstalling this — a cluster with no prometheus-operator
+# is a supported configuration that must not crash or fail a reconcile.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: prometheusrules.monitoring.coreos.com
+spec:
+  group: monitoring.coreos.com
+  scope: Namespaced
+  names:
+    kind: PrometheusRule
+    listKind: PrometheusRuleList
+    plural: prometheusrules
+    singular: prometheusrule
+    shortNames:
+      - promrule
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

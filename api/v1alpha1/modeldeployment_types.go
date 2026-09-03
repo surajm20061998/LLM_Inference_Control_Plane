@@ -20,7 +20,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // Variant identifies which side of a progressive rollout a workload belongs to.
@@ -70,6 +69,22 @@ type ModelDeploymentSpec struct {
 	// changes.
 	// +optional
 	Rollout RolloutSpec `json:"rollout,omitempty"`
+
+	// Observability configures what the operator publishes for Prometheus and
+	// Grafana to consume.
+	// +optional
+	Observability ObservabilitySpec `json:"observability,omitempty"`
+
+	// Autoscaling configures the built-in autoscaler.
+	//
+	// Nil means off, and something else owns .spec.replicas: a human with
+	// `kubectl scale`, a GitOps commit, or an external HorizontalPodAutoscaler
+	// writing through the /scale subresource. All three work without any
+	// configuration here, which is why this is a pointer rather than a struct
+	// with a defaulted `mode: Off`.
+	//
+	// +optional
+	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
 }
 
 // ModelSpec describes the model being served.
@@ -202,59 +217,96 @@ type ServingSpec struct {
 	// +optional
 	// +kubebuilder:default="300s"
 	StartupTimeout *metav1.Duration `json:"startupTimeout,omitempty"`
+
+	// Shim configures the llmcp metrics sidecar.
+	// +optional
+	Shim ShimSpec `json:"shim,omitempty"`
 }
 
-// RolloutStrategyType selects how pod template changes are rolled out.
-// +kubebuilder:validation:Enum=RollingUpdate;Recreate
-type RolloutStrategyType string
-
-const (
-	// RolloutRollingUpdate replaces pods incrementally, keeping the service up.
-	RolloutRollingUpdate RolloutStrategyType = "RollingUpdate"
-	// RolloutRecreate tears down all pods before creating replacements.
-	RolloutRecreate RolloutStrategyType = "Recreate"
-)
-
-// RolloutSpec controls rollout behaviour.
+// ShimSpec configures the llmcp metrics sidecar.
 //
-// The mechanics of a rolling update are delegated to the child Deployment,
-// which already implements them correctly. What this operator adds on top is
-// the behaviour a Deployment does NOT have: a Deployment whose rollout stalls
-// stays stalled forever, whereas exceeding ProgressDeadline here reverts to the
-// last revision that was known good.
-type RolloutSpec struct {
-	// Type selects the update strategy.
-	// +optional
-	// +kubebuilder:default=RollingUpdate
-	Type RolloutStrategyType `json:"type,omitempty"`
-
-	// MaxSurge is the number or percentage of pods that may exist above the
-	// desired count during an update. Ignored when Type is Recreate.
-	// +optional
-	MaxSurge *intstr.IntOrString `json:"maxSurge,omitempty"`
-
-	// MaxUnavailable is the number or percentage of pods that may be
-	// unavailable during an update. Ignored when Type is Recreate.
-	// +optional
-	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
-
-	// ProgressDeadline is how long a rollout may make no progress before it is
-	// declared failed.
-	// +optional
-	// +kubebuilder:default="600s"
-	ProgressDeadline *metav1.Duration `json:"progressDeadline,omitempty"`
-
-	// AutoRollback reverts to the last known-good revision when the deadline is
-	// exceeded. Consumed from the sprint that implements rollback; declared
-	// here so the field is stable.
+// # Why a sidecar exists at all
+//
+// It is not a convenience layer. llama.cpp exposes GAUGES only — no
+// histograms, no request duration, no time-to-first-token, no HTTP status-code
+// counter. p95 latency and success rate are therefore not merely inconvenient
+// to compute from the engine's own metrics, they are impossible, and canary
+// analysis would have nothing to gate a promotion on. The shim reverse-proxies
+// the OpenAI surface and emits the missing signals.
+//
+// The second reason is engine independence. `llmcp_inference_ttft_seconds`
+// means exactly the same thing whether the engine underneath is llama.cpp,
+// vLLM or the deterministic test stub, because one binary measures it in one
+// place. That is what makes the EngineSpec abstraction real rather than
+// decorative: swapping engines does not invalidate a single alert, dashboard
+// or rollout gate.
+type ShimSpec struct {
+	// Enabled injects the shim. Defaults to true.
+	//
+	// Turning it off leaves the engine serving directly and is supported, but
+	// it disables every llmcp_* metric — which means canary analysis, the
+	// built-in autoscaler and the SLO alerts all lose their inputs. The
+	// MetricsRegistered condition says so out loud rather than leaving an
+	// operator to discover it from empty graphs.
+	//
 	// +optional
 	// +kubebuilder:default=true
-	AutoRollback *bool `json:"autoRollback,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Image overrides the shim container image.
+	//
+	// The operator's own build-pinned shim image is used when this is empty,
+	// which is almost always what is wanted: the shim's metric names are the
+	// contract the operator's analysis code reads, so running a shim from a
+	// different build than the controller is a version skew with silent
+	// consequences.
+	//
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Resources are the shim container's compute resources.
+	//
+	// The shim is a streaming byte pump with a histogram attached; it is
+	// deliberately given a small, explicit default rather than left
+	// unconstrained, because an unbounded sidecar sharing a pod with a
+	// CPU-starved inference engine can steal exactly the cycles whose absence
+	// the metrics are supposed to be measuring.
+	//
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// LogLevel sets the shim's log verbosity.
+	// +optional
+	// +kubebuilder:default=info
+	// +kubebuilder:validation:Enum=debug;info;warn;error
+	LogLevel string `json:"logLevel,omitempty"`
+}
+
+// ShimEnabled reports whether the metrics sidecar should be injected.
+func (s *ServingSpec) ShimEnabled() bool {
+	if s == nil || s.Shim.Enabled == nil {
+		return true
+	}
+	return *s.Shim.Enabled
 }
 
 // Phase is a coarse, human-facing summary of where a ModelDeployment is.
 // Machine logic should read Conditions, not Phase.
-// +kubebuilder:validation:Enum=Pending;Progressing;Available;Degraded
+//
+// The state machine is:
+//
+//	Pending -> Progressing -> Available
+//	Available -> Canarying -> Promoting   -> Available
+//	                       -> RollingBack -> Degraded
+//	                       -> Paused      (awaiting a human)
+//
+// Three invariants are enforced by unit tests rather than by comments:
+// Promoting and RollingBack always make progress; Paused never leaves without
+// external input; and entering Canarying requires a non-empty lastGoodRevision,
+// because a canary with nothing to roll back TO is not a canary, it is a
+// deploy with extra steps.
+//
+// +kubebuilder:validation:Enum=Pending;Progressing;Available;Canarying;Promoting;RollingBack;Paused;Degraded
 type Phase string
 
 const (
@@ -264,6 +316,15 @@ const (
 	PhaseProgressing Phase = "Progressing"
 	// PhaseAvailable is the steady state: desired replicas are ready.
 	PhaseAvailable Phase = "Available"
+	// PhaseCanarying means a canary is running and being analysed.
+	PhaseCanarying Phase = "Canarying"
+	// PhasePromoting means the canary passed and is becoming the primary.
+	PhasePromoting Phase = "Promoting"
+	// PhaseRollingBack means the canary failed and is being torn down.
+	PhaseRollingBack Phase = "RollingBack"
+	// PhasePaused means the rollout is waiting for an operator to approve or
+	// abort it. Nothing moves out of this phase without external input.
+	PhasePaused Phase = "Paused"
 	// PhaseDegraded means the rollout failed or availability was lost.
 	PhaseDegraded Phase = "Degraded"
 )
@@ -325,6 +386,16 @@ type ModelDeploymentStatus struct {
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
 
+	// Canary reports the state of an in-flight or just-finished canary. It is
+	// nil when no canary has ever run.
+	// +optional
+	Canary *CanaryStatus `json:"canary,omitempty"`
+
+	// Autoscaling reports what the built-in autoscaler is doing. Nil when it is
+	// not enabled.
+	// +optional
+	Autoscaling *AutoscalingStatus `json:"autoscaling,omitempty"`
+
 	// Conditions follow the standard Kubernetes condition contract.
 	// +optional
 	// +patchMergeKey=type
@@ -343,6 +414,8 @@ type ModelDeploymentStatus struct {
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Weight",type=integer,JSONPath=`.status.canary.currentWeight`
+// +kubebuilder:printcolumn:name="Failed",type=integer,JSONPath=`.status.canary.failedChecks`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:printcolumn:name="Revision",type=string,JSONPath=`.status.stableRevision`,priority=1
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`,priority=1

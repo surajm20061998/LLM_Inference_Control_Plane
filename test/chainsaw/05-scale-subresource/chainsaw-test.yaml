@@ -1,0 +1,60 @@
+# The /scale subresource, end to end on a real cluster.
+#
+# envtest already proves the subresource round-trips and that status.selector is
+# a serialized string. What it cannot prove is the half that involves other
+# controllers: that `kubectl scale` reaches the child Deployment, that the
+# Deployment controller creates the pods, and that status.replicas converges on
+# what was asked for.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: scale-subresource
+spec:
+  timeouts:
+    apply: 1m
+    assert: 5m
+    cleanup: 2m
+  steps:
+    - name: create
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            file: assert-ready.yaml
+
+    - name: scale-up-through-the-subresource
+      try:
+        # `kubectl scale` writes .spec.replicas through /scale. Using the real
+        # command rather than a patch is the point: it exercises the same path
+        # an operator and an HPA both take.
+        - script:
+            content: |
+              kubectl -n $NAMESPACE scale modeldeployment/scale-demo --replicas=3
+        - assert:
+            file: assert-three-replicas.yaml
+
+    - name: scale-down
+      try:
+        - script:
+            content: |
+              kubectl -n $NAMESPACE scale modeldeployment/scale-demo --replicas=1
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: scale-demo
+              status:
+                replicas: 1
+                readyReplicas: 1
+
+    - name: the-child-deployment-follows
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: scale-demo-primary
+              spec:
+                replicas: 1

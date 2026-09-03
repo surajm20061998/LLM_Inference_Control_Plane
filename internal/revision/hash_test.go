@@ -27,7 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // ptrTo is a local generic pointer helper so the tests do not depend on any

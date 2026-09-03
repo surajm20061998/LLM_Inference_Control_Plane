@@ -1,0 +1,16 @@
+{
+  "keep_alive": true,
+  "total_prompt_tokens": 37488,
+  "pods": [
+    {
+      "pod": "spike-primary-primary-7bdb964848-ctskm",
+      "delta": 18552,
+      "share_pct": 49.5
+    },
+    {
+      "pod": "spike-primary-primary-7bdb964848-hd7nb",
+      "delta": 18936,
+      "share_pct": 50.5
+    }
+  ]
+}

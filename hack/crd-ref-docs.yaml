@@ -1,0 +1,21 @@
+# crd-ref-docs configuration.
+#
+# The API reference is GENERATED from the Go doc comments rather than written
+# separately, and `make api-docs-check` fails CI when it drifts. Hand-maintained
+# API docs are wrong within two sprints, and a reader who catches them being
+# wrong once stops trusting the rest.
+processor:
+  # Types that appear in the schema but carry no useful reference documentation
+  # of their own.
+  ignoreTypes:
+    - "(ModelDeployment)List$"
+  ignoreFields:
+    # Standard object metadata: the Kubernetes docs describe it better than any
+    # generated table here would.
+    - "TypeMeta$"
+    - "status$"
+
+render:
+  # Link Kubernetes core types out to the upstream reference rather than
+  # rendering hollow stubs for them.
+  kubernetesVersion: 1.35

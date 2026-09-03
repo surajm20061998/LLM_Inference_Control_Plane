@@ -1,0 +1,115 @@
+# The vertical slice, on a real cluster.
+#
+# Everything below is proven at the envtest tier already — except the part that
+# matters most here: that the pods actually START, that the shim is injected as
+# a native sidecar and becomes ready before the engine, and that a real HTTP
+# request reaches a real streaming response through the Service.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: basic
+spec:
+  steps:
+    - name: create
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: basic-demo
+              status:
+                phase: Available
+                replicas: 2
+                readyReplicas: 2
+                conditions:
+                  - type: Ready
+                    status: "True"
+                  - type: ModelReady
+                    status: "True"
+
+    - name: the-shim-is-a-native-sidecar
+      try:
+        - assert:
+            # restartPolicy: Always on an INIT container is what makes it a
+            # native sidecar. Without it the kubelet waits for the shim to exit
+            # before starting the engine — and since the shim is a server that
+            # never exits, the pod hangs in Init forever. envtest cannot catch
+            # that, because envtest never starts a pod.
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: basic-demo-primary
+              spec:
+                template:
+                  spec:
+                    initContainers:
+                      - name: shim
+                        restartPolicy: Always
+
+    - name: serves-a-streamed-completion
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE run curl-$RANDOM --rm -i --restart=Never \
+                --image=curlimages/curl:8.11.1 --quiet -- \
+                curl -sS --fail-with-body -m 60 \
+                  -H 'Content-Type: application/json' \
+                  -d '{"model":"stub-model","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
+                  http://basic-demo.$NAMESPACE.svc:8080/v1/chat/completions \
+                | tee /dev/stderr | grep -q 'data: '
+
+    - name: the-shim-is-in-the-path
+      try:
+        # If the Service targeted the engine directly, this endpoint would 404 —
+        # and every llmcp_* metric would be missing while everything else looked
+        # perfectly healthy.
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE run curl-$RANDOM --rm -i --restart=Never \
+                --image=curlimages/curl:8.11.1 --quiet -- \
+                curl -sS --fail-with-body -m 30 \
+                  http://basic-demo.$NAMESPACE.svc:8080/llmcp/livez \
+                | grep -q ok
+
+    - name: metrics-are-exposed-on-the-headless-service
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              pod=$(kubectl -n $NAMESPACE get pods -l llmcp.io/model-deployment=basic-demo \
+                -o jsonpath='{.items[0].metadata.name}')
+              kubectl -n $NAMESPACE exec "$pod" -c shim -- true 2>/dev/null || true
+              kubectl -n $NAMESPACE run curl-$RANDOM --rm -i --restart=Never \
+                --image=curlimages/curl:8.11.1 --quiet -- \
+                curl -sS --fail-with-body -m 30 "http://${pod}.basic-demo-metrics.$NAMESPACE.svc:9090/metrics" \
+                | grep -q llmcp_inference_requests_total
+
+    - name: deleting-garbage-collects-every-child
+      try:
+        # The whole no-finalizer story: every child is ownerRef'd, so deleting
+        # the parent is enough. A finalizer that is not strictly required is a
+        # liability, because a bug in its removal path wedges deletion
+        # permanently — during your own demo.
+        - delete:
+            ref:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              name: basic-demo
+        - error:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: basic-demo-primary
+        - error:
+            resource:
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: basic-demo

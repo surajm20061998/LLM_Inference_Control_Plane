@@ -20,10 +20,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
-	"github.com/surajmishra/llmcp/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // Fixture constants. They are exported so a test can assert on the value it
@@ -152,4 +153,73 @@ func WithResources(res corev1.ResourceRequirements) MDOption {
 	return func(md *v1alpha1.ModelDeployment) {
 		md.Spec.Engine.Resources = res
 	}
+}
+
+// WithCanary switches the ModelDeployment to the canary strategy.
+//
+// The defaults here are deliberately tighter than the API's: a two-rung ladder
+// and a failure threshold of 2, so a test spends four analysis rounds rather
+// than a dozen. The clock is fake, so this costs nothing in wall time — it
+// costs READING time, and a test whose intent is "rollback fires on the second
+// failure" should not need twelve steps of scrollback to show it.
+func WithCanary(mutate ...func(*v1alpha1.CanarySpec)) MDOption {
+	return func(md *v1alpha1.ModelDeployment) {
+		md.Spec.Rollout.Type = v1alpha1.RolloutCanary
+		md.Spec.Rollout.Canary = &v1alpha1.CanarySpec{
+			StepWeights: []int32{20, 50},
+			Analysis: v1alpha1.AnalysisSpec{
+				Interval:              &metav1.Duration{Duration: 30 * time.Second},
+				Window:                &metav1.Duration{Duration: 60 * time.Second},
+				InitialDelay:          &metav1.Duration{Duration: 60 * time.Second},
+				FailureThreshold:      ptr.To(int32(2)),
+				ConsecutiveErrorLimit: ptr.To(int32(3)),
+				InconclusiveLimit:     ptr.To(int32(3)),
+				OnInconclusive:        v1alpha1.InconclusiveWait,
+				MinRequestRate:        quantityPtr("500m"),
+				Provider: v1alpha1.AnalysisProviderSpec{
+					Type: v1alpha1.AnalysisProviderPrometheus,
+					// Set even though the tests inject a scripted provider, so
+					// the fixture is a spec that would work in a real cluster.
+					Address: "http://prometheus-operated.monitoring.svc:9090",
+					Timeout: &metav1.Duration{Duration: 10 * time.Second},
+				},
+				Metrics: []v1alpha1.AnalysisMetric{{
+					Name:           "ttft-p95",
+					Builtin:        builtinPtr(v1alpha1.MetricTTFTP95),
+					ThresholdRange: v1alpha1.ThresholdRange{Max: quantityPtr("1500m")},
+				}},
+			},
+			TrafficRouting: v1alpha1.TrafficRoutingSpec{Mode: v1alpha1.TrafficRoutingReplica},
+		}
+		for _, m := range mutate {
+			m(md.Spec.Rollout.Canary)
+		}
+	}
+}
+
+// WithProviderAddress sets the metric backend URL.
+func WithProviderAddress(address string) MDOption {
+	return func(md *v1alpha1.ModelDeployment) {
+		if md.Spec.Rollout.Canary == nil {
+			return
+		}
+		md.Spec.Rollout.Canary.Analysis.Provider.Address = address
+	}
+}
+
+// builtinPtr returns a pointer to a built-in metric name.
+func builtinPtr(b v1alpha1.BuiltinMetric) *v1alpha1.BuiltinMetric { return &b }
+
+// QuantityPtr parses a canonical quantity literal for a fixture. Exported so
+// controller tests can build threshold values without re-importing resource.
+func QuantityPtr(s string) *resource.Quantity { return quantityPtr(s) }
+
+// quantityPtr parses a canonical quantity literal for a fixture.
+//
+// It panics on a malformed input, which is correct here: every caller passes a
+// compile-time constant, so a failure can only be a typo introduced while
+// editing this file, and the first test to run catches it.
+func quantityPtr(s string) *resource.Quantity {
+	q := resource.MustParse(s)
+	return &q
 }

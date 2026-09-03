@@ -44,7 +44,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	v1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // ModelVolumeName is the pod volume the model file is mounted from. The
@@ -77,6 +77,18 @@ type BuildContext struct {
 	// ModelPath is the absolute in-container path to the model file, or "" when
 	// the engine fetches its own weights.
 	ModelPath string
+
+	// CacheDir is a writable directory on the model volume that an engine may
+	// download weights into. It is set only when the engine fetches its own
+	// weights (ModelPath == ""), and is empty otherwise.
+	//
+	// The two fields are deliberately mutually exclusive rather than one field
+	// with a mode flag: they imply opposite mount permissions. A pre-populated
+	// model directory is mounted read-only, which is what lets the engine run
+	// with a read-only root filesystem and no write capability anywhere; a
+	// download directory cannot be. Keeping the distinction in the type means a
+	// profile cannot accidentally ask for a writable mount it does not need.
+	CacheDir string
 
 	// Threads is the resolved worker-thread count. It is computed once by the
 	// controller via ThreadsFor and passed in; profiles must NOT re-derive it,

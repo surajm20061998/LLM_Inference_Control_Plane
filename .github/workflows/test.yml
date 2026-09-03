@@ -7,10 +7,10 @@ on:
 permissions: {}
 
 jobs:
-  test:
+  unit:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: Unit and envtest
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -22,8 +22,55 @@ jobs:
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
 
-      - name: Running Tests
+      - name: Run tests
+        run: make test
+
+      # The Chainsaw suites cannot RUN here — they need a cluster, and that is
+      # the e2e job's problem. But they can be validated against Chainsaw's own
+      # schema, which catches a misspelled field or a misplaced block without
+      # waiting for someone to have both a cluster and the time to use it.
+      - name: Validate the Chainsaw suites
+        run: make chainsaw-lint
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: cover.out
+          if-no-files-found: warn
+
+  generated:
+    permissions:
+      contents: read
+    name: Generated files are current
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # The CRD, the RBAC role, the deepcopy functions and the API reference are
+      # all generated from Go markers and comments. A pull request that changes
+      # a type without regenerating them produces a repository whose manifests
+      # do not match its code — and the mismatch surfaces as a confusing
+      # validation error in someone else's cluster.
+      - name: Regenerate everything
+        run: make manifests generate api-docs
+
+      - name: Fail if anything changed
         run: |
-          go mod tidy
-          make test
+          if ! git diff --quiet; then
+            echo "::error::Generated files are out of date. Run 'make manifests generate api-docs' and commit the result."
+            git --no-pager diff --stat
+            git --no-pager diff | head -200
+            exit 1
+          fi

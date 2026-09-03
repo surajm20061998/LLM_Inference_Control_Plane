@@ -20,6 +20,10 @@ kind: Kustomization
 
 resources:
   - ../default
+  # Scrape the operator itself. Kept out of the base because it references an
+  # optional CRD; see the file's own comment.
+  - operator-servicemonitor.yaml
+  - prometheus-metrics-reader.yaml
 
 patches:
   - target:
@@ -29,3 +33,7 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: Always
+  - target:
+      kind: Deployment
+      name: controller-manager
+    path: shim-image-patch.yaml

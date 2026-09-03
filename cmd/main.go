@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -29,14 +30,17 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/controller"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/controller"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/discovery"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/observability"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +65,9 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var shimImage string
+	var dashboardNamespace string
+	var installDashboards bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -79,6 +86,23 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+
+	// The shim image is an OPERATOR-level setting rather than a per-resource
+	// one. Its metric names are the contract this controller's own analysis
+	// queries, so shim and controller are two halves of one build and a user
+	// should not have to know the sidecar exists to get working metrics.
+	flag.StringVar(&shimImage, "shim-image", controller.DefaultShimImage,
+		"Container image for the llmcp metrics sidecar injected into every serving pod.")
+
+	// Dashboards belong to the operator, not to any ModelDeployment. Publishing
+	// them per-resource would create N copies of one dashboard and delete them
+	// all when the last ModelDeployment went away — which is exactly when
+	// someone wants to look at the graphs.
+	flag.StringVar(&dashboardNamespace, "dashboard-namespace", "",
+		"Namespace to publish Grafana dashboard ConfigMaps into. "+
+			"Defaults to POD_NAMESPACE, then to the operator's own namespace.")
+	flag.BoolVar(&installDashboards, "install-dashboards", true,
+		"Publish the embedded Grafana dashboards as ConfigMaps at start-up.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -178,14 +202,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The optional-CRD prober is built from the REST config rather than from the
+	// manager's client. It has to answer "does this kind exist at all", and a
+	// cached client can only answer questions about kinds it already knows.
+	prober, err := discovery.New(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "Failed to build the API discovery prober")
+		os.Exit(1)
+	}
+
 	if err := (&controller.ModelDeploymentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Discovery: prober,
+		ShimImage: shimImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "modeldeployment")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
+
+	if installDashboards {
+		ns := resolveDashboardNamespace(dashboardNamespace)
+		if err := mgr.Add(dashboardInstaller{client: mgr.GetClient(), namespace: ns}); err != nil {
+			setupLog.Error(err, "Failed to register the dashboard installer")
+			os.Exit(1)
+		}
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "Failed to set up health check")
@@ -201,4 +244,50 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// dashboardInstaller publishes the embedded Grafana dashboards once the manager
+// has started.
+//
+// It is a Runnable rather than a call in main() for one reason: the manager's
+// client is backed by a cache that is not usable until the manager is running,
+// and an Apply issued before then blocks or fails depending on timing. Being a
+// Runnable also means leader election applies — without it, every replica of a
+// highly-available operator would race to write the same ConfigMaps.
+type dashboardInstaller struct {
+	client    client.Client
+	namespace string
+}
+
+// NeedLeaderElection makes the installer run on the leader only.
+func (dashboardInstaller) NeedLeaderElection() bool { return true }
+
+// Start publishes the dashboards and returns.
+//
+// A failure here is LOGGED, not returned. Returning an error from a Runnable
+// tears the manager down, and refusing to serve models because a cosmetic
+// ConfigMap could not be written would trade a dashboard outage for a serving
+// one. The operator's job is inference; the graphs are how humans watch it.
+func (d dashboardInstaller) Start(ctx context.Context) error {
+	if err := observability.InstallDashboards(ctx, d.client, d.namespace); err != nil {
+		setupLog.Error(err, "Failed to publish Grafana dashboards; the operator continues without them",
+			"namespace", d.namespace)
+	}
+	return nil
+}
+
+// resolveDashboardNamespace picks where dashboard ConfigMaps are written.
+//
+// The downward API is the authority: config/manager sets POD_NAMESPACE, so the
+// operator publishes into its own namespace by default and needs no cluster-wide
+// ConfigMap write to do its normal job. The flag overrides it for the case where
+// Grafana's sidecar is scoped to a single namespace that is not the operator's.
+func resolveDashboardNamespace(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "llmcp-system"
 }

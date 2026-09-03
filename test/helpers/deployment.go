@@ -42,7 +42,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/surajmishra/llmcp/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // MarkDeploymentAvailable patches a Deployment's status so it appears fully

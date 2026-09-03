@@ -1,0 +1,1104 @@
+{
+  "uid": "llmcp-canary",
+  "title": "LLMCP \u2014 Canary",
+  "description": "Progressive delivery: the weight ladder as it climbs, both variants' latency on one axis, the four-valued verdict timeline, and promote/rollback markers sourced from the controller's own counters.",
+  "tags": [
+    "llmcp",
+    "inference",
+    "canary",
+    "rollout"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m"
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(llmcp_shim_info, model)",
+          "refId": "model"
+        },
+        "definition": "label_values(llmcp_shim_info, model)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Canary promoted",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "green",
+        "target": {
+          "expr": "changes(llmcp_canary_promotions_total{model=~\"$model\"}[1m]) > 0",
+          "titleFormat": "Promoted",
+          "textFormat": "{{model}} canary promoted"
+        }
+      },
+      {
+        "name": "Canary rolled back",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "red",
+        "target": {
+          "expr": "changes(llmcp_canary_rollbacks_total{model=~\"$model\"}[1m]) > 0",
+          "titleFormat": "Rolled back",
+          "textFormat": "{{model}} canary rolled back"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Rollout",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Canary weight",
+      "description": "The share of traffic the canary is ACTUALLY receiving, after quantisation. Replica-based splitting can only express multiples of 1/replicas, so a requested 20% at three pods realises as 33% \u2014 and this panel shows the realised figure, because believing the blast radius is smaller than it is the whole reason to publish both.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(llmcp_canary_current_weight{model=~\"$model\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Failed checks",
+      "description": "Analysis rounds that failed a threshold. Note this counter is NOT reset by an intervening pass: a canary that fails, passes, fails, passes, fails is not healthy, it is intermittently broken \u2014 which for a latency SLI is the more common shape of a real regression than a clean step change.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(llmcp_canary_failed_checks{model=~\"$model\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Promotions",
+      "description": "Canaries promoted in the selected window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(llmcp_canary_promotions_total{model=~\"$model\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Rollbacks",
+      "description": "Canaries rolled back automatically. A non-zero count here with no corresponding incident is the gate doing its job.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(llmcp_canary_rollbacks_total{model=~\"$model\"}[$__range]))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Analysis check duration p95",
+      "description": "How long one analysis round takes. It bounds how quickly a rollback can be acted on: a round slower than the analysis interval means the controller is permanently behind.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_analysis_check_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Canary pods",
+      "description": "Shim instances reporting as the canary variant. Zero while no rollout is in flight.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(llmcp_shim_info{model=~\"$model\",variant=\"canary\"})",
+          "legendFormat": "",
+          "range": false,
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Traffic weight over time",
+      "description": "The weight ladder as it climbs, with the requested and realised figures overlaid. A persistent gap between them is quantisation, not a fault \u2014 replica splitting cannot express an arbitrary percentage \u2014 and the WeightQuantized event says so at the moment it happens.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(llmcp_canary_desired_weight{model=~\"$model\"})",
+          "legendFormat": "requested",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max(llmcp_canary_current_weight{model=~\"$model\"})",
+          "legendFormat": "realised",
+          "range": true,
+          "instant": false,
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "TTFT p95 \u2014 canary against primary",
+      "description": "THE panel a promotion is decided on. Both variants on one axis: while they track each other the canary is passing, and a persistent gap is exactly what the analysis threshold measures. The annotated promote and rollback markers line up with the moment the controller acted on what this shows.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, variant) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "TTFT ratio \u2014 canary / primary",
+      "description": "The default canary gate, drawn. A ratio rather than an absolute threshold because an absolute latency bound has to be re-tuned for every model, node type and prompt mix \u2014 and a stale one fires on a busy afternoon rather than on a bad release. The denominator is clamped so a primary reporting nothing cannot make the canary look infinitely bad.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\",variant=\"canary\"}[$__rate_interval]))) / clamp_min(histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\",variant=\"primary\"}[$__rate_interval]))), 1e-9)",
+          "legendFormat": "p95 ratio",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1.5
+              }
+            ]
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Error rate by variant",
+      "description": "The second default gate, kept as an ABSOLUTE threshold rather than a ratio \u2014 a ratio is meaningless when the primary's error rate is zero, which it should be, because every ratio would then be either 0 or undefined.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "100 * sum by (variant) (rate(llmcp_inference_requests_total{model=~\"$model\",code=~\"5..\"}[$__rate_interval])) / clamp_min(sum by (variant) (rate(llmcp_inference_requests_total{model=~\"$model\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Request rate by variant",
+      "description": "What each variant is actually serving. Compare its shape against the requested weight above: a canary at 20% weight receiving 2% of requests means keep-alive is pinning clients to pods, and the analysis is judging a canary that has barely been tested.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (variant) (rate(llmcp_inference_requests_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{variant}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Analysis verdicts",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Verdict timeline",
+      "description": "Four verdicts with disjoint counters, and the separation is the safety argument. Only Fail spends the rollback budget. Error means the provider could not be reached and says nothing about the canary \u2014 so a Prometheus outage shows up here as a band of Error and never as a rollback. Inconclusive means there was not enough traffic to judge.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 14,
+        "x": 0,
+        "y": 21
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (verdict) (increase(llmcp_analysis_verdicts_total{model=~\"$model\"}[$__rate_interval]))",
+          "legendFormat": "{{verdict}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Reconcile activity",
+      "description": "The controller's own throughput while the rollout runs. A canary that appears stuck is either waiting deliberately or the controller is wedged, and only this panel distinguishes the two.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 10,
+        "x": 14,
+        "y": 21
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(controller_runtime_reconcile_total{controller=\"modeldeployment\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "range": true,
+          "instant": false,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

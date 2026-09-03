@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,10 +38,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/engine"
-	"github.com/surajmishra/llmcp/internal/naming"
-	"github.com/surajmishra/llmcp/internal/revision"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/analysis"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/discovery"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/engine"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/observability"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/revision"
 )
 
 // revisionHistoryLimit bounds how many ControllerRevisions are retained per
@@ -65,9 +69,51 @@ type ModelDeploymentReconciler struct {
 	// test. Production passes a real clock; tests pass a fake one and step it.
 	Clock clock.PassiveClock
 
+	// Discovery answers whether optional CRDs — prometheus-operator's, today —
+	// are served by this cluster.
+	//
+	// It is an interface and it is allowed to be nil. Nil means "nothing was
+	// checked", which is reported as an Unknown MetricsRegistered condition
+	// rather than assumed to be an absence: a unit test that constructs a bare
+	// reconciler should not thereby assert something about a cluster.
+	Discovery discovery.Interface
+
+	// ShimImage is the metrics sidecar image injected into every serving pod.
+	// Empty falls back to DefaultShimImage.
+	ShimImage string
+
+	// Provider overrides the metric backend used by canary analysis.
+	//
+	// Production leaves it nil and one is built from
+	// spec.rollout.canary.analysis.provider. Tests inject a scripted provider
+	// so that a rollout's verdict sequence — "pass, pass, fail, fail" — is a
+	// property of the test rather than of whatever Prometheus happened to
+	// scrape, which is the only way to assert that rollback fires on exactly
+	// the second failure.
+	Provider analysis.Provider
+
 	// revisions persists rollout history. Built lazily from Client so that a
 	// zero-value reconciler constructed in a test still works.
 	revisions *revision.Recorder
+}
+
+// renderOptions returns the operator-level settings the pure builders need.
+func (r *ModelDeploymentReconciler) renderOptions() renderOptions {
+	return renderOptions{ShimImage: r.ShimImage}
+}
+
+// now reads the injected clock.
+//
+// Nothing in this package calls time.Now() directly, and a lint rule forbids
+// it outside main. That is what lets an entire five-step canary — including its
+// analysis interval and its warm-up delay — be replayed in microseconds by
+// stepping a fake clock, instead of a test suite that sleeps for minutes and
+// flakes when a CI runner is busy.
+func (r *ModelDeploymentReconciler) now() time.Time {
+	if r.Clock == nil {
+		r.Clock = clock.RealClock{}
+	}
+	return r.Clock.Now()
 }
 
 // +kubebuilder:rbac:groups=inference.llmcp.io,resources=modeldeployments,verbs=get;list;watch;create;update;patch;delete
@@ -92,9 +138,21 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	var md inferencev1alpha1.ModelDeployment
 	if err := r.Get(ctx, req.NamespacedName, &md); err != nil {
-		// Not found is the normal path after a delete: every child carries an
-		// owner reference, so garbage collection has already cleaned up.
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// The normal path after a delete: every child carries an owner
+			// reference, so garbage collection has already cleaned up the
+			// objects. What it cannot clean up is this process's own metric
+			// gauges, and a gauge for a resource that no longer exists is worse
+			// than a leak — it keeps reporting a canary weight for a rollout
+			// that ended, holding dashboards and alerts on a deployment nobody
+			// can look at any more.
+			//
+			// The model label is unknown here (the object is gone), so the
+			// sweep matches on namespace and name alone.
+			observability.ForgetNamespacedName(req.Namespace, req.Name)
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
 
 	// A resource being deleted needs nothing from us. There is no finalizer by
@@ -117,7 +175,32 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, fmt.Errorf("recording revision: %w", err)
 	}
 
-	desired, err := buildChildren(&md, prof, rev)
+	primaryDep, err := r.deploymentFor(ctx, &md, naming.PrimaryDeployment(md.Name))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	canaryDep, err := r.canaryDeploymentFor(ctx, &md)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Autoscaling runs BEFORE the rollout is planned, so a scale decision and
+	// the canary split that distributes it happen in the same pass. Planned
+	// first, the split would divide last pass's total and the fleet would spend
+	// a full analysis window at the wrong size.
+	//
+	// Its error is captured rather than returned, for the same reason the
+	// metrics verdict's is: a failed sample must still leave an accurate status
+	// behind, and returning here would skip the status write entirely.
+	scaling, scaleErr := r.reconcileAutoscaling(ctx, &md, primaryDep, canaryDep)
+
+	// Decide what SHOULD be running before touching anything. The plan is a
+	// description of the desired end state, not a list of operations, so the
+	// same code path applies a canary at 20%, a promotion, a rollback and a
+	// plain rolling update.
+	plan := r.planRollout(ctx, &md, rev, primaryDep, canaryDep)
+
+	desired, err := r.renderRollout(ctx, &md, prof, rev, plan)
 	if err != nil {
 		// A build failure is a spec the controller cannot render. Retrying
 		// cannot fix it, so do not spin.
@@ -128,22 +211,199 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	obs, err := r.observe(ctx, &md, rev)
+	if desired.CanaryDeployment == nil {
+		if err := r.deleteCanaryDeployment(ctx, &md); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	r.emitRolloutEvents(&md, plan)
+
+	// Consume promote/abort now that they have been acted on, so an operator's
+	// earlier "yes" cannot silently approve the next release too.
+	if err := r.clearRolloutAnnotations(ctx, &md); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Metric collection is reconciled before status is computed, so the
+	// MetricsRegistered condition reflects this pass rather than the previous
+	// one. Its error is captured, not returned immediately: a ServiceMonitor
+	// that could not be applied must still leave an accurate status behind, and
+	// returning here would skip the status write entirely.
+	verdict, metricsErr := r.reconcileObservability(ctx, &md)
+	r.noteMetricsUnavailable(&md, verdict)
+
+	obs, err := r.observe(ctx, &md, rev, plan)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	obs.Metrics = verdict
+	obs.Scaling = scaling
 
 	if err := r.updateStatus(ctx, &md, obs); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	log.V(1).Info("reconciled", "revision", rev, "ready", obs.Deployment != nil)
+	// Both deferred errors are reported only now that status is durable, so the
+	// retry that follows starts from an accurate picture rather than a stale
+	// one. Metrics first: it is the more common failure and the one whose
+	// message points at the likelier cause.
+	if metricsErr != nil {
+		return ctrl.Result{}, metricsErr
+	}
+	if scaleErr != nil {
+		return ctrl.Result{}, scaleErr
+	}
 
-	// No RequeueAfter: the Deployment is watched via Owns(), so every change to
-	// its status — including the Deployment controller declaring the rollout
-	// stalled — wakes this reconciler. Polling on a timer would be strictly
-	// worse: slower to react and more API traffic at rest.
-	return ctrl.Result{}, nil
+	log.V(1).Info("reconciled",
+		"revision", rev,
+		"primaryRevision", plan.PrimaryRevision,
+		"canaryRevision", plan.CanaryRevision,
+		"action", plan.Output.Action)
+
+	// RequeueAfter comes from the state machine and the autoscaler as VALUES,
+	// and is zero whenever nothing is time-dependent.
+	//
+	// At rest that means no timer at all: the child Deployments are watched via
+	// Owns(), so every status change — including the Deployment controller
+	// declaring a rollout stalled — wakes this reconciler already. Polling on a
+	// timer would be strictly worse there: slower to react and more API traffic
+	// for nothing.
+	//
+	// Two things are exceptions, and both for the same reason — the passage of
+	// time is not an event any Kubernetes object emits. A canary needs waking
+	// when its analysis interval elapses; the autoscaler needs waking to look
+	// at the load at all. The SHORTER of the two wins, because a timer that
+	// fires too often merely costs a no-op reconcile whereas one that fires too
+	// rarely misses a decision.
+	return ctrl.Result{RequeueAfter: soonest(plan.RequeueAfter, scaling.RequeueAfter)}, nil
+}
+
+// soonest returns the smallest positive duration, or zero when neither is set.
+func soonest(a, b time.Duration) time.Duration {
+	switch {
+	case a <= 0:
+		return max(b, 0)
+	case b <= 0:
+		return a
+	default:
+		return min(a, b)
+	}
+}
+
+// renderRollout resolves each variant's spec and renders the child objects.
+//
+// The per-variant spec lookup is what makes a canary a real comparison. The
+// primary must run the LAST KNOWN-GOOD revision's pod template while the canary
+// runs the target's, and the known-good template lives in a ControllerRevision
+// rather than in the live spec — which by definition describes the new thing.
+// Rendering both from md.Spec would produce two identical variants and an
+// analysis that compares a revision against itself.
+func (r *ModelDeploymentReconciler) renderRollout(
+	ctx context.Context,
+	md *inferencev1alpha1.ModelDeployment,
+	prof engine.Profile,
+	target string,
+	plan rollout,
+) (desiredChildren, error) {
+	primarySpec, err := r.specForRevision(ctx, md, target, plan.PrimaryRevision)
+	if err != nil {
+		return desiredChildren{}, err
+	}
+
+	primary := variantPlan{
+		Spec:     primarySpec,
+		Revision: plan.PrimaryRevision,
+		Replicas: plan.PrimaryReplicas,
+	}
+
+	if plan.CanaryRevision == "" || plan.CanaryReplicas <= 0 {
+		return buildChildren(md, prof, primary, nil, r.renderOptions())
+	}
+
+	canarySpec, err := r.specForRevision(ctx, md, target, plan.CanaryRevision)
+	if err != nil {
+		return desiredChildren{}, err
+	}
+
+	canary := variantPlan{
+		Spec:     canarySpec,
+		Revision: plan.CanaryRevision,
+		Replicas: plan.CanaryReplicas,
+	}
+	return buildChildren(md, prof, primary, &canary, r.renderOptions())
+}
+
+// specForRevision reconstructs the spec a revision was recorded with.
+//
+// The reconstruction is a MERGE, never a wholesale replacement, and the
+// distinction is load-bearing. A ControllerRevision stores only the fields that
+// define a revision — model, engine, serving port and shim — so everything else
+// comes back zero. Assigning it directly would set Replicas to nil, undoing
+// whatever an autoscaler had decided, and clear the rollout settings, turning a
+// rollback into an unintended scale-down at the worst possible moment.
+//
+// A missing revision falls back to the live spec rather than failing. History
+// can legitimately be gone — pruned, or never recorded because the operator was
+// upgraded mid-rollout — and refusing to render anything would leave a
+// ModelDeployment with no pods at all, which is a far worse outcome than
+// rolling forward.
+func (r *ModelDeploymentReconciler) specForRevision(
+	ctx context.Context,
+	md *inferencev1alpha1.ModelDeployment,
+	target, want string,
+) (inferencev1alpha1.ModelDeploymentSpec, error) {
+	if want == "" || want == target {
+		return md.Spec, nil
+	}
+
+	if r.revisions == nil {
+		r.revisions = &revision.Recorder{Client: r.Client, Scheme: r.Scheme}
+	}
+
+	cr, err := r.revisions.Get(ctx, md, want)
+	if apierrors.IsNotFound(err) {
+		logf.FromContext(ctx).Info(
+			"revision history is missing; rendering from the live spec instead",
+			"revision", want)
+		return md.Spec, nil
+	}
+	if err != nil {
+		return inferencev1alpha1.ModelDeploymentSpec{}, fmt.Errorf("reading revision %s: %w", want, err)
+	}
+
+	stored, err := revision.SpecFrom(cr)
+	if err != nil {
+		return inferencev1alpha1.ModelDeploymentSpec{}, fmt.Errorf("decoding revision %s: %w", want, err)
+	}
+
+	merged := *md.Spec.DeepCopy()
+	merged.Model = stored.Model
+	merged.Engine = stored.Engine
+	merged.Serving.Port = stored.Serving.Port
+	merged.Serving.Shim = stored.Serving.Shim
+	return merged, nil
+}
+
+// deploymentFor reads one child Deployment by name, tolerating its absence.
+func (r *ModelDeploymentReconciler) deploymentFor(
+	ctx context.Context,
+	md *inferencev1alpha1.ModelDeployment,
+	name string,
+) (*appsv1.Deployment, error) {
+	var dep appsv1.Deployment
+	key := types.NamespacedName{Namespace: md.Namespace, Name: name}
+
+	switch err := r.Get(ctx, key, &dep); {
+	case err == nil:
+		return &dep, nil
+	case apierrors.IsNotFound(err):
+		// Just applied it, or it has not been created yet; the cache has not
+		// caught up. Status reports Progressing and the watch brings us back.
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("reading Deployment %s: %w", name, err)
+	}
 }
 
 // recordRevision persists the current spec revision and prunes old history.
@@ -198,6 +458,14 @@ func (r *ModelDeploymentReconciler) applyChildren(ctx context.Context, desired d
 	if err := r.Apply(ctx, desired.Service, opts...); err != nil {
 		return fmt.Errorf("applying Service: %w", err)
 	}
+	if err := r.Apply(ctx, desired.MetricsService, opts...); err != nil {
+		return fmt.Errorf("applying metrics Service: %w", err)
+	}
+	if desired.CanaryDeployment != nil {
+		if err := r.Apply(ctx, desired.CanaryDeployment, opts...); err != nil {
+			return fmt.Errorf("applying canary Deployment: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -206,6 +474,7 @@ func (r *ModelDeploymentReconciler) observe(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
 	rev string,
+	plan rollout,
 ) (observed, error) {
 	selector, err := serviceSelectorString(md)
 	if err != nil {
@@ -215,23 +484,19 @@ func (r *ModelDeploymentReconciler) observe(
 	obs := observed{
 		DesiredReplicas: replicasFor(md),
 		Revision:        rev,
+		PrimaryRevision: plan.PrimaryRevision,
 		Selector:        selector,
 		Endpoint:        endpointFor(md),
+		Rollout:         plan,
 	}
 
-	var dep appsv1.Deployment
-	key := types.NamespacedName{
-		Namespace: md.Namespace,
-		Name:      naming.PrimaryDeployment(md.Name),
+	obs.Deployment, err = r.deploymentFor(ctx, md, naming.PrimaryDeployment(md.Name))
+	if err != nil {
+		return observed{}, err
 	}
-	switch err := r.Get(ctx, key, &dep); {
-	case err == nil:
-		obs.Deployment = &dep
-	case apierrors.IsNotFound(err):
-		// Just applied it; the cache has not caught up. Status will report
-		// Progressing and the watch will bring us straight back.
-	default:
-		return observed{}, fmt.Errorf("reading Deployment: %w", err)
+	obs.CanaryDeployment, err = r.canaryDeploymentFor(ctx, md)
+	if err != nil {
+		return observed{}, err
 	}
 
 	return obs, nil
@@ -331,6 +596,51 @@ func (r *ModelDeploymentReconciler) event(
 	// `related` is nil: these events concern the ModelDeployment itself, not a
 	// relationship between it and a second object.
 	r.Recorder.Eventf(md, nil, eventType, reason, action, "%s", message)
+}
+
+// eventOnce emits an event only when a condition's reason is about to CHANGE.
+//
+// The de-duplication keys off the current status rather than a field on the
+// reconciler, which matters twice over: it fires once per transition rather
+// than once per process lifetime, and a leader-election handover does not
+// replay the backlog. Events are rate-limited by the API server anyway, but a
+// controller that re-emits the same warning every fifteen seconds trains people
+// to filter its events out — and these are the events the canary dashboard's
+// annotations are sourced from, so a duplicate is a second vertical line on a
+// graph at a moment when nothing happened.
+func (r *ModelDeploymentReconciler) eventOnce(
+	md *inferencev1alpha1.ModelDeployment,
+	conditionType, reason string,
+	eventType, eventReason, action, message string,
+) {
+	if conditionReason(md.Status.Conditions, conditionType) == reason {
+		return
+	}
+	r.event(md, eventType, eventReason, action, message)
+}
+
+// noteMetricsUnavailable emits an event the first time metric collection
+// becomes unavailable for a resource.
+func (r *ModelDeploymentReconciler) noteMetricsUnavailable(
+	md *inferencev1alpha1.ModelDeployment,
+	verdict metricsVerdict,
+) {
+	if verdict.Status == metav1.ConditionTrue {
+		return
+	}
+	r.eventOnce(md, inferencev1alpha1.ConditionMetricsRegistered, verdict.Reason,
+		corev1.EventTypeWarning, inferencev1alpha1.EventReasonMetricsUnavailable,
+		"RegisterMetrics", verdict.Message)
+}
+
+// conditionReason returns the reason of a condition, or "" when absent.
+func conditionReason(conds []metav1.Condition, condType string) string {
+	for i := range conds {
+		if conds[i].Type == condType {
+			return conds[i].Reason
+		}
+	}
+	return ""
 }
 
 // isConditionTrue reports whether a condition of the given type is True.

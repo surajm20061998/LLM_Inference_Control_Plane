@@ -1,0 +1,107 @@
+# Rolling updates, and the one thing a Deployment cannot do for itself.
+#
+# The rolling update itself is delegated wholesale to the Deployment controller,
+# which already implements it correctly — this operator adds nothing there and
+# the suite only confirms it works end to end. What IS this operator's job is
+# the second half: noticing that a rollout blew its progress deadline and
+# reverting to the last known-good revision. Once a Deployment sets
+# Progressing=False with ProgressDeadlineExceeded, nothing in Kubernetes ever
+# revisits that decision.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: rolling-update
+spec:
+  steps:
+    - name: create
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: rollout-demo
+              status:
+                phase: Available
+                readyReplicas: 2
+
+    - name: record-the-known-good-revision
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              rev=$(kubectl -n $NAMESPACE get modeldeployment rollout-demo \
+                -o jsonpath='{.status.lastGoodRevision}')
+              echo "lastGoodRevision: ${rev}"
+              [ -n "${rev}" ]
+
+    - name: a-healthy-change-rolls-out
+      try:
+        # contextSize is part of the revision payload, so this is the cheapest
+        # way to force a new revision without changing anything that matters.
+        - script:
+            content: |
+              kubectl -n $NAMESPACE patch modeldeployment rollout-demo --type=merge \
+                -p '{"spec":{"engine":{"contextSize":8192}}}'
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: rollout-demo
+              status:
+                phase: Available
+                readyReplicas: 2
+        - script:
+            content: |
+              set -euo pipefail
+              args=$(kubectl -n $NAMESPACE get deploy rollout-demo-primary \
+                -o jsonpath='{.spec.template.spec.containers[?(@.name=="engine")].args}')
+              echo "engine args: ${args}"
+              echo "${args}" | grep -q 8192
+
+    - name: a-broken-change-is-reverted
+      try:
+        # An image that cannot be pulled never becomes ready, so the Deployment
+        # blows its progress deadline. progressDeadline is 120s in the fixture,
+        # which is why the assert timeout below is generous.
+        - script:
+            content: |
+              kubectl -n $NAMESPACE patch modeldeployment rollout-demo --type=merge \
+                -p '{"spec":{"engine":{"image":"localhost:5001/llmcp-does-not-exist:v0"}}}'
+        - assert:
+            timeout: 6m
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: rollout-demo
+              status:
+                conditions:
+                  - type: Progressing
+                    status: "False"
+                    reason: ProgressDeadlineExceeded
+        - assert:
+            timeout: 3m
+            # The revert: the primary is back on the image that worked. Asserted
+            # on the DEPLOYMENT rather than the ModelDeployment, because the
+            # spec still names the broken image — a rollback restores what is
+            # RUNNING, and leaves the spec for a human to fix.
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: rollout-demo-primary
+              spec:
+                template:
+                  spec:
+                    containers:
+                      - name: engine
+                        image: localhost:5001/llmcp-fakeengine:dev
+      catch:
+        - events: {}
+        - describe:
+            apiVersion: inference.llmcp.io/v1alpha1
+            kind: ModelDeployment

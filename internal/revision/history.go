@@ -31,8 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	inferencev1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
-	"github.com/surajmishra/llmcp/internal/naming"
+	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 )
 
 // Recorder persists ModelDeployment revision history as ControllerRevisions.
@@ -209,8 +209,8 @@ func (r *Recorder) List(
 
 // SpecFrom reconstructs the recorded spec subset from a ControllerRevision.
 //
-// IMPORTANT: only the revision-defining fields are populated — Model, Engine
-// and Serving.Port. Everything excluded from the revision is returned ZERO:
+// IMPORTANT: only the revision-defining fields are populated — Model, Engine,
+// Serving.Port and Serving.Shim. Everything excluded from the revision is returned ZERO:
 // Replicas is nil, Rollout is the empty struct, Serving.StartupTimeout is nil.
 // That is not a gap to be filled in later, it is the point: those fields are
 // not part of the revision, so history has no opinion about them.
@@ -238,6 +238,7 @@ func SpecFrom(cr *appsv1.ControllerRevision) (*inferencev1alpha1.ModelDeployment
 		Engine: in.Engine,
 		Serving: inferencev1alpha1.ServingSpec{
 			Port: in.Serving.Port,
+			Shim: in.Serving.Shim,
 		},
 	}, nil
 }

@@ -1,0 +1,36 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: hpa-demo
+spec:
+  replicas: 1
+  model:
+    name: stub-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        path: /weights/model.gguf
+        pullPolicy: Always
+  engine:
+    type: llamacpp
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 4
+    resources:
+      requests:
+        # A CPU REQUEST is mandatory for a utilisation-target HPA: utilisation is
+        # a percentage OF THE REQUEST, so without one the HPA reports <unknown>
+        # forever and the suite would fail for a reason that has nothing to do
+        # with this operator.
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+  serving:
+    port: 8080
+    startupTimeout: 60s
+  # Deliberately absent: spec.autoscaling. The built-in autoscaler must be OFF
+  # for this suite, or two controllers would write .spec.replicas and the test
+  # would be measuring the fight rather than the contract.

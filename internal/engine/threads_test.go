@@ -23,7 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	v1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 func TestThreadsFor(t *testing.T) {

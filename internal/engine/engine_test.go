@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	v1alpha1 "github.com/surajmishra/llmcp/api/v1alpha1"
+	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 func TestGetReturnsRegisteredProfiles(t *testing.T) {

@@ -1,0 +1,115 @@
+# A healthy canary climbs the ladder and is promoted.
+#
+# # Why this needs a real cluster
+#
+# The state machine is already proven exhaustively as a pure function, and the
+# controller's use of it is proven against envtest with a scripted metric
+# provider. Neither of those touches the parts that only exist in a cluster:
+# that Prometheus actually scrapes the shim, that the recording the analysis
+# reads is the one the shim wrote, and that a real traffic split reaches two
+# real Deployments.
+#
+# Requires kube-prometheus-stack: make monitoring-install
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: canary-promote
+spec:
+  timeouts:
+    assert: 8m
+  steps:
+    - name: create
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: promote-demo
+              status:
+                phase: Available
+                readyReplicas: 4
+
+    - name: drive-load
+      try:
+        # Load runs for the whole rollout. Without it the canary receives no
+        # traffic, every check is Inconclusive by design, and the rollout holds
+        # forever — which is the CORRECT behaviour and would look like a hang.
+        #
+        # keep-alive is OFF: kube-proxy load-balances per connection, so a
+        # keep-alive client pins itself to one pod for its whole session and the
+        # realised split becomes an arbitrary multiple of 1/clients.
+        - apply:
+            file: loadgen.yaml
+
+    - name: the-canary-starts
+      try:
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: promote-demo
+              status:
+                phase: Canarying
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: promote-demo-canary
+              spec:
+                replicas: 1
+
+    - name: it-climbs-and-promotes
+      try:
+        - assert:
+            timeout: 8m
+            # Asserted on the OUTCOME, never on how long it took. Chainsaw polls
+            # until this holds, which is the only form of waiting that does not
+            # encode one machine's speed into the test.
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: promote-demo
+              status:
+                phase: Available
+                conditions:
+                  - type: CanaryHealthy
+                    status: "True"
+        - error:
+            # Removed, not scaled to zero. A Deployment left at zero keeps its
+            # ReplicaSets and keeps the canary's llmcp_shim_info series alive
+            # for Prometheus's whole staleness window, so the dashboard shows a
+            # variant that no longer exists.
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: promote-demo-canary
+
+    - name: the-promotion-is-in-the-audit-trail
+      try:
+        - script:
+            content: |
+              set -euo pipefail
+              kubectl -n $NAMESPACE get events \
+                --field-selector reason=CanaryPromoted -o name | tee /dev/stderr | grep -q .
+      catch:
+        - events: {}
+        - describe:
+            apiVersion: inference.llmcp.io/v1alpha1
+            kind: ModelDeployment
+      cleanup:
+        # Attached to the LAST step rather than to the test, because the load
+        # generator has to outlive every assertion that depends on traffic — a
+        # canary with no requests is Inconclusive by design, and tearing the job
+        # down early would make the suite fail for the wrong reason.
+        - delete:
+            ref:
+              apiVersion: batch/v1
+              kind: Job
+              name: promote-load

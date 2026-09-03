@@ -7,14 +7,7 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
+  - configmaps
   - services
   verbs:
   - create
@@ -23,6 +16,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - ""
@@ -44,6 +45,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - inference.llmcp.io
@@ -72,3 +81,16 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - monitoring.coreos.com
+  resources:
+  - prometheusrules
+  - servicemonitors
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

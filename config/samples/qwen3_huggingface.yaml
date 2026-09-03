@@ -1,0 +1,61 @@
+# The alternative model source: weights pulled from the Hugging Face Hub at pod
+# start rather than delivered as an OCI image.
+#
+# This works, and it is the fastest way to try a model you have not packaged.
+# It is NOT the recommended source, for three reasons worth being explicit
+# about:
+#
+#   1. Every pod start re-downloads ~400 MB. The volume is an emptyDir, so a
+#      restart, a rescheduling, or a scale-up all pay it again.
+#   2. Startup now depends on upstream availability and rate limits. A Hub
+#      outage becomes an outage here.
+#   3. A tag on the Hub can move. Two replicas created an hour apart are not
+#      guaranteed to be running the same bytes — which quietly breaks the one
+#      assumption progressive delivery rests on, that a canary and its primary
+#      differ only by the change under test.
+#
+# Use config/samples/qwen3_llamacpp.yaml for anything you intend to measure.
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3-hf
+  labels:
+    app.kubernetes.io/name: llmcp
+spec:
+  replicas: 1
+
+  model:
+    name: qwen3-0.6b
+    source:
+      huggingFace:
+        repo: unsloth/Qwen3-0.6B-GGUF
+        # Required, not optional. The repository carries every quantisation
+        # side by side — Q4_K_M, Q8_0, BF16 — and letting llama.cpp choose
+        # would mean the memory footprint and the latency of the pod were
+        # decided by a default nobody wrote down.
+        file: Qwen3-0.6B-Q4_K_M.gguf
+        # For a gated repository, reference a token here. It is passed to the
+        # engine as an environment variable sourced from the Secret, so it
+        # never appears in the pod spec or in a process listing:
+        #
+        # tokenSecretRef:
+        #   name: huggingface
+        #   key: token
+
+  engine:
+    type: llamacpp
+    contextSize: 4096
+    maxConcurrency: 4
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+
+  serving:
+    port: 8080
+    # Much larger than the image-source sample: this budget has to cover a
+    # ~400 MB download over the internet before the model even begins loading.
+    startupTimeout: 600s

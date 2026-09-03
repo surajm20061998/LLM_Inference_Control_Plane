@@ -1,0 +1,86 @@
+# Sprint 2 sample: the REAL engine serving REAL weights.
+#
+# This is llama.cpp's llama-server running Qwen3-0.6B quantised to Q4_K_M,
+# delivered as its own OCI image. Unlike the stub sample next to it, latency
+# here is measured rather than configured — which is the point: everything from
+# Sprint 3 onward reasons about time-to-first-token, and a stub cannot tell you
+# whether those numbers are physically plausible.
+#
+# Prerequisites:
+#   make kind-up
+#   make model-image-real        # downloads ~400 MB, verifies its checksum
+#   make dev-deploy
+#
+# Then:
+#   kubectl apply -f config/samples/qwen3_llamacpp.yaml
+#   kubectl wait modeldeployment/qwen3 --for=condition=Ready --timeout=300s
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3
+  labels:
+    app.kubernetes.io/name: llmcp
+spec:
+  # Three replicas is the interesting number, not two: it is where thread
+  # oversubscription would start to show up as latency noise if the operator
+  # were not deriving -t from the CPU limit below.
+  replicas: 3
+
+  model:
+    name: qwen3-0.6b
+    source:
+      image:
+        # The tag names the model and its quantisation, so it is immutable in
+        # practice — which is what makes IfNotPresent the right policy here.
+        # Two replicas created an hour apart are guaranteed the same weights.
+        image: localhost:5001/llmcp-model:qwen3-0.6b-q4km
+        path: /weights/model.gguf
+        pullPolicy: IfNotPresent
+
+  engine:
+    type: llamacpp
+    # No image: the profile's pinned default is used, which is the reproducible
+    # choice. Overriding it is how CI selects the deterministic stub instead.
+    contextSize: 4096
+    # Slots inside one llama-server process. Four concurrent requests per pod
+    # across three pods is comfortably more than a laptop load generator drives.
+    maxConcurrency: 4
+
+    resources:
+      requests:
+        # Requests are what the scheduler packs against, so they are set to the
+        # steady-state working set rather than to the limit. Three of these fit
+        # on a 8-CPU / 12 GiB Docker VM alongside the control plane.
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        # THE load-bearing field. llama.cpp reads the HOST's /proc to size its
+        # thread pool and is entirely cgroup-unaware, so without an explicit -t
+        # each pod would start ~8 workers and three replicas would contend for
+        # 8 cores. The operator derives -t from this limit; confirm it with:
+        #
+        #   kubectl get deploy qwen3-primary -o jsonpath='{..args}' | tr ' ' '\n' | grep -A1 '^-t$'
+        #
+        # Raising this raises -t in lockstep. They cannot drift.
+        cpu: "2"
+        # Q4_K_M weights are ~397 MB; the rest is the KV cache for a 4096-token
+        # context plus allocator overhead. The spike ADR measured real RSS —
+        # see docs/adr/0001-spike-closed-loop.md.
+        memory: 2Gi
+
+  serving:
+    port: 8080
+    # Generous because it budgets for the model load, not for steady-state
+    # health checks. The weights are already on the node (the init container
+    # copies them from a local image), so this is mostly mmap and warmup.
+    startupTimeout: 180s
+
+  rollout:
+    type: RollingUpdate
+    maxSurge: 1
+    # Zero, so a rolling update never dips below the current replica count.
+    # With a real engine a restarting pod is unavailable for however long the
+    # model takes to load, which is long enough to notice.
+    maxUnavailable: 0
+    progressDeadline: 600s
+    autoRollback: true

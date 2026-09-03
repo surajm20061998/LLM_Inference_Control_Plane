@@ -1,0 +1,40 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: rollout-demo
+spec:
+  replicas: 2
+  model:
+    name: stub-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        path: /weights/model.gguf
+        pullPolicy: Always
+  engine:
+    type: llamacpp
+    # The deterministic stub, selected through spec.engine.image rather than a
+    # dedicated enum value — so the real llamacpp profile's argument building is
+    # exercised rather than bypassed. A real model would take minutes to load
+    # and its latency varies by orders of magnitude between runs, which would
+    # make every assertion here flaky by construction.
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 4
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+  serving:
+    port: 8080
+    startupTimeout: 60s
+  rollout:
+    type: RollingUpdate
+    maxSurge: 1
+    maxUnavailable: 0
+    progressDeadline: 120s
+    autoRollback: true

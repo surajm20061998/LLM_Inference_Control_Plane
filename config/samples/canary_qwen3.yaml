@@ -1,0 +1,223 @@
+# Sprint 4 sample: a metric-gated canary with automated rollback.
+#
+# This is the centrepiece of the project. Kubernetes already performs rolling
+# updates correctly and this operator delegates them unchanged; what a
+# Deployment cannot do is notice that the new pods are HEALTHY BUT WORSE —
+# passing every readiness probe while serving three times the latency — and undo
+# itself. That is what the analysis block below buys.
+#
+# Prerequisites:
+#   make kind-up
+#   make model-image-real
+#   make dev-deploy
+#   make monitoring-install
+#
+# Apply, then drive the rollout:
+#   kubectl apply -f config/samples/canary_qwen3.yaml
+#   kubectl wait modeldeployment/qwen3-canary --for=condition=Ready --timeout=300s
+#   make load MD=qwen3-canary &
+#
+#   # Trigger a canary by changing anything in the pod template:
+#   kubectl patch modeldeployment qwen3-canary --type=merge \
+#     -p '{"spec":{"engine":{"contextSize":8192}}}'
+#
+#   kubectl get modeldeployment qwen3-canary -w -o custom-columns=\
+# 'PHASE:.status.phase,W:.status.canary.currentWeight,FAIL:.status.canary.failedChecks'
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3-canary
+  labels:
+    app.kubernetes.io/name: llmcp
+spec:
+  # Four replicas, and the number is chosen rather than arbitrary. Replica-based
+  # traffic splitting can only express multiples of 1/replicas, so at three pods
+  # a requested 25% realises as 33% and the operator reports the difference.
+  # Four makes the first rung exact, which keeps the demo's numbers honest
+  # instead of requiring a footnote.
+  replicas: 4
+
+  model:
+    name: qwen3-0.6b
+    source:
+      image:
+        image: localhost:5001/llmcp-model:qwen3-0.6b-q4km
+        path: /weights/model.gguf
+        pullPolicy: IfNotPresent
+
+  engine:
+    type: llamacpp
+    contextSize: 4096
+    maxConcurrency: 4
+    resources:
+      requests:
+        cpu: "1"
+        memory: 1Gi
+      limits:
+        # The operator derives llama.cpp's -t from this. Left unset, the engine
+        # reads the HOST's /proc, starts one worker per host core, and four
+        # replicas contend badly enough that latency percentiles become noise —
+        # at which point the canary analysis below is comparing noise to noise
+        # and rolling back healthy revisions at random.
+        cpu: "2"
+        memory: 2Gi
+
+  serving:
+    port: 8080
+    startupTimeout: 180s
+    shim:
+      # On by default; stated explicitly because everything below depends on it.
+      # llama.cpp exposes gauges only — no histograms, no TTFT, no status-code
+      # counter — so without the shim the analysis has nothing to read.
+      enabled: true
+
+  rollout:
+    type: Canary
+    progressDeadline: 900s
+    autoRollback: true
+
+    canary:
+      # An explicit ladder rather than a uniform step. The interesting
+      # information arrives in the first few percent of traffic, so a small
+      # first rung followed by larger ones spends the risk budget where it buys
+      # the most.
+      stepWeights: [25, 50, 75]
+
+      trafficRouting:
+        # Replica-based splitting: both variants sit behind one Service and the
+        # share each receives is approximately its share of the ready pods.
+        #
+        # The approximation is real. kube-proxy load-balances per CONNECTION,
+        # so a client using HTTP keep-alive pins itself to one pod for its whole
+        # session. This project's feasibility spike measured the resulting skew
+        # at 1.02 with keep-alive on and 1.09 with it off — well inside the
+        # noise — and the load generator disables keep-alive as the documented
+        # mitigation. status.canary.currentWeight always reports the weight
+        # actually achieved, never the one requested.
+        mode: Replica
+
+      scale:
+        # Pin the canary at one pod for the whole rollout, independently of its
+        # traffic weight.
+        #
+        # This matters far more for inference than for a stateless service. A
+        # model server has a long, expensive warm-up, so a canary resized at
+        # every step spends the first analysis window of each one loading a
+        # model — and the latency it reports during that window is the warm-up,
+        # not the revision under test.
+        replicas: 1
+
+      analysis:
+        # Measured, not guessed. Both numbers come from this project's spike
+        # against a 0.6B model on a laptop CPU: a percentile needs roughly 100
+        # requests per variant to be stable, and at the throughput observed
+        # there, 60 seconds supplies that while 30 does not.
+        interval: 30s
+        window: 60s
+
+        # A freshly started inference pod has a cold KV cache and is still
+        # faulting the model's pages in. Its first seconds of TTFT are genuinely
+        # terrible and genuinely unrepresentative; measuring them would fail
+        # every canary that was ever going to be fine.
+        initialDelay: 90s
+
+        # Three failures, and note they need not be consecutive: a canary that
+        # fails, passes, fails, passes, fails is not healthy, it is
+        # intermittently broken — which for a latency SLI is the more common
+        # shape of a real regression than a clean step change.
+        failureThreshold: 3
+
+        # Errors and inconclusive rounds have their own budgets, and they reset.
+        # A Prometheus outage yields Error, never Fail, so a monitoring failure
+        # can never cause a production rollback.
+        consecutiveErrorLimit: 5
+        inconclusiveLimit: 5
+        onInconclusive: Wait
+
+        # The gate that stops "no traffic" from looking like "no problems".
+        # Without it a canary passes every check having served nothing, and the
+        # whole demo is a lie. 0.5 req/s is what the spike measured as the floor
+        # below which the primary's own p95 swung by more than the regression
+        # the analysis is meant to catch.
+        minRequestRate: "500m"
+
+        provider:
+          type: Prometheus
+          # The Service kube-prometheus-stack creates for its Prometheus. No
+          # default exists for this field on purpose: a wrong-but-plausible one
+          # would make every canary report Error for a reason nobody would think
+          # to check.
+          address: http://prometheus-operated.monitoring.svc:9090
+          timeout: 10s
+
+        metrics:
+          - name: ttft-vs-primary
+            builtin: ttft-p95
+            # A RATIO against the primary, not an absolute threshold.
+            #
+            # An absolute latency bound has to be re-tuned for every model,
+            # every node type and every prompt mix, and a stale one fires on a
+            # busy afternoon rather than on a bad release — after which people
+            # stop trusting the gate. A ratio asks the only question a rollout
+            # needs answered: is the new version worse than the one it is
+            # replacing? 1.5 tolerates ordinary variance while catching the
+            # regression the spike measured, where a starved canary ran better
+            # than 2x its primary.
+            compareToPrimary: true
+            thresholdRange:
+              max: "1500m"
+
+          - name: error-rate
+            builtin: error-rate
+            # Absolute, deliberately: a ratio is meaningless when the primary's
+            # error rate is zero — which it should be — because every ratio
+            # would then be either 0 or undefined.
+            thresholdRange:
+              max: "50m"
+
+      # Promote automatically. Set to true to hold at the final weight until an
+      # operator sets llmcp.io/promote="true".
+      #
+      # The gate is on PROMOTION, not on each step: a human asked to approve
+      # every 25% increment stops reading and starts clicking, which is worse
+      # than no gate at all.
+      requireApproval: false
+
+  observability:
+    serviceMonitor:
+      enabled: true
+      interval: 15s
+      scrapeEngineMetrics: true
+
+    slo:
+      # The SLI is TIME TO FIRST TOKEN, not end-to-end duration. Duration scales
+      # with how many tokens the caller asked for, so a p95 over mixed traffic
+      # measures the request mix as much as the server — it moves when a client
+      # changes max_tokens and stays flat through a real regression that happens
+      # to coincide with shorter prompts.
+      #
+      # This value is SNAPPED UP to the nearest histogram bucket boundary, and
+      # the operator says so in the MetricsRegistered condition rather than
+      # doing it silently. Prometheus matches `le` as an exact string, so a
+      # threshold between boundaries selects no bucket at all — the recording
+      # rule produces nothing and the alert can never fire.
+      ttftThreshold: "1500m"
+
+      # 99% of requests must beat it, so the error budget is 1%. Note that a
+      # stricter objective makes every burn-rate alert MORE SENSITIVE rather
+      # than merely raising a bar: each rung fires at factor x budget.
+      ttftObjective: "990m"
+
+      # 5xx only. A 4xx is the caller's fault — a malformed prompt, a model name
+      # that does not exist — and counting one against the service would let a
+      # single misbehaving client burn a budget the service is not responsible
+      # for.
+      availabilityObjective: "995m"
+
+    prometheusRule:
+      enabled: true
+      # The 1d and 3d burn-rate rungs. Off here because a demo cluster is
+      # minutes old, so those windows have no data and every alert built on them
+      # shows "No Data" — which looks worse than not having them. Turn it on for
+      # a real deployment, where the windows mean what they say.
+      longWindowAlerts: false

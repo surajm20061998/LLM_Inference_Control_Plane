@@ -28,7 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/surajmishra/llmcp/test/utils"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/test/utils"
 )
 
 var (

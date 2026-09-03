@@ -8,6 +8,7 @@ linters:
     - depguard
     - dupl
     - errcheck
+    - forbidigo
     - ginkgolinter
     - goconst
     - gocyclo
@@ -29,6 +30,44 @@ linters:
       logcheck:
         type: "module"
         description: Checks Go logging calls for Kubernetes logging conventions.
+    # forbidigo bans two specific things that this project has spent real
+    # effort keeping out, and which are easy to reintroduce without noticing.
+    forbidigo:
+      analyze-types: true
+      forbid:
+        # 1. Wall-clock time outside main.
+        #
+        # Every decision this operator makes about timing — a canary's analysis
+        # interval, an autoscaler's stabilization window, a warm-up delay — runs
+        # through an injected clock.PassiveClock. That is what lets an entire
+        # five-step rollout replay in microseconds by stepping a fake clock
+        # instead of a test suite that sleeps for minutes and flakes on a busy
+        # CI runner.
+        #
+        # A single time.Now() slipped into a decision path silently converts one
+        # of those tests from deterministic to timing-dependent, and the failure
+        # shows up later as an unrelated flake. Banning it makes the injection a
+        # rule the compiler enforces rather than a convention people remember.
+        - pattern: '^time\.Now$'
+          msg: >-
+            Use the injected clock.PassiveClock (r.now()) instead of time.Now().
+            Wall-clock time in a decision path makes canary and autoscaler tests
+            timing-dependent. If this really is main or a load generator, add an
+            exclusion for the file rather than removing the rule.
+
+        # 2. reconcile.Result.Requeue.
+        #
+        # Deprecated in controller-runtime: it requeues with exponential backoff
+        # that is invisible in the return value, whereas RequeueAfter states the
+        # delay as a number a test can assert on. This project treats requeue
+        # timing as a RETURN VALUE from its pure state machines, and Requeue
+        # would quietly reintroduce a side effect in its place.
+        - pattern: '\.Requeue\b'
+          msg: >-
+            Result.Requeue is deprecated. Return Result{RequeueAfter: d} so the
+            delay is an assertable value rather than hidden backoff, or return a
+            non-nil error to requeue with backoff deliberately.
+
     depguard:
       rules:
         forbid-sort-pkg:
@@ -53,6 +92,41 @@ linters:
           - dupl
           - lll
         path: internal/*
+
+      # main is where the real clock is legitimately read: it constructs the
+      # manager and injects clock.RealClock into the reconciler. The ban exists
+      # to keep wall time out of the DECISION paths, not out of the wiring.
+      - linters:
+          - forbidigo
+        path: cmd/main.go
+
+      # The shim and the stub engine are servers, not controllers. They measure
+      # elapsed wall time as their entire job — a shim that timed requests with
+      # an injected clock would report zero — and neither takes part in any
+      # rollout decision.
+      - linters:
+          - forbidigo
+        path: cmd/shim/.*
+      - linters:
+          - forbidigo
+        path: cmd/fakeengine/.*
+
+      # The load generator is a measurement tool whose output is wall time.
+      - linters:
+          - forbidigo
+        path: hack/loadgen/.*
+
+      # Tests construct fixtures with real timestamps and drive fake clocks
+      # seeded from them. The rule is about production decision paths.
+      - linters:
+          - forbidigo
+        path: _test\.go
+
+      # envtest fixtures stamp real times into object status, which is what a
+      # real API server would do.
+      - linters:
+          - forbidigo
+        path: test/.*
     paths:
       - third_party$
       - builtin$

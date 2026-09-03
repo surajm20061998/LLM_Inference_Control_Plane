@@ -1,0 +1,44 @@
+# Scrape the operator's OWN metrics.
+#
+# This lives in the dev overlay rather than in config/default because it
+# references monitoring.coreos.com, which is an optional CRD. A base that
+# included it would fail `kustomize build | kubectl apply` outright on any
+# cluster without prometheus-operator — turning an optional integration into a
+# hard dependency for everyone.
+#
+# What it buys: controller_runtime_reconcile_* and workqueue_* on the control
+# plane dashboard. Those are what distinguish "the canary is not advancing
+# because analysis says wait" from "the canary is not advancing because the
+# controller is wedged", and without them the two look identical.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: llmcp-controller-manager-metrics-monitor
+  namespace: llmcp-system
+  labels:
+    app.kubernetes.io/name: llmcp
+    app.kubernetes.io/component: control-plane
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: llmcp
+  namespaceSelector:
+    matchNames:
+      - llmcp-system
+  endpoints:
+    - port: https
+      path: /metrics
+      scheme: https
+      interval: 15s
+      # The manager serves metrics over HTTPS behind controller-runtime's
+      # authn/authz filter, so the scrape has to authenticate as Prometheus's
+      # own service account. That account needs the metrics-reader ClusterRole,
+      # which config/rbac already defines.
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        # The manager generates a self-signed certificate when none is
+        # provided. Verifying it would require cert-manager, which this project
+        # deliberately does not depend on until the hardening sprint — and the
+        # connection never leaves the cluster.
+        insecureSkipVerify: true

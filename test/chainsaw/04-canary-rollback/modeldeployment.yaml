@@ -1,0 +1,75 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: rollback-demo
+spec:
+  # Four replicas so the first ladder rung (25%) is EXACT. Replica splitting can
+  # only express multiples of 1/replicas, and at three pods a requested 25%
+  # realises as 33% — which the operator reports honestly but which would make
+  # this suite's assertions need a footnote.
+  replicas: 4
+  model:
+    name: stub-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        path: /weights/model.gguf
+        pullPolicy: Always
+  engine:
+    type: llamacpp
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 4
+    env:
+      # The stub's latency is CONFIGURED rather than measured, which is the
+      # entire reason these suites use it: a real model's latency varies by
+      # orders of magnitude between runs, so a canary assertion written against
+      # one would be flaky by construction.
+      - name: LLMCP_FAKE_TTFT_MS
+        value: "60"
+      - name: LLMCP_FAKE_TOKENS
+        value: "24"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+  serving:
+    port: 8080
+    startupTimeout: 60s
+  rollout:
+    type: Canary
+    progressDeadline: 300s
+    autoRollback: true
+    canary:
+      stepWeights: [25, 50]
+      trafficRouting:
+        mode: Replica
+      analysis:
+        # Compressed for the suite. The production defaults are 30s/60s/60s,
+        # measured during the feasibility spike; these are the shortest values
+        # that still give a percentile something to work with against the stub.
+        interval: 15s
+        window: 30s
+        initialDelay: 20s
+        failureThreshold: 2
+        consecutiveErrorLimit: 4
+        inconclusiveLimit: 8
+        onInconclusive: Wait
+        minRequestRate: "500m"
+        provider:
+          type: Prometheus
+          address: http://prometheus-operated.monitoring.svc:9090
+        metrics:
+          - name: ttft-vs-primary
+            builtin: ttft-p95
+            compareToPrimary: true
+            thresholdRange:
+              max: "1500m"
+  observability:
+    serviceMonitor:
+      enabled: true
+      interval: 5s
