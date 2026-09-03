@@ -77,9 +77,10 @@ spec:
                 name: promote-demo
               status:
                 phase: Available
-                conditions:
-                  - type: CanaryHealthy
-                    status: "True"
+                # Looked up by JMESPath, not by position. Chainsaw compares arrays
+                # element by element BY INDEX, and status.conditions[0] is SpecValid —
+                # so a positional assertion here silently checks the wrong condition.
+                (conditions[?type == 'CanaryHealthy'])[0].status: "True"
         - error:
             # Removed, not scaled to zero. A Deployment left at zero keeps its
             # ReplicaSets and keeps the canary's llmcp_shim_info series alive
@@ -94,6 +95,12 @@ spec:
     - name: the-promotion-is-in-the-audit-trail
       try:
         - script:
+            # bash, explicitly. Chainsaw defaults to `sh -c`, and on an Ubuntu runner
+            # /bin/sh is dash — which does not support `set -o pipefail` and aborts the
+            # whole step with "Illegal option". It works on macOS only because /bin/sh
+            # there is bash in POSIX mode, which is exactly why this stayed invisible
+            # locally.
+            shell: bash
             content: |
               set -euo pipefail
               kubectl -n $NAMESPACE get events \

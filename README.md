@@ -164,9 +164,11 @@ Sprints 0–7 complete. The vLLM engine profile (Sprint 8, committed stretch) is
 the remaining work — it proves `EngineSpec` is a real abstraction rather than a
 fiction, since the canary demo should run unchanged across an engine swap.
 
-**Not yet proven:** the Chainsaw suites are written and schema-validated
-(`make chainsaw-lint`, part of `make verify` and of CI) but have not been
-executed against a live cluster — Docker was unavailable. Everything that runs
+**Not yet proven:** the Chainsaw suites are schema-validated and
+semantically checked (`make chainsaw-lint` plus `internal/build`) but have not
+been executed against a live cluster — Docker has been unavailable. The first CI
+run found five packaging bugs that no local check could see; each is now a
+regression test in [`internal/build`](internal/build/). Everything that runs
 without a cluster is green, and is what every other claim here rests on.
 
 ---

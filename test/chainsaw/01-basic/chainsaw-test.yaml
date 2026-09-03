@@ -24,11 +24,11 @@ spec:
                 phase: Available
                 replicas: 2
                 readyReplicas: 2
-                conditions:
-                  - type: Ready
-                    status: "True"
-                  - type: ModelReady
-                    status: "True"
+                # Looked up by JMESPath, not by position. Chainsaw compares arrays
+                # element by element BY INDEX, and status.conditions[0] is SpecValid —
+                # so a positional assertion here silently checks the wrong condition.
+                (conditions[?type == 'Ready'])[0].status: "True"
+                (conditions[?type == 'ModelReady'])[0].status: "True"
 
     - name: the-shim-is-a-native-sidecar
       try:
@@ -38,6 +38,11 @@ spec:
             # before starting the engine — and since the shim is a server that
             # never exits, the pod hangs in Init forever. envtest cannot catch
             # that, because envtest never starts a pod.
+            #
+            # Selected by JMESPath rather than by position: initContainers[0] is
+            # the model-init container, so a positional assertion would compare
+            # the shim's expected fields against the wrong container and fail
+            # for a reason that has nothing to do with sidecars.
             resource:
               apiVersion: apps/v1
               kind: Deployment
@@ -46,16 +51,32 @@ spec:
               spec:
                 template:
                   spec:
-                    initContainers:
-                      - name: shim
-                        restartPolicy: Always
+                    (initContainers[?name == 'shim'])[0].restartPolicy: Always
+        - assert:
+            # And the ORDER: weights are staged before anything starts serving
+            # or measuring.
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: basic-demo-primary
+              spec:
+                template:
+                  spec:
+                    (initContainers[].name): [model-init, shim]
 
     - name: serves-a-streamed-completion
       try:
         - script:
+            # bash, explicitly. Chainsaw defaults to `sh -c`, and on an Ubuntu runner
+            # /bin/sh is dash — which does not support `set -o pipefail` and aborts the
+            # whole step with "Illegal option". It works on macOS only because /bin/sh
+            # there is bash in POSIX mode, which is exactly why this stayed invisible
+            # locally.
+            shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE run curl-$RANDOM --rm -i --restart=Never \
+              kubectl -n $NAMESPACE run curl-completion --rm -i --restart=Never \
                 --image=curlimages/curl:8.11.1 --quiet -- \
                 curl -sS --fail-with-body -m 60 \
                   -H 'Content-Type: application/json' \
@@ -69,26 +90,47 @@ spec:
         # and every llmcp_* metric would be missing while everything else looked
         # perfectly healthy.
         - script:
+            shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE run curl-$RANDOM --rm -i --restart=Never \
+              kubectl -n $NAMESPACE run curl-livez --rm -i --restart=Never \
                 --image=curlimages/curl:8.11.1 --quiet -- \
                 curl -sS --fail-with-body -m 30 \
                   http://basic-demo.$NAMESPACE.svc:8080/llmcp/livez \
                 | grep -q ok
 
-    - name: metrics-are-exposed-on-the-headless-service
+    - name: metrics-are-exposed-on-the-metrics-port
       try:
         - script:
+            shell: bash
             content: |
               set -euo pipefail
-              pod=$(kubectl -n $NAMESPACE get pods -l llmcp.io/model-deployment=basic-demo \
-                -o jsonpath='{.items[0].metadata.name}')
-              kubectl -n $NAMESPACE exec "$pod" -c shim -- true 2>/dev/null || true
-              kubectl -n $NAMESPACE run curl-$RANDOM --rm -i --restart=Never \
+              # Addressed by POD IP, not by a pod-name DNS record.
+              #
+              # A headless Service only publishes per-pod DNS names of the form
+              # <hostname>.<service>.<ns>.svc when the pods set spec.hostname and
+              # spec.subdomain — which StatefulSet does automatically and a
+              # Deployment does not. For Deployment pods the addressable records
+              # are the Service name (returning every pod IP) and the IP itself.
+              ip=$(kubectl -n $NAMESPACE get pods -l llmcp.io/model-deployment=basic-demo \
+                -o jsonpath='{.items[0].status.podIP}')
+              echo "shim metrics at ${ip}:9090"
+              kubectl -n $NAMESPACE run curl-metrics --rm -i --restart=Never \
                 --image=curlimages/curl:8.11.1 --quiet -- \
-                curl -sS --fail-with-body -m 30 "http://${pod}.basic-demo-metrics.$NAMESPACE.svc:9090/metrics" \
+                curl -sS --fail-with-body -m 30 "http://${ip}:9090/metrics" \
                 | grep -q llmcp_inference_requests_total
+
+        - assert:
+            # The headless metrics Service exists and has endpoints, which is
+            # what the ServiceMonitor selects on. Separate from the scrape above
+            # because they fail for different reasons.
+            resource:
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: basic-demo-metrics
+              spec:
+                clusterIP: None
 
     - name: deleting-garbage-collects-every-child
       try:

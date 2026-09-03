@@ -1,0 +1,28 @@
+# Everything that depends on prometheus-operator's CRDs existing.
+#
+# # Why this is a separate overlay
+#
+# These two resources used to live in config/dev, and that was a bug of exactly
+# the kind this operator goes to some length to avoid internally: a hard
+# dependency on an OPTIONAL CRD.
+#
+# `config/dev` renders a ServiceMonitor, so `kubectl apply` of it fails outright
+# on any cluster without prometheus-operator —
+#
+#     no matches for kind "ServiceMonitor" in version "monitoring.coreos.com/v1"
+#
+# — which meant `make dev-deploy` could not run on a fresh cluster at all,
+# despite the README telling you to run it before `make monitoring-install`.
+#
+# The operator itself handles the same situation correctly: it probes for the
+# CRD and reports MetricsRegistered rather than failing. The manifests had not
+# been held to the same standard.
+#
+# Applied by `make monitoring-install`, after the Helm release has created the
+# CRDs.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - operator-servicemonitor.yaml
+  - prometheus-metrics-reader.yaml

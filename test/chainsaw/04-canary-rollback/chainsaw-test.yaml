@@ -37,6 +37,12 @@ spec:
     - name: record-the-known-good-revision
       try:
         - script:
+            # bash, explicitly. Chainsaw defaults to `sh -c`, and on an Ubuntu runner
+            # /bin/sh is dash — which does not support `set -o pipefail` and aborts the
+            # whole step with "Illegal option". It works on macOS only because /bin/sh
+            # there is bash in POSIX mode, which is exactly why this stayed invisible
+            # locally.
+            shell: bash
             content: |
               set -euo pipefail
               kubectl -n $NAMESPACE get modeldeployment rollback-demo \
@@ -57,6 +63,7 @@ spec:
         # Every pod passes its readiness probe and every request succeeds. A
         # Deployment would roll this out and consider the job done.
         - script:
+            shell: bash
             content: |
               kubectl -n $NAMESPACE patch modeldeployment rollback-demo --type=merge -p '
               {"spec":{"engine":{"env":[
@@ -85,9 +92,10 @@ spec:
               metadata:
                 name: rollback-demo
               status:
-                conditions:
-                  - type: CanaryHealthy
-                    status: "False"
+                # Looked up by JMESPath, not by position. Chainsaw compares arrays
+                # element by element BY INDEX, and status.conditions[0] is SpecValid —
+                # so a positional assertion here silently checks the wrong condition.
+                (conditions[?type == 'CanaryHealthy'])[0].status: "False"
         - error:
             resource:
               apiVersion: apps/v1
@@ -98,6 +106,7 @@ spec:
     - name: the-primary-still-serves-the-good-revision
       try:
         - script:
+            shell: bash
             content: |
               set -euo pipefail
               # The revert restores what is RUNNING. The spec still names the
@@ -115,6 +124,7 @@ spec:
         # failing rollouts, each costing a full analysis window and a Deployment
         # churn. A rollback has to STICK until a human changes the spec.
         - script:
+            shell: bash
             content: |
               set -euo pipefail
               kubectl -n $NAMESPACE get modeldeployment rollback-demo \
@@ -132,6 +142,7 @@ spec:
         # finds, and it is how the demo proves the rollback was automatic rather
         # than staged.
         - script:
+            shell: bash
             content: |
               set -euo pipefail
               kubectl -n $NAMESPACE get events \

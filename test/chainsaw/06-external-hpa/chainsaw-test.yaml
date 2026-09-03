@@ -11,12 +11,21 @@
 # can only show that the subresource this operator publishes has the right
 # shape — not that the real thing consumes it.
 #
-# The HPA here targets CPU deliberately. metrics-server ships in kind and CPU is
-# the one metric it always has, which keeps the suite about the SCALE CONTRACT
-# rather than about custom-metrics plumbing. The project's own thesis — that CPU
-# is the wrong signal for inference — is demonstrated by the built-in
-# autoscaler; what is being tested here is only that a foreign scaler can drive
-# the resource at all.
+# # What this asserts, and what it deliberately does not
+#
+# kind ships NO metrics-server, so an HPA here can never compute a CPU
+# utilisation and `ScalingActive` will stay False with FailedGetResourceMetric.
+# That is fine, because metrics plumbing is not what is under test.
+#
+# The contract this operator provides is a /scale subresource an arbitrary
+# scaler can READ and WRITE. The HPA proves it reads by populating
+# `status.currentReplicas` from the subresource and setting `AbleToScale=True`;
+# the final step proves the resource accepts the corresponding write. Installing
+# metrics-server to turn one more condition green would test Kubernetes, not
+# this project.
+#
+# The project's own thesis — that CPU is the wrong signal for inference — is
+# demonstrated by the built-in autoscaler, which tracks queue depth.
 apiVersion: chainsaw.kyverno.io/v1alpha1
 kind: Test
 metadata:
@@ -40,9 +49,10 @@ spec:
               status:
                 replicas: 1
                 readyReplicas: 1
-                conditions:
-                  - type: Ready
-                    status: "True"
+                # Looked up by JMESPath, not by position. Chainsaw compares arrays
+                # element by element BY INDEX, and status.conditions[0] is SpecValid —
+                # so a positional assertion here silently checks the wrong condition.
+                (conditions[?type == 'Ready'])[0].status: "True"
 
     - name: the-scale-subresource-is-readable
       try:
@@ -51,12 +61,19 @@ spec:
         # validates, still scales by hand, and fails ONLY here — by leaving the
         # HPA unable to find any pods.
         - script:
+            # bash, explicitly. Chainsaw defaults to `sh -c`, and on an Ubuntu runner
+            # /bin/sh is dash — which does not support `set -o pipefail` and aborts the
+            # whole step with "Illegal option". It works on macOS only because /bin/sh
+            # there is bash in POSIX mode, which is exactly why this stayed invisible
+            # locally.
+            shell: bash
             content: |
               set -euo pipefail
               kubectl -n $NAMESPACE get --raw \
                 "/apis/inference.llmcp.io/v1alpha1/namespaces/$NAMESPACE/modeldeployments/hpa-demo/scale" \
                 | tee /dev/stderr | grep -q '"replicas":1'
         - script:
+            shell: bash
             content: |
               set -euo pipefail
               selector=$(kubectl -n $NAMESPACE get modeldeployment hpa-demo -o jsonpath='{.status.selector}')
@@ -76,9 +93,19 @@ spec:
         - apply:
             file: hpa.yaml
         - assert:
-            # `currentReplicas` becoming non-zero and ScalingActive going True is
-            # exactly the difference between `kubectl get hpa` showing <unknown>
-            # and showing a number. It is the assertion the exit criterion names.
+            # `currentReplicas` is read straight from this CRD's /scale
+            # subresource. Its being populated at all is the whole assertion:
+            # a CRD whose status.selector is a marshalled LabelSelector rather
+            # than a serialized string still validates, still scales by hand,
+            # and fails ONLY here.
+            #
+            # AbleToScale, not ScalingActive. AbleToScale reports that the HPA
+            # resolved the scale subresource and could act on it; ScalingActive
+            # additionally requires a usable metric, which needs metrics-server
+            # — absent on kind, and not what this suite is about.
+            #
+            # Conditions are looked up by JMESPath because an HPA's condition
+            # order is not guaranteed.
             resource:
               apiVersion: autoscaling/v2
               kind: HorizontalPodAutoscaler
@@ -86,9 +113,7 @@ spec:
                 name: hpa-demo
               status:
                 currentReplicas: 1
-                conditions:
-                  - type: ScalingActive
-                    status: "True"
+                (conditions[?type == 'AbleToScale'])[0].status: "True"
 
     - name: the-hpa-can-write-back
       try:
@@ -97,6 +122,7 @@ spec:
         # uses. What the previous step proved is that the HPA can READ; this
         # proves the resource accepts the corresponding write.
         - script:
+            shell: bash
             content: |
               set -euo pipefail
               kubectl -n $NAMESPACE patch --subresource=scale modeldeployment/hpa-demo \

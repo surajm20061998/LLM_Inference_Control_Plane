@@ -36,40 +36,28 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Create the cluster
-        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.14.0
-        with:
-          version: v0.33.0
-          node_image: kindest/node:v1.35.8
-          cluster_name: llmcp-canary
-          config: hack/kind-config.yaml
-
-      - name: Build and load the images
+      - name: Install kind
         run: |
           set -euo pipefail
-          make docker-build IMG=llmcp-controller:ci
-          docker build -f Dockerfile.shim -t llmcp-shim:ci .
-          docker build -f Dockerfile.fakeengine -t llmcp-fakeengine:ci .
-          docker build -f Dockerfile.loadgen -t llmcp-loadgen:ci .
-          rm -rf .build/model && mkdir -p .build/model
-          echo "llmcp ci placeholder" > .build/model/model.gguf
-          docker build -f Dockerfile.model -t llmcp-model:ci .build/model
-          for img in llmcp-controller llmcp-shim llmcp-fakeengine llmcp-loadgen llmcp-model; do
-            kind load docker-image "${img}:ci" --name llmcp-canary
-          done
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Create the cluster and registry
+        run: make kind-up
+
+      - name: Build, push and deploy
+        run: |
+          set -euo pipefail
+          make dev-deploy
+          # dev-images deliberately omits the load generator: it is not part of
+          # the fast inner loop. The canary suites need it, because a canary with
+          # no traffic is Inconclusive by design and would hold forever.
+          make loadgen-image
 
       - name: Install kube-prometheus-stack
         run: make monitoring-install
-
-      - name: Deploy the operator
-        run: |
-          set -euo pipefail
-          make install
-          cd config/manager && ../../bin/kustomize edit set image controller=llmcp-controller:ci && cd -
-          ./bin/kustomize build config/default \
-            | sed -e 's#localhost:5001/llmcp-shim:dev#llmcp-shim:ci#' \
-            | kubectl apply -f -
-          kubectl -n llmcp-system rollout status deploy/llmcp-controller-manager --timeout=180s
 
       - name: Canary suites
         run: |

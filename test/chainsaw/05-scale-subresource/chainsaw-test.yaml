@@ -28,6 +28,12 @@ spec:
         # command rather than a patch is the point: it exercises the same path
         # an operator and an HPA both take.
         - script:
+            # bash, explicitly. Chainsaw defaults to `sh -c`, and on an Ubuntu runner
+            # /bin/sh is dash — which does not support `set -o pipefail` and aborts the
+            # whole step with "Illegal option". It works on macOS only because /bin/sh
+            # there is bash in POSIX mode, which is exactly why this stayed invisible
+            # locally.
+            shell: bash
             content: |
               kubectl -n $NAMESPACE scale modeldeployment/scale-demo --replicas=3
         - assert:
@@ -36,6 +42,7 @@ spec:
     - name: scale-down
       try:
         - script:
+            shell: bash
             content: |
               kubectl -n $NAMESPACE scale modeldeployment/scale-demo --replicas=1
         - assert:

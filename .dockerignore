@@ -1,5 +1,25 @@
 # More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
-# Ignore everything by default and re-include only needed files
+#
+# Ignore everything by default and re-include only what a build needs. That
+# direction is the right one — a deny-by-default context cannot accidentally
+# ship a .env or a 400 MB model file — but it has one sharp edge, and this
+# project has already been cut by it.
+#
+# ANY FILE A BINARY EMBEDS MUST BE RE-INCLUDED HERE.
+#
+# `//go:embed` is resolved by the COMPILER, not at runtime, and a pattern that
+# matches nothing is a compile ERROR:
+#
+#     internal/observability/dashboards.go:48:12:
+#         pattern dashboards/*.json: no matching files found
+#
+# So a missing re-include does not degrade the image, it fails the build — but
+# only inside the container. `go build` on a developer's machine sees the files
+# and succeeds, so the breakage is invisible until CI builds an image. That is
+# exactly how the Grafana dashboards got here: added in Sprint 3, never built
+# into an image until Sprint 7's CI run.
+#
+# TestEmbeddedFilesSurviveTheDockerContext enforces this automatically.
 **
 
 # Re-include Go source files (but not *_test.go)
@@ -9,3 +29,7 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include embedded assets. See the note above: these are compile-time
+# dependencies of internal/observability, not optional extras.
+!internal/observability/dashboards/*.json

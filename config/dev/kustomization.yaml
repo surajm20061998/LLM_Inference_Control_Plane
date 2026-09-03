@@ -20,10 +20,12 @@ kind: Kustomization
 
 resources:
   - ../default
-  # Scrape the operator itself. Kept out of the base because it references an
-  # optional CRD; see the file's own comment.
-  - operator-servicemonitor.yaml
-  - prometheus-metrics-reader.yaml
+
+# NOTE: scraping the operator's own metrics lives in config/monitoring, NOT
+# here. Those resources reference monitoring.coreos.com, and a `kubectl apply`
+# of an overlay containing a ServiceMonitor fails outright on a cluster without
+# prometheus-operator — which would make `make dev-deploy` impossible on a fresh
+# cluster. `make monitoring-install` applies them once the CRDs exist.
 
 patches:
   - target:

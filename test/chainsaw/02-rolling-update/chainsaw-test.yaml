@@ -30,6 +30,12 @@ spec:
     - name: record-the-known-good-revision
       try:
         - script:
+            # bash, explicitly. Chainsaw defaults to `sh -c`, and on an Ubuntu runner
+            # /bin/sh is dash — which does not support `set -o pipefail` and aborts the
+            # whole step with "Illegal option". It works on macOS only because /bin/sh
+            # there is bash in POSIX mode, which is exactly why this stayed invisible
+            # locally.
+            shell: bash
             content: |
               set -euo pipefail
               rev=$(kubectl -n $NAMESPACE get modeldeployment rollout-demo \
@@ -42,6 +48,7 @@ spec:
         # contextSize is part of the revision payload, so this is the cheapest
         # way to force a new revision without changing anything that matters.
         - script:
+            shell: bash
             content: |
               kubectl -n $NAMESPACE patch modeldeployment rollout-demo --type=merge \
                 -p '{"spec":{"engine":{"contextSize":8192}}}'
@@ -55,6 +62,7 @@ spec:
                 phase: Available
                 readyReplicas: 2
         - script:
+            shell: bash
             content: |
               set -euo pipefail
               args=$(kubectl -n $NAMESPACE get deploy rollout-demo-primary \
@@ -68,6 +76,7 @@ spec:
         # blows its progress deadline. progressDeadline is 120s in the fixture,
         # which is why the assert timeout below is generous.
         - script:
+            shell: bash
             content: |
               kubectl -n $NAMESPACE patch modeldeployment rollout-demo --type=merge \
                 -p '{"spec":{"engine":{"image":"localhost:5001/llmcp-does-not-exist:v0"}}}'
@@ -79,10 +88,11 @@ spec:
               metadata:
                 name: rollout-demo
               status:
-                conditions:
-                  - type: Progressing
-                    status: "False"
-                    reason: ProgressDeadlineExceeded
+                # Looked up by JMESPath, not by position. Chainsaw compares arrays
+                # element by element BY INDEX, and status.conditions[0] is SpecValid —
+                # so a positional assertion here silently checks the wrong condition.
+                (conditions[?type == 'Progressing'])[0].status: "False"
+                (conditions[?type == 'Progressing'])[0].reason: ProgressDeadlineExceeded
         - assert:
             timeout: 3m
             # The revert: the primary is back on the image that worked. Asserted

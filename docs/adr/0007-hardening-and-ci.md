@@ -137,6 +137,54 @@ version difference is exactly where CEL behaviour, native sidecar semantics and
   the canary dashboard needed them and shipping panels that query nothing would
   have been the exact failure that sprint was about.
 
+## What the first real CI run found
+
+The section below used to say the Chainsaw suites had never been executed and
+that "the first real run will find something; it always does." It did. Recording
+what, because the pattern is more useful than the individual bugs.
+
+**Every one of them was invisible to `make verify`, and for the same structural
+reason: the local environment is not the deployed one.**
+
+1. **`.dockerignore` starved `//go:embed`.** The Grafana dashboards were added
+   in Sprint 3; `.dockerignore` ignores everything and re-included only `*.go`.
+   `//go:embed` is resolved by the compiler, so the image build failed with
+   `pattern dashboards/*.json: no matching files found` — while every local
+   build, test and lint run succeeded, because the working tree has the files.
+   Four sprints passed before an image was built.
+
+2. **Chainsaw compares arrays by index.** Six suites asserted
+   `status.conditions: [- type: Ready]`, which means *"conditions[0] is Ready"*,
+   not *"the Ready condition"*. This operator's `conditions[0]` is `SpecValid`,
+   always. The fix is a JMESPath lookup, which is also order-independent.
+
+3. **`sh` is dash on Ubuntu.** Chainsaw runs script steps with `sh -c`. All
+   eighteen began `set -euo pipefail`, which dash rejects outright. It works on
+   macOS only because `/bin/sh` there is bash in POSIX mode.
+
+4. **kind ships no metrics-server.** A suite asserted an HPA's `ScalingActive`
+   condition, which cannot go True without one. `AbleToScale` is the correct
+   assertion anyway: it tests the /scale contract this operator provides, rather
+   than Kubernetes' metrics pipeline.
+
+5. **`config/dev` required an optional CRD.** It contained a ServiceMonitor, so
+   `kubectl apply` failed on any cluster without prometheus-operator — making
+   `make dev-deploy` impossible on a fresh cluster, in the exact order the README
+   prescribes. The operator handles this situation correctly at runtime, probing
+   for the CRD and reporting `MetricsRegistered`; the manifests had simply never
+   been held to the same standard. They now live in `config/monitoring`, applied
+   by `make monitoring-install`.
+
+Each is now a test in `internal/build`, a package whose subject is **how this
+repository is packaged** rather than how it behaves — the one thing no other
+tier can see. Each was verified by reintroducing the bug.
+
+The sixth fix was to CI itself. It had been reproducing the deployment by hand
+(`kustomize build config/default | sed ...`), and the `sed` matched nothing, so
+the controller would have injected a shim image nobody built. CI now runs
+`make kind-up && make dev-deploy` — the documented local workflow — so it proves
+the instructions in the README rather than a parallel path only CI uses.
+
 ## What is still not proven
 
 Honesty is worth more here than a green tick.
@@ -145,16 +193,15 @@ The Chainsaw suites are **written and schema-validated, but have not been
 executed**, because Docker was unavailable throughout the implementation of
 Sprints 5 to 7.
 
-`make chainsaw-lint` runs `chainsaw lint` over every suite and is part of
-`make verify` and of CI. That is a meaningful step above "the YAML parses" — it
-proved its worth immediately by rejecting two suites that had `cleanup` at the
-test level where Chainsaw expects it on a step, an error no amount of reading
-had caught. It eliminates the class of authoring mistakes that would otherwise
-sit undetected until somebody had both a cluster and the time to use it.
+`make chainsaw-lint` validates every suite against Chainsaw's schema, and
+`internal/build` now checks the semantics a schema cannot express. Together they
+caught five real bugs. But note what they still cannot do: **schema-valid,
+semantically-checked suites are not passing suites.** The image build is fixed
+and the deployment path is fixed; whether the assertions themselves hold against
+a running cluster is unverified, because Docker has been unavailable throughout.
 
-It does **not** prove the suites pass. The first real run will find something;
-it always does. `make verify` — everything that needs no cluster — is green, and
-is what every other claim in this repository currently rests on.
+`make verify` — everything that needs no cluster — is green, and is what every
+other claim in this repository rests on.
 
 There is a small lesson in how that lint step was added, worth recording because
 it is the same failure this ADR is about. The first attempt validated the suites

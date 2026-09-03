@@ -404,10 +404,14 @@ KPS_VALUES        ?= hack/values/kube-prometheus-stack.yaml
 PROM_URL ?= http://localhost:9091
 
 .PHONY: monitoring-install
-monitoring-install: ## Install kube-prometheus-stack into the kind cluster.
+monitoring-install: kustomize ## Install kube-prometheus-stack and wire the operator's own metrics in.
 	$(HELM) repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
 	$(HELM) repo update prometheus-community >/dev/null
 	$(HELM) upgrade --install $(KPS_RELEASE) prometheus-community/kube-prometheus-stack 		--namespace $(KPS_NAMESPACE) --create-namespace 		--version $(KPS_CHART_VERSION) 		-f $(KPS_VALUES) 		--wait --timeout 10m
+	@# Applied only now that the Helm release has created the
+	@# monitoring.coreos.com CRDs. Kept out of config/dev for exactly that
+	@# reason — see config/monitoring/kustomization.yaml.
+	$(KUSTOMIZE) build config/monitoring | $(KUBECTL) apply -f -
 	@echo
 	@echo "Grafana:    make grafana     (admin / admin)"
 	@echo "Prometheus: make prometheus"
