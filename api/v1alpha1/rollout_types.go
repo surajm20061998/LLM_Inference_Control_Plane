@@ -190,7 +190,7 @@ const (
 	// behind one Service, and the share each receives is approximately its
 	// share of the ready pods.
 	//
-	// The approximation is real and is reported honestly. kube-proxy
+	// The approximation is real. kube-proxy
 	// load-balances per CONNECTION, not per request, so a client using HTTP
 	// keep-alive — which every OpenAI SDK does by default — pins itself to one
 	// pod for its whole session. At a requested 20% with 8 concurrent clients,
@@ -201,8 +201,8 @@ const (
 	// with keep-alive on and 1.09 with it off, which is well inside the noise —
 	// so replica-based splitting stands, and the load generator disables
 	// keep-alive as the documented mitigation. status.canary.currentWeight
-	// always reports the QUANTIZED weight actually achieved, never the one that
-	// was asked for.
+	// reports the configured, quantized replica share; it is not a measurement
+	// of request distribution.
 	TrafficRoutingReplica TrafficRoutingMode = "Replica"
 )
 

@@ -290,9 +290,10 @@ type ThresholdRange struct {
 // Verdict is the outcome of one metric check.
 //
 // Four values, with DISJOINT counters, because collapsing them into pass/fail
-// is how homegrown canary controllers roll back for the wrong reason. The
-// distinction that matters most: a Prometheus outage yields Error, never Fail,
-// so a monitoring failure can never cause a production rollback.
+// is how canary controllers act on the wrong evidence. The distinction that
+// matters most: a Prometheus outage yields Error, never Fail, and does not
+// spend the failed-check budget. The state machine holds initially and aborts
+// safely to the stable revision at the configured consecutive-error limit.
 //
 // +kubebuilder:validation:Enum=Pass;Fail;Inconclusive;Error
 type Verdict string
@@ -374,14 +375,12 @@ type CanaryStatus struct {
 	// +optional
 	DesiredWeight int32 `json:"desiredWeight,omitempty"`
 
-	// CurrentWeight is the share actually achieved after quantisation.
+	// CurrentWeight is the configured replica share after quantisation.
 	//
-	// Reported separately from DesiredWeight, and this honesty is the point.
-	// Replica-based splitting cannot express 20% with 3 pods: the nearest
-	// achievable value is 33%. Showing only the requested number would let an
-	// operator believe the blast radius is smaller than it is, and would make
-	// the analysis appear to be measuring a 20% exposure when it is measuring a
-	// third of production.
+	// Reported separately from DesiredWeight because replica-based splitting
+	// cannot configure 20% with 3 pods: the nearest share is 33%. This field is
+	// derived from desired replica counts, not measured request distribution;
+	// connection reuse can make observed traffic differ from the pod ratio.
 	//
 	// +optional
 	CurrentWeight int32 `json:"currentWeight,omitempty"`

@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="620" viewBox="0 0 1280 620" role="img" aria-labelledby="title description">
+  <title id="title">Live LLMCP request and metrics capture</title>
+  <desc id="description">A terminal-style capture showing a streamed OpenAI-compatible response passing through the LLMCP shim and the resulting HTTP 200 and TTFT Prometheus metrics.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#081426"/>
+      <stop offset="1" stop-color="#101827"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#020617" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="620" rx="24" fill="url(#background)"/>
+  <rect x="34" y="34" width="1212" height="552" rx="18" fill="#0b1220" stroke="#263449" filter="url(#shadow)"/>
+  <rect x="34" y="34" width="1212" height="56" rx="18" fill="#111c2e"/>
+  <rect x="34" y="72" width="1212" height="18" fill="#111c2e"/>
+
+  <circle cx="68" cy="62" r="7" fill="#fb7185"/>
+  <circle cx="92" cy="62" r="7" fill="#fbbf24"/>
+  <circle cx="116" cy="62" r="7" fill="#34d399"/>
+  <text x="640" y="68" text-anchor="middle" fill="#9fb0c7" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="16" font-weight="600">LLMCP · live localhost request path</text>
+
+  <rect x="68" y="122" width="694" height="420" rx="14" fill="#07101d" stroke="#1e2d42"/>
+  <text x="96" y="158" fill="#38bdf8" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700">$ curl -sN ... /v1/chat/completions</text>
+  <text x="96" y="198" fill="#d5e2f2" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+    <tspan x="96" dy="0">data: {</tspan>
+    <tspan fill="#93c5fd">"model":"demo-model"</tspan>
+    <tspan>,</tspan>
+    <tspan fill="#c4b5fd">"role":"assistant"</tspan>
+    <tspan>}</tspan>
+    <tspan x="96" dy="34">data: {</tspan>
+    <tspan fill="#86efac">"content":"tok "</tspan>
+    <tspan>}  × 24 streamed chunks</tspan>
+    <tspan x="96" dy="34">data: {</tspan>
+    <tspan fill="#fda4af">"finish_reason":"stop"</tspan>
+    <tspan>}</tspan>
+    <tspan x="96" dy="34" fill="#86efac">data: [DONE]</tspan>
+  </text>
+
+  <line x1="96" y1="350" x2="734" y2="350" stroke="#1e2d42"/>
+  <text x="96" y="390" fill="#38bdf8" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700">$ curl -s localhost:19090/metrics</text>
+  <text x="96" y="430" fill="#d5e2f2" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="13">
+    <tspan x="96" dy="0">llmcp_inference_requests_total{code=</tspan>
+    <tspan fill="#86efac">"200"</tspan>
+    <tspan>, ...} 1</tspan>
+    <tspan x="96" dy="29">llmcp_inference_ttft_seconds_count{...} 1</tspan>
+    <tspan x="96" dy="29">llmcp_inference_queue_depth{...} 0</tspan>
+  </text>
+
+  <rect x="798" y="122" width="414" height="420" rx="14" fill="#0e1728" stroke="#2b3950"/>
+  <rect x="826" y="152" width="4" height="72" rx="2" fill="url(#accent)"/>
+  <text x="850" y="174" fill="#f8fafc" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="22" font-weight="700">One request, two proofs</text>
+  <text x="850" y="205" fill="#9fb0c7" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="14">Captured from the repository binaries</text>
+
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif">
+    <rect x="826" y="256" width="358" height="58" rx="10" fill="#10243a"/>
+    <circle cx="856" cy="285" r="10" fill="#34d399"/>
+    <path d="M851 285l4 4 7-9" fill="none" stroke="#052e24" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="880" y="291" fill="#dff7eb" font-size="16" font-weight="650">Stream completed through shim</text>
+
+    <rect x="826" y="330" width="358" height="58" rx="10" fill="#10243a"/>
+    <circle cx="856" cy="359" r="10" fill="#34d399"/>
+    <path d="M851 359l4 4 7-9" fill="none" stroke="#052e24" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="880" y="365" fill="#dff7eb" font-size="16" font-weight="650">HTTP 200 recorded</text>
+
+    <rect x="826" y="404" width="358" height="58" rx="10" fill="#10243a"/>
+    <circle cx="856" cy="433" r="10" fill="#34d399"/>
+    <path d="M851 433l4 4 7-9" fill="none" stroke="#052e24" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="880" y="439" fill="#dff7eb" font-size="16" font-weight="650">TTFT observation recorded</text>
+  </g>
+
+  <text x="826" y="510" fill="#73839a" font-family="SFMono-Regular, Menlo, Consolas, monospace" font-size="12">deterministic engine · commit bfd56ae</text>
+</svg>

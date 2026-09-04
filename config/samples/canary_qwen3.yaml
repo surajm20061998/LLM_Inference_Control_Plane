@@ -92,20 +92,13 @@ spec:
         # session. This project's feasibility spike measured the resulting skew
         # at 1.02 with keep-alive on and 1.09 with it off — well inside the
         # noise — and the load generator disables keep-alive as the documented
-        # mitigation. status.canary.currentWeight always reports the weight
-        # actually achieved, never the one requested.
+        # mitigation. status.canary.currentWeight reports the configured,
+        # replica-derived share; it is not measured request distribution.
         mode: Replica
 
-      scale:
-        # Pin the canary at one pod for the whole rollout, independently of its
-        # traffic weight.
-        #
-        # This matters far more for inference than for a stateless service. A
-        # model server has a long, expensive warm-up, so a canary resized at
-        # every step spends the first analysis window of each one loading a
-        # model — and the latency it reports during that window is the warm-up,
-        # not the revision under test.
-        replicas: 1
+      # No fixed canary replica override is used here. Replica count is the
+      # only implemented routing mechanism, so four total replicas produce
+      # honest 3/1, 2/2, and 1/3 configured splits at the three rungs.
 
       analysis:
         # Measured, not guessed. Both numbers come from this project's spike
@@ -128,8 +121,9 @@ spec:
         failureThreshold: 3
 
         # Errors and inconclusive rounds have their own budgets, and they reset.
-        # A Prometheus outage yields Error, never Fail, so a monitoring failure
-        # can never cause a production rollback.
+        # A Prometheus outage yields Error, never Fail, so it does not count as
+        # evidence that the candidate is bad. At the consecutive-error limit,
+        # the rollout is aborted safely back to the stable revision.
         consecutiveErrorLimit: 5
         inconclusiveLimit: 5
         onInconclusive: Wait

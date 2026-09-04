@@ -310,7 +310,7 @@ _Appears in:_
 | `stableRevision` _string_ | StableRevision is what a rollback would revert to. |  | Optional: \{\} <br /> |
 | `failedRevision` _string_ | FailedRevision is the revision the most recent rollback rejected.<br />Without it the controller would immediately re-canary the same revision<br />it just rolled back from: the spec still names it, so the target and the<br />stable revision still differ, and the state machine would dutifully start<br />again — producing an infinite loop of identical failing rollouts, each<br />one costing a full analysis window and a Deployment churn.<br />Recording the rejection makes a rollback STICK until a human changes the<br />spec, which is exactly the semantics people expect from one. |  | Optional: \{\} <br /> |
 | `desiredWeight` _integer_ | DesiredWeight is the traffic share the current step asked for. |  | Optional: \{\} <br /> |
-| `currentWeight` _integer_ | CurrentWeight is the share actually achieved after quantisation.<br />Reported separately from DesiredWeight, and this honesty is the point.<br />Replica-based splitting cannot express 20% with 3 pods: the nearest<br />achievable value is 33%. Showing only the requested number would let an<br />operator believe the blast radius is smaller than it is, and would make<br />the analysis appear to be measuring a 20% exposure when it is measuring a<br />third of production. |  | Optional: \{\} <br /> |
+| `currentWeight` _integer_ | CurrentWeight is the configured replica share after quantisation.<br />Reported separately from DesiredWeight because replica-based splitting<br />cannot configure 20% with 3 pods: the nearest share is 33%. This field is<br />derived from desired replica counts, not measured request distribution;<br />connection reuse can make observed traffic differ from the pod ratio. |  | Optional: \{\} <br /> |
 | `step` _integer_ | Step is the zero-based index into the weight ladder. |  | Optional: \{\} <br /> |
 | `steps` _integer_ | Steps is how many steps the ladder has. |  | Optional: \{\} <br /> |
 | `failedChecks` _integer_ | FailedChecks counts rounds that produced a Fail. Not reset by a<br />subsequent Pass. |  | Optional: \{\} <br /> |
@@ -494,9 +494,8 @@ _Appears in:_
 
 ModelSourceSpec is a discriminated union: exactly one member must be set.
 
-The union is modelled in full from the first release even though only Image
-is implemented today. Adding a member to an existing union is a backward
-compatible change; turning a scalar field into a union is not.
+The union is modelled explicitly so that adding a source remains a backward
+compatible change; turning a scalar field into a union later would not be.
 
 
 
@@ -506,7 +505,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `image` _[ImageModelSource](#imagemodelsource)_ | Image mounts model weights from an OCI image.<br />This is the recommended source: it is deterministic, layer-cached by the<br />container runtime, works fully offline, and decouples the model's version<br />from the engine's — which is what allows a model change and an engine<br />change to be rolled out independently. |  | Optional: \{\} <br /> |
-| `huggingFace` _[HuggingFaceModelSource](#huggingfacemodelsource)_ | HuggingFace downloads weights from the Hugging Face Hub at pod start.<br />Convenient, but startup is non-deterministic, every replica re-downloads<br />on every restart, and it is subject to upstream availability and rate<br />limits. Not implemented yet. |  | Optional: \{\} <br /> |
+| `huggingFace` _[HuggingFaceModelSource](#huggingfacemodelsource)_ | HuggingFace downloads weights from the Hugging Face Hub at pod start.<br />Convenient, but startup is non-deterministic, every replica re-downloads<br />on every restart, and it is subject to upstream availability and rate<br />limits. |  | Optional: \{\} <br /> |
 | `persistentVolumeClaim` _[PVCModelSource](#pvcmodelsource)_ | PersistentVolumeClaim mounts weights from an existing PVC.<br />Not implemented yet. |  | Optional: \{\} <br /> |
 
 
@@ -833,7 +832,7 @@ _Appears in:_
 
 | Field | Description |
 | --- | --- |
-| `Replica` | TrafficRoutingReplica splits traffic by REPLICA COUNT: both variants sit<br />behind one Service, and the share each receives is approximately its<br />share of the ready pods.<br />The approximation is real and is reported honestly. kube-proxy<br />load-balances per CONNECTION, not per request, so a client using HTTP<br />keep-alive — which every OpenAI SDK does by default — pins itself to one<br />pod for its whole session. At a requested 20% with 8 concurrent clients,<br />the realised split is some multiple of 1/8, stable and wrong for the<br />entire analysis window.<br />This project's feasibility spike measured the effect at a skew of 1.02<br />with keep-alive on and 1.09 with it off, which is well inside the noise —<br />so replica-based splitting stands, and the load generator disables<br />keep-alive as the documented mitigation. status.canary.currentWeight<br />always reports the QUANTIZED weight actually achieved, never the one that<br />was asked for.<br /> |
+| `Replica` | TrafficRoutingReplica splits traffic by REPLICA COUNT: both variants sit<br />behind one Service, and the share each receives is approximately its<br />share of the ready pods.<br />The approximation is real. kube-proxy<br />load-balances per CONNECTION, not per request, so a client using HTTP<br />keep-alive — which every OpenAI SDK does by default — pins itself to one<br />pod for its whole session. At a requested 20% with 8 concurrent clients,<br />the realised split is some multiple of 1/8, stable and wrong for the<br />entire analysis window.<br />This project's feasibility spike measured the effect at a skew of 1.02<br />with keep-alive on and 1.09 with it off, which is well inside the noise —<br />so replica-based splitting stands, and the load generator disables<br />keep-alive as the documented mitigation. status.canary.currentWeight<br />reports the configured, quantized replica share; it is not a measurement<br />of request distribution.<br /> |
 
 
 #### TrafficRoutingSpec
@@ -861,9 +860,10 @@ _Underlying type:_ _string_
 Verdict is the outcome of one metric check.
 
 Four values, with DISJOINT counters, because collapsing them into pass/fail
-is how homegrown canary controllers roll back for the wrong reason. The
-distinction that matters most: a Prometheus outage yields Error, never Fail,
-so a monitoring failure can never cause a production rollback.
+is how canary controllers act on the wrong evidence. The distinction that
+matters most: a Prometheus outage yields Error, never Fail, and does not
+spend the failed-check budget. The state machine holds initially and aborts
+safely to the stable revision at the configured consecutive-error limit.
 
 _Validation:_
 - Enum: [Pass Fail Inconclusive Error]

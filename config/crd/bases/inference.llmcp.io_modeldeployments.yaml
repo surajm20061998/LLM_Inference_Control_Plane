@@ -557,7 +557,7 @@ spec:
 
                           Convenient, but startup is non-deterministic, every replica re-downloads
                           on every restart, and it is subject to upstream availability and rate
-                          limits. Not implemented yet.
+                          limits.
                         properties:
                           file:
                             description: |-
@@ -1464,14 +1464,12 @@ spec:
                     type: integer
                   currentWeight:
                     description: |-
-                      CurrentWeight is the share actually achieved after quantisation.
+                      CurrentWeight is the configured replica share after quantisation.
 
-                      Reported separately from DesiredWeight, and this honesty is the point.
-                      Replica-based splitting cannot express 20% with 3 pods: the nearest
-                      achievable value is 33%. Showing only the requested number would let an
-                      operator believe the blast radius is smaller than it is, and would make
-                      the analysis appear to be measuring a 20% exposure when it is measuring a
-                      third of production.
+                      Reported separately from DesiredWeight because replica-based splitting
+                      cannot configure 20% with 3 pods: the nearest share is 33%. This field is
+                      derived from desired replica counts, not measured request distribution;
+                      connection reuse can make observed traffic differ from the pod ratio.
                     format: int32
                     type: integer
                   desiredWeight:

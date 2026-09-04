@@ -105,9 +105,8 @@ type ModelSpec struct {
 
 // ModelSourceSpec is a discriminated union: exactly one member must be set.
 //
-// The union is modelled in full from the first release even though only Image
-// is implemented today. Adding a member to an existing union is a backward
-// compatible change; turning a scalar field into a union is not.
+// The union is modelled explicitly so that adding a source remains a backward
+// compatible change; turning a scalar field into a union later would not be.
 //
 // +kubebuilder:validation:XValidation:rule="[has(self.image), has(self.huggingFace), has(self.persistentVolumeClaim)].filter(x, x).size() == 1",message="exactly one of image, huggingFace or persistentVolumeClaim must be set"
 type ModelSourceSpec struct {
@@ -125,7 +124,7 @@ type ModelSourceSpec struct {
 	//
 	// Convenient, but startup is non-deterministic, every replica re-downloads
 	// on every restart, and it is subject to upstream availability and rate
-	// limits. Not implemented yet.
+	// limits.
 	//
 	// +optional
 	HuggingFace *HuggingFaceModelSource `json:"huggingFace,omitempty"`
