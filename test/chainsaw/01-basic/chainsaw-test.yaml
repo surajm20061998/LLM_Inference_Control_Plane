@@ -84,13 +84,14 @@ spec:
             shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE run curl-completion --rm -i --restart=Never \
+              response=$(kubectl -n $NAMESPACE run curl-completion --rm -i --restart=Never \
                 --image=curlimages/curl:8.11.1 --quiet -- \
                 curl -sS --fail-with-body -m 60 \
                   -H 'Content-Type: application/json' \
                   -d '{"model":"stub-model","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
-                  http://basic-demo.$NAMESPACE.svc:8080/v1/chat/completions \
-                | tee /dev/stderr | grep -q 'data: '
+                  http://basic-demo.$NAMESPACE.svc:8080/v1/chat/completions)
+              printf '%s\n' "${response}" >&2
+              grep -q 'data: ' <<< "${response}"
 
     - name: the-shim-is-in-the-path
       try:
@@ -101,11 +102,11 @@ spec:
             shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE run curl-livez --rm -i --restart=Never \
+              response=$(kubectl -n $NAMESPACE run curl-livez --rm -i --restart=Never \
                 --image=curlimages/curl:8.11.1 --quiet -- \
                 curl -sS --fail-with-body -m 30 \
-                  http://basic-demo.$NAMESPACE.svc:8080/llmcp/livez \
-                | grep -q ok
+                  http://basic-demo.$NAMESPACE.svc:8080/llmcp/livez)
+              grep -q ok <<< "${response}"
 
     - name: metrics-are-exposed-on-the-metrics-port
       try:
@@ -123,10 +124,10 @@ spec:
               ip=$(kubectl -n $NAMESPACE get pods -l llmcp.io/model-deployment=basic-demo \
                 -o jsonpath='{.items[0].status.podIP}')
               echo "shim metrics at ${ip}:9090"
-              kubectl -n $NAMESPACE run curl-metrics --rm -i --restart=Never \
+              metrics=$(kubectl -n $NAMESPACE run curl-metrics --rm -i --restart=Never \
                 --image=curlimages/curl:8.11.1 --quiet -- \
-                curl -sS --fail-with-body -m 30 "http://${ip}:9090/metrics" \
-                | grep -q llmcp_inference_requests_total
+                curl -sS --fail-with-body -m 30 "http://${ip}:9090/metrics")
+              grep -q llmcp_inference_requests_total <<< "${metrics}"
 
         - assert:
             # The headless metrics Service exists and has endpoints, which is

@@ -68,7 +68,7 @@ spec:
               args=$(kubectl -n $NAMESPACE get deploy rollout-demo-primary \
                 -o jsonpath='{.spec.template.spec.containers[?(@.name=="engine")].args}')
               echo "engine args: ${args}"
-              echo "${args}" | grep -q 8192
+              grep -q 8192 <<< "${args}"
 
     - name: a-broken-change-is-reverted
       try:

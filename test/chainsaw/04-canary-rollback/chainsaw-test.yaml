@@ -45,8 +45,10 @@ spec:
             shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE get modeldeployment rollback-demo \
-                -o jsonpath='{.status.lastGoodRevision}' | tee /dev/stderr | grep -q .
+              revision=$(kubectl -n $NAMESPACE get modeldeployment rollback-demo \
+                -o jsonpath='{.status.lastGoodRevision}')
+              printf '%s\n' "${revision}" >&2
+              grep -q . <<< "${revision}"
 
     - name: drive-load
       try:
@@ -115,7 +117,7 @@ spec:
               args=$(kubectl -n $NAMESPACE get deploy rollback-demo-primary \
                 -o jsonpath='{.spec.template.spec.containers[?(@.name=="engine")].env}')
               echo "engine env: ${args}"
-              echo "${args}" | grep -q '"value":"60"'
+              grep -q '"value":"60"' <<< "${args}"
 
     - name: the-rejected-revision-is-not-retried
       try:
@@ -127,8 +129,10 @@ spec:
             shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE get modeldeployment rollback-demo \
-                -o jsonpath='{.status.canary.failedRevision}' | tee /dev/stderr | grep -q .
+              revision=$(kubectl -n $NAMESPACE get modeldeployment rollback-demo \
+                -o jsonpath='{.status.canary.failedRevision}')
+              printf '%s\n' "${revision}" >&2
+              grep -q . <<< "${revision}"
         - error:
             resource:
               apiVersion: apps/v1
@@ -145,8 +149,10 @@ spec:
             shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE get events \
-                --field-selector reason=CanaryRolledBack -o name | tee /dev/stderr | grep -q .
+              events=$(kubectl -n $NAMESPACE get events \
+                --field-selector reason=CanaryRolledBack -o name)
+              printf '%s\n' "${events}" >&2
+              grep -q . <<< "${events}"
       catch:
         - events: {}
         - describe:

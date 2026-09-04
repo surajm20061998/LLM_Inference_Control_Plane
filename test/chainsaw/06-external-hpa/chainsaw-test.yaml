@@ -69,9 +69,10 @@ spec:
             shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE get --raw \
-                "/apis/inference.llmcp.io/v1alpha1/namespaces/$NAMESPACE/modeldeployments/hpa-demo/scale" \
-                | tee /dev/stderr | grep -q '"replicas":1'
+              scale=$(kubectl -n $NAMESPACE get --raw \
+                "/apis/inference.llmcp.io/v1alpha1/namespaces/$NAMESPACE/modeldeployments/hpa-demo/scale")
+              printf '%s\n' "${scale}" >&2
+              grep -q '"replicas":1' <<< "${scale}"
         - script:
             shell: bash
             content: |

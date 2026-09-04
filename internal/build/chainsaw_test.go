@@ -77,6 +77,43 @@ func TestEveryChainsawScriptDeclaresBash(t *testing.T) {
 	t.Logf("checked %d script steps across %d suites", checked, len(suites))
 }
 
+// TestChainsawScriptsDoNotUseQuietGrepInPipelines guards a pipefail trap.
+//
+// `grep -q` exits immediately after its first match. When it is downstream of
+// kubectl (or another producer) in a pipefail-enabled script, that closes the
+// pipe while the producer may still be writing. The producer then exits with
+// SIGPIPE (141), turning a successful assertion into a failed Chainsaw step.
+// Capture the producer's complete output first, then run grep on a here-string.
+func TestChainsawScriptsDoNotUseQuietGrepInPipelines(t *testing.T) {
+	t.Parallel()
+
+	quietGrepPipeline := regexp.MustCompile(`(?m)\|(?:[^\n|]*\|)?\s*grep\s+-q(?:\s|$)`)
+	checked := 0
+
+	for _, suite := range chainsawSuites(t) {
+		var doc any
+		if err := yaml.Unmarshal(suite.body, &doc); err != nil {
+			t.Fatalf("%s: %v", suite.path, err)
+		}
+
+		for _, script := range findKey(doc, "script") {
+			m, ok := script.(map[string]any)
+			if !ok {
+				continue
+			}
+			content, _ := m["content"].(string)
+			checked++
+			if quietGrepPipeline.MatchString(content) {
+				t.Errorf("%s pipes into `grep -q`; under pipefail an early match can give the producer SIGPIPE (exit 141). Capture the output first and grep a here-string", suite.path)
+			}
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("no script steps were found; either the suites have none or the scan is broken")
+	}
+}
+
 // TestChainsawConditionsAreLookedUpNotIndexed guards the assertion trap.
 //
 // Chainsaw compares arrays ELEMENT BY ELEMENT, BY INDEX. So this:

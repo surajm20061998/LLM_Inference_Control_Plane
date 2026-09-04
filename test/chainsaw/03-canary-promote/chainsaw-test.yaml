@@ -103,8 +103,10 @@ spec:
             shell: bash
             content: |
               set -euo pipefail
-              kubectl -n $NAMESPACE get events \
-                --field-selector reason=CanaryPromoted -o name | tee /dev/stderr | grep -q .
+              events=$(kubectl -n $NAMESPACE get events \
+                --field-selector reason=CanaryPromoted -o name)
+              printf '%s\n' "${events}" >&2
+              grep -q . <<< "${events}"
       catch:
         - events: {}
         - describe:
