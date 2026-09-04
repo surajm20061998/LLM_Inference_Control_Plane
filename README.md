@@ -116,7 +116,7 @@ The [`cmd/shim`](cmd/shim) reverse proxy measures streaming responses and export
 
 ```mermaid
 sequenceDiagram
-    actor User as Engineer / GitOps
+    participant User as Engineer or GitOps
     participant API as ModelDeployment
     participant C as LLMCP controller
     participant K as Kubernetes workloads
@@ -124,11 +124,11 @@ sequenceDiagram
 
     User->>API: Change model, engine, or serving configuration
     C->>C: Hash target and record ControllerRevision
-    C->>K: Keep stable primary; create candidate canary
+    C->>K: Keep stable primary and create candidate canary
     K-->>C: Candidate replicas become ready
     C->>C: Wait for configured warm-up
     C->>P: Require request-rate evidence and query checks
-    P-->>C: Pass / Fail / Inconclusive / Error
+    P-->>C: Verdict is Pass, Fail, Inconclusive, or Error
     alt Pass
         C->>K: Advance a rung or promote candidate
     else Measured regression reaches threshold
@@ -138,7 +138,7 @@ sequenceDiagram
         C->>C: Follow configured inconclusive policy
     else Metrics provider failure
         C->>C: Hold and retry
-        Note over C,K: At the configured error limit,<br/>abort rollout back to stable
+        Note over C,K: Error limit aborts rollout back to stable
     end
 ```
 
