@@ -1,7 +1,13 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
-# YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
-YEAR ?= $(shell date +%Y)
+# YEAR substitutes the YEAR placeholder in hack/boilerplate.go.txt.
+#
+# PINNED, not read from the clock. CI regenerates everything and fails the build
+# if `git diff` is non-empty, so a clock-derived year turns 1 January into a
+# repo-wide false failure: every open pull request starts reporting that its
+# unrelated change made the manifests stale, and the only "fix" is to commit a
+# year bump that rewrites the header on files nobody touched.
+YEAR ?= 2026
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -61,7 +67,14 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	@# Resolved to an ABSOLUTE path. `setup-envtest ... -p path` prints a path
+	@# relative to the working directory, and `go test` runs each package with
+	@# cwd set to that package's own directory — so a relative KUBEBUILDER_ASSETS
+	@# points somewhere that does not exist and every envtest spec fails to find
+	@# etcd, with an error that looks like a broken install rather than a broken
+	@# variable.
+	KUBEBUILDER_ASSETS="$$(cd "$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" && pwd)" \
+		go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -136,13 +149,15 @@ docker-push: ## Push docker image with the manager.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+	@# Builds Dockerfile directly. The scaffolded version of this target copied
+	@# the Dockerfile aside and sed'd `--platform=$${BUILDPLATFORM}` into its
+	@# first FROM, because the Dockerfile did not carry it. It does now — like
+	@# every other image in this repo — so the sed would insert a SECOND
+	@# --platform flag on a line that already has one.
 	- $(CONTAINER_TOOL) buildx create --name llmcp-builder
 	$(CONTAINER_TOOL) buildx use llmcp-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile .
 	- $(CONTAINER_TOOL) buildx rm llmcp-builder
-	rm Dockerfile.cross
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
@@ -188,7 +203,7 @@ KIND ?= kind
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
-GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
@@ -207,12 +222,12 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
 GOLANGCI_LINT_VERSION ?= v2.12.2
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
-$(KUSTOMIZE): $(LOCALBIN)
+$(KUSTOMIZE): | $(LOCALBIN)
 	$(call go-install-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v5,$(KUSTOMIZE_VERSION))
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
-$(CONTROLLER_GEN): $(LOCALBIN)
+$(CONTROLLER_GEN): | $(LOCALBIN)
 	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
 
 .PHONY: setup-envtest
@@ -225,18 +240,40 @@ setup-envtest: envtest ## Download the binaries required for ENVTEST in the loca
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
-$(ENVTEST): $(LOCALBIN)
+$(ENVTEST): | $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
-$(GOLANGCI_LINT): $(LOCALBIN)
+$(GOLANGCI_LINT): | $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
-	@test -f .custom-gcl.yml && { \
-		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
-		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
-	} || true
+	@# The plugin-enabled build REPLACES the versioned file and the symlink is
+	@# repointed at it, so go-install-tool's `readlink` cache guard keeps
+	@# hitting. Writing a plain file over the symlink — which is what the
+	@# previous `mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT)` did —
+	@# made `readlink` return empty, so the guard missed forever and every lint
+	@# invocation rebuilt both the tool and its plugins from source.
+	@#
+	@# The stamp is what stops the plugin build itself from re-running: it is
+	@# keyed on the version and invalidated by .custom-gcl.yml being newer.
+	@#
+	@# No `|| true`. Swallowing a failure here leaves the PLAIN binary in place,
+	@# and the next `golangci-lint run` dies with
+	@#   build linters: plugin(logcheck): plugin "logcheck" not found
+	@# which blames .golangci.yml's linter list rather than the build step that
+	@# actually broke, with the real error long gone. `make lint-config` does
+	@# not catch it either — `config verify` on the plain binary exits 0.
+	@if [ -f .custom-gcl.yml ]; then \
+		stamp="$(LOCALBIN)/.golangci-lint-custom-$(GOLANGCI_LINT_VERSION).stamp"; \
+		if [ ! -f "$$stamp" ] || [ .custom-gcl.yml -nt "$$stamp" ]; then \
+			set -e; \
+			echo "Building custom golangci-lint with plugins..."; \
+			"$(GOLANGCI_LINT)" custom --destination "$(LOCALBIN)" --name golangci-lint-custom; \
+			mv -f "$(LOCALBIN)/golangci-lint-custom" "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)"; \
+			ln -sf "$$(realpath "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)")" "$(GOLANGCI_LINT)"; \
+			touch "$$stamp"; \
+		fi; \
+	fi
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
@@ -405,9 +442,16 @@ PROM_URL ?= http://localhost:9091
 
 .PHONY: monitoring-install
 monitoring-install: kustomize ## Install kube-prometheus-stack and wire the operator's own metrics in.
-	$(HELM) repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
+	@# --force-update, because a plain `helm repo add` FAILS when the repo is
+	@# already configured with a different URL — and .SHELLFLAGS is -ec, so that
+	@# aborts the target. Harmless on a fresh runner, hostile on a dev machine.
+	$(HELM) repo add --force-update prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
 	$(HELM) repo update prometheus-community >/dev/null
-	$(HELM) upgrade --install $(KPS_RELEASE) prometheus-community/kube-prometheus-stack 		--namespace $(KPS_NAMESPACE) --create-namespace 		--version $(KPS_CHART_VERSION) 		-f $(KPS_VALUES) 		--wait --timeout 10m
+	$(HELM) upgrade --install $(KPS_RELEASE) prometheus-community/kube-prometheus-stack \
+		--namespace $(KPS_NAMESPACE) --create-namespace \
+		--version $(KPS_CHART_VERSION) \
+		-f $(KPS_VALUES) \
+		--wait --timeout 10m
 	@# Applied only now that the Helm release has created the
 	@# monitoring.coreos.com CRDs. Kept out of config/dev for exactly that
 	@# reason — see config/monitoring/kustomization.yaml.
@@ -446,7 +490,7 @@ SUITE ?=
 
 .PHONY: chainsaw
 chainsaw: $(CHAINSAW) ## Download chainsaw locally if necessary.
-$(CHAINSAW): $(LOCALBIN)
+$(CHAINSAW): | $(LOCALBIN)
 	$(call go-install-tool,$(CHAINSAW),github.com/kyverno/chainsaw,$(CHAINSAW_VERSION))
 
 .PHONY: chainsaw-lint
@@ -461,11 +505,21 @@ chainsaw-lint: chainsaw ## Validate the Chainsaw suites without a cluster.
 	@# price of a second.
 	@#
 	@# It does NOT prove the suites pass. It proves they are suites.
-	@set -e; 	$(CHAINSAW) lint configuration -f test/chainsaw/config.yaml >/dev/null; 	echo "config.yaml: valid"; 	for f in test/chainsaw/*/chainsaw-test.yaml; do 		$(CHAINSAW) lint test -f "$$f" >/dev/null || { echo "INVALID: $$f"; exit 1; }; 		echo "$$f: valid"; 	done
+	@set -e; \
+	"$(CHAINSAW)" lint configuration -f test/chainsaw/config.yaml >/dev/null; \
+	echo "config.yaml: valid"; \
+	for f in test/chainsaw/*/chainsaw-test.yaml; do \
+		"$(CHAINSAW)" lint test -f "$$f" >/dev/null || { echo "INVALID: $$f"; exit 1; }; \
+		echo "$$f: valid"; \
+	done
 
 .PHONY: e2e-chainsaw
 e2e-chainsaw: chainsaw ## Run the Chainsaw suites against the current cluster.
-	@if [ -n "$(SUITE)" ]; then 		$(CHAINSAW) test test/chainsaw/$(SUITE) --config test/chainsaw/config.yaml; 	else 		$(CHAINSAW) test test/chainsaw --config test/chainsaw/config.yaml; 	fi
+	@if [ -n "$(SUITE)" ]; then \
+		"$(CHAINSAW)" test "test/chainsaw/$(SUITE)" --config test/chainsaw/config.yaml; \
+	else \
+		"$(CHAINSAW)" test test/chainsaw --config test/chainsaw/config.yaml; \
+	fi
 
 .PHONY: e2e-up
 e2e-up: kind-up dev-images dev-deploy ## Bring up a cluster with the operator and the stub images.
@@ -481,7 +535,7 @@ CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
 
 .PHONY: crd-ref-docs
 crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary.
-$(CRD_REF_DOCS): $(LOCALBIN)
+$(CRD_REF_DOCS): | $(LOCALBIN)
 	$(call go-install-tool,$(CRD_REF_DOCS),github.com/elastic/crd-ref-docs,$(CRD_REF_DOCS_VERSION))
 
 .PHONY: api-docs

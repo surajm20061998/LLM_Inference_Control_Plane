@@ -278,8 +278,18 @@ func Service(mdName string) string {
 }
 
 // Endpoint is the OpenAI-compatible base URL published in status.
-func Endpoint(mdName, namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc:%d/v1", Service(mdName), namespace, ServicePort)
+//
+// port is spec.serving.port, and 0 means "unset", which resolves to ServicePort
+// — the same rule buildService applies when it renders the Service. Taking the
+// port as an argument rather than assuming the constant is the whole point:
+// status.endpoint is the address this operator TELLS people to use, so a
+// deployment that moved its port off the default published a URL on which every
+// client connection is refused.
+func Endpoint(mdName, namespace string, port int32) string {
+	if port == 0 {
+		port = ServicePort
+	}
+	return fmt.Sprintf("http://%s.%s.svc:%d/v1", Service(mdName), namespace, port)
 }
 
 // MetricsService is the headless Service that Prometheus scrapes.

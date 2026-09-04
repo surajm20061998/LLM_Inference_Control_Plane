@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -582,9 +583,97 @@ func TestProxyClientCancelIsNotAnEngineError(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
+	// Both halves, in this order. Asserting only that stream_aborted is zero
+	// passes trivially when NOTHING was recorded — which is precisely the bug
+	// this test was meant to be sensitive to.
+	if got := counterFor(t, m, llmcpmetrics.UpstreamErrorsTotal, prometheus.Labels{
+		llmcpmetrics.LabelReason: llmcpmetrics.ReasonClientCanceled,
+	}); got != 1 {
+		t.Fatalf("client_canceled = %v, want 1: the cancel must be recorded, not dropped", got)
+	}
 	if got := counterFor(t, m, llmcpmetrics.UpstreamErrorsTotal, prometheus.Labels{
 		llmcpmetrics.LabelReason: llmcpmetrics.ReasonStreamAborted,
 	}); got != 0 {
 		t.Fatalf("stream_aborted = %v, want 0: a client cancel is not an engine failure", got)
+	}
+}
+
+// diesMidStream is an upstream that starts a well-formed SSE response, emits a
+// few content frames, then drops the TCP connection without ever sending
+// `data: [DONE]`. It is the shape of an engine that OOMs or segfaults during
+// generation, which is the failure canary analysis exists to catch.
+func diesMidStream(frames int) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			panic(err)
+		}
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\n" +
+			"Content-Type: text/event-stream\r\n" +
+			"Transfer-Encoding: chunked\r\n\r\n")
+		for i := range frames {
+			frame := fmt.Sprintf("data: %s\n\n",
+				`{"choices":[{"delta":{"content":"tok"}}]}`)
+			_, _ = fmt.Fprintf(buf, "%x\r\n%s\r\n", len(frame), frame)
+			_ = buf.Flush()
+			_ = i
+		}
+		// RST rather than FIN, so the shim sees a read error on a chunked body
+		// that never terminated — not a clean EOF.
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	})
+}
+
+func TestProxyRecordsAnAbortedStream(t *testing.T) {
+	// httputil.ReverseProxy does not RETURN when the response body copy fails —
+	// it panics with http.ErrAbortHandler (reverseproxy.go, "abort the
+	// request"). Anything recorded after ServeHTTP is therefore skipped for
+	// exactly the requests that matter most.
+	//
+	// The consequence is not a missing counter, it is a canary gate that cannot
+	// see the failure: an engine dying on every streamed request emits no
+	// upstream errors and no requests_total, so the availability SLI's
+	// numerator and denominator both stay flat and the ratio stays perfect.
+	engine := httptest.NewServer(diesMidStream(3))
+	defer engine.Close()
+
+	p, m := newTestProxy(t, engine.URL)
+	shim := httptest.NewServer(p.handler())
+	defer shim.Close()
+
+	resp, err := http.Post(shim.URL+"/v1/chat/completions",
+		"application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if counterFor(t, m, llmcpmetrics.UpstreamErrorsTotal, prometheus.Labels{
+			llmcpmetrics.LabelReason: llmcpmetrics.ReasonStreamAborted,
+		}) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := counterFor(t, m, llmcpmetrics.UpstreamErrorsTotal, prometheus.Labels{
+		llmcpmetrics.LabelReason: llmcpmetrics.ReasonStreamAborted,
+	}); got != 1 {
+		t.Errorf("upstream_errors_total{reason=stream_aborted} = %v, want 1", got)
+	}
+	if got := counterFor(t, m, llmcpmetrics.RequestsTotal, prometheus.Labels{
+		llmcpmetrics.LabelOperation: llmcpmetrics.OperationChat,
+		llmcpmetrics.LabelCode:      "200",
+	}); got != 1 {
+		t.Errorf("requests_total{chat,200} = %v, want 1: an aborted stream is still a request", got)
+	}
+	if got := gaugeValue(t, m, llmcpmetrics.RequestsInFlight); got != 0 {
+		t.Errorf("requests_in_flight = %v, want 0 after the request unwound", got)
 	}
 }

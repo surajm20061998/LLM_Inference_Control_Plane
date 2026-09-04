@@ -99,7 +99,84 @@ func (r *ModelDeploymentReconciler) planRollout(
 		res = r.planCanary(ctx, md, target, canaryDep, total)
 	}
 
+	res = holdRejectedRevision(md, res, target)
+
 	return r.guardAgainstStall(md, res, primaryDep)
+}
+
+// holdRejectedRevision keeps a revision that was already rejected from being
+// re-applied to the primary on the next pass.
+//
+// # Why a rollback does not stick without this
+//
+// Rejecting a revision and REVERTING to the last known-good one are two
+// different facts, and only the second one was being acted on. The rejection is
+// recorded — canary.begin returns ActionNone with FailedRevision set, and
+// guardAgainstStall writes the same field when a RollingUpdate blows its
+// progress deadline — but neither strategy consulted it again when choosing the
+// primary's revision.
+//
+// So the revert lasted exactly one reconcile:
+//
+//   - Canary. begin() answers ActionNone for three unrelated situations — the
+//     target is already stable, there is nothing to fall back to yet, and this
+//     target was rolled back. The planner treated all three as "roll the target
+//     out", so the pass after a rollback put 100% of traffic back on the
+//     revision the gate had just rejected. Worse, once that revision became
+//     available LastGoodRevision advanced to it, destroying the rollback target
+//     itself.
+//   - RollingUpdate. guardAgainstStall reverts only WHILE the Deployment
+//     reports ProgressDeadlineExceeded. The reverted template starts rolling
+//     out, Progressing goes back to True, the guard stops firing, and the
+//     failed revision is re-applied — an endless bad-revision → stall → revert
+//     → bad-revision loop with a period of spec.rollout.progressDeadline,
+//     churning ReplicaSets and pods forever.
+//
+// A rollback sticks until a human changes the spec, which is what the state
+// machine's own comment already promised.
+func holdRejectedRevision(
+	md *inferencev1alpha1.ModelDeployment,
+	res rollout,
+	target string,
+) rollout {
+	// A canary that is actively serving has a rejection belonging to some
+	// EARLIER revision; the guard below is only about the target itself.
+	if res.Active || res.RolledBack {
+		return res
+	}
+
+	// This pass's verdict first, then what was persisted by an earlier one.
+	rejected := firstNonEmpty(res.Output.State.FailedRevision, canaryFailedRevision(md))
+	if rejected == "" || rejected != target {
+		return res
+	}
+
+	lastGood := md.Status.LastGoodRevision
+	if lastGood == "" || lastGood == target {
+		// Nothing better to run. A first-ever deployment must still roll out,
+		// or a bad first revision would leave the resource with no pods at all
+		// and no way to observe why.
+		return res
+	}
+
+	res.PrimaryRevision = lastGood
+	res.PrimaryReplicas = replicasFor(md)
+	res.CanaryRevision = ""
+	res.CanaryReplicas = 0
+	res.RolledBack = true
+	// Carried forward so the rejection survives into status and is still there
+	// on the next reconcile. Losing it here is what made the revert temporary.
+	res.Output.State.FailedRevision = rejected
+
+	return res
+}
+
+// canaryFailedRevision returns the revision a previous rollback rejected, or "".
+func canaryFailedRevision(md *inferencev1alpha1.ModelDeployment) string {
+	if md.Status.Canary == nil {
+		return ""
+	}
+	return md.Status.Canary.FailedRevision
 }
 
 // guardAgainstStall reverts a primary rollout that blew its progress deadline.
@@ -334,6 +411,11 @@ func canaryPlan(md *inferencev1alpha1.ModelDeployment) canary.Plan {
 		InconclusiveLimit:     a.ResolvedInconclusiveLimit(),
 		OnInconclusive:        a.ResolvedOnInconclusive(),
 		RequireApproval:       c.ApprovalRequired(),
+		// Reused from the rollout spec rather than given its own field: it
+		// answers the same question ("how long may this take before we call it
+		// failed?"), and a second knob would let the two drift into a
+		// configuration where a canary can outlive the rollout that owns it.
+		ProgressDeadline: time.Duration(progressDeadlineSeconds(md)) * time.Second,
 	}
 
 	if c.Scale != nil && c.Scale.Replicas != nil {

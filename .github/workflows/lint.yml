@@ -6,6 +6,16 @@ on:
 
 permissions: {}
 
+# One run per ref, and supersede rather than queue.
+#
+# Without this every same-repo pull request runs each workflow TWICE — once for
+# the push to the branch, once for the pull_request event — and pushing a fixup
+# leaves the run for the previous commit burning a runner to report on code
+# nobody is looking at any more. test-e2e.yml alone has timeout-minutes: 40.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     permissions:
@@ -22,6 +32,21 @@ jobs:
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # The tool binaries under bin/ are `go install`ed from source. Nothing
+      # else caches them: setup-go caches the module and build caches, which
+      # makes the rebuild cheaper but does not skip it. The worst instance is
+      # chainsaw, a ~229 MB binary compiled on every push purely to schema-check
+      # six YAML files in about a second. Every tool version literal lives in
+      # the Makefile, so it is the right cache key.
+      - name: Cache tool binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: bin
+          key: tools-${{ runner.os }}-${{ hashFiles('Makefile', '.custom-gcl.yml') }}
+          restore-keys: |
+            tools-${{ runner.os }}-
 
       - name: Check linter configuration
         run: make lint-config

@@ -645,15 +645,37 @@ func (s *server) streamCompletion(w http.ResponseWriter, r *http.Request, id str
 	flusher.Flush()
 
 	chunks := s.textChunks(id, created)
+	// firstContent is the index of the first chunk that carries a TOKEN. For a
+	// chat stream that is 1, because chunk 0 is the role frame; for a legacy
+	// completion there is no role frame and it is 0.
+	firstContent := 0
 	if chat {
 		chunks = s.chatChunks(id, created)
+		firstContent = 1
 	}
 
 	ctx := r.Context()
 	for i, c := range chunks {
-		delay := s.cfg.itl
-		if i == 0 {
+		// The role frame goes out IMMEDIATELY, and cfg.ttft is spent before the
+		// first frame that carries content.
+		//
+		// Two things break if the role frame is delayed instead. The observable
+		// TTFT on a chat stream becomes ttft+itl while a legacy completion's
+		// stays ttft, so the two endpoints disagree and every assertion of the
+		// form "the histogram is about LLMCP_FAKE_TTFT_MS" is off by one ITL.
+		// Worse, real llama.cpp emits the role frame at once — which is the
+		// premise the shim's whole first-token measurement rests on — so a shim
+		// that wrongly timed the first FRAME would report the configured TTFT
+		// and look correct. The stub would be hiding the exact regression it
+		// exists to catch.
+		var delay time.Duration
+		switch {
+		case i < firstContent:
+			delay = 0
+		case i == firstContent:
 			delay = s.cfg.ttft
+		default:
+			delay = s.cfg.itl
 		}
 		if !sleepCtx(ctx, delay) {
 			// The client hung up; stop generating rather than burning the

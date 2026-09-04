@@ -201,7 +201,8 @@ const ComponentSLO = "slo"
 //
 // # The shape of a latency SLI
 //
-//	sum(rate(ttft_bucket{le="T"}[w])) / sum(rate(ttft_count[w]))
+//	1 - (sum(rate(ttft_count[w])) - sum(rate(ttft_bucket{le="T"}[w])))
+//	      / sum(rate(ttft_count[w]))
 //
 // which reads "the fraction of requests faster than T". Note the denominator is
 // the histogram's own _count, not a separate request counter: they can differ,
@@ -209,6 +210,31 @@ const ComponentSLO = "slo"
 // successes by all requests would report an SLI that falls whenever a client
 // sends a non-streaming request. Using the histogram's own count keeps the
 // numerator and denominator over the same population.
+//
+// # Why BAD/total, subtracted from one, rather than the obvious good/total
+//
+// Both SLIs are written as `1 - bad/total` so that ZERO TRAFFIC yields a
+// perfect 1.0. The direct form does not, and the difference pages people.
+//
+// A plain (non-Vec) histogram is exported from the very first scrape with
+// _count at 0 and every bucket present, so on an idle deployment the good/total
+// form evaluates to 0 / 1e-9 = 0 — a zero SLI, not a perfect one. The burn-rate
+// ladder below then reads (1 - 0) as a 100% error rate and fires
+// LLMCPTTFTBudgetFastBurn, critical, about two minutes after start-up, on a
+// deployment that has simply not been asked for anything yet. LLMCPNoTraffic
+// exists precisely to cover that state, and it cannot do its job if the burn
+// alerts fire there first.
+//
+// The bad/total form is 0/1e-9 = 0 in the same state, so the SLI is 1.0 and
+// only LLMCPNoTraffic speaks.
+//
+// The availability numerator needs one more guard. A counter series that was
+// never incremented does not exist, and the shim pre-initialises only
+// code="200" — so `{code=~"5.."}` selects NOTHING while the deployment is
+// healthy, sum() over no series is an EMPTY vector rather than zero, and every
+// operator involving it yields empty. Without `or vector(0)` the recording rule
+// produces no samples at all in the healthy case, and the SLO dashboard renders
+// "No Data" for a service that is working perfectly.
 //
 // The `le` value must be an exact bucket boundary and is formatted the way the
 // client library formats one. See internal/metrics/buckets.go.
@@ -222,7 +248,9 @@ func recordingRules(model string, threshold float64, windows []string) []any {
 		rules = append(rules, map[string]any{
 			fieldRecord: recordTTFTSLI + w,
 			fieldExpr: fmt.Sprintf(
-				`sum(rate(%s_bucket{%s,le=%q}[%s])) / clamp_min(sum(rate(%s_count{%s}[%s])), 1e-9)`,
+				`1 - (clamp_min(sum(rate(%s_count{%s}[%s])) - sum(rate(%s_bucket{%s,le=%q}[%s])), 0) `+
+					`/ clamp_min(sum(rate(%s_count{%s}[%s])), 1e-9))`,
+				llmcpmetrics.TTFTSeconds, sel, w,
 				llmcpmetrics.TTFTSeconds, sel, le, w,
 				llmcpmetrics.TTFTSeconds, sel, w),
 			fieldLabels: map[string]any{llmcpmetrics.LabelModel: model},
@@ -233,7 +261,8 @@ func recordingRules(model string, threshold float64, windows []string) []any {
 		rules = append(rules, map[string]any{
 			fieldRecord: recordAvailSLI + w,
 			fieldExpr: fmt.Sprintf(
-				`1 - (sum(rate(%s{%s,%s=~"5.."}[%s])) / clamp_min(sum(rate(%s{%s}[%s])), 1e-9))`,
+				`1 - ((sum(rate(%s{%s,%s=~"5.."}[%s])) or vector(0)) `+
+					`/ clamp_min(sum(rate(%s{%s}[%s])), 1e-9))`,
 				llmcpmetrics.RequestsTotal, sel, llmcpmetrics.LabelCode, w,
 				llmcpmetrics.RequestsTotal, sel, w),
 			fieldLabels: map[string]any{llmcpmetrics.LabelModel: model},

@@ -183,19 +183,34 @@ func (p *proxy) serveProxy(w http.ResponseWriter, r *http.Request) {
 	defer p.metrics.end()
 
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+	// DEFERRED, not sequential. httputil.ReverseProxy does not return when the
+	// response body copy fails: it panics with http.ErrAbortHandler
+	// ("Since we're streaming the response, if we run into an error all we can
+	// do is abort the request"). That covers both halves of the case this shim
+	// exists to measure — an engine that dies mid-generation, and a client that
+	// hangs up — so recording after ServeHTTP records everything EXCEPT the
+	// failures.
+	//
+	// The symptom is not a missing counter, it is a canary gate that cannot
+	// see the outage. An engine failing 100% of streamed requests would emit no
+	// upstream errors and no requests_total at all, leaving the availability
+	// SLI's numerator and denominator both flat and the ratio at a perfect 1.0
+	// while nothing works.
+	defer func() {
+		st.duration = p.now().Sub(st.start)
+		p.metrics.observe(st, rec.status)
+		p.countStreamOutcome(r, st)
+
+		if p.logger.Enabled(r.Context(), slog.LevelDebug) {
+			p.logger.Debug("proxied",
+				"operation", st.operation, "code", rec.status,
+				"streamed", st.streamed, "tokens", st.tokens,
+				"ttftMS", st.ttft.Milliseconds(), "durationMS", st.duration.Milliseconds())
+		}
+	}()
+
 	p.rp.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), stateKey, st)))
-
-	st.duration = p.now().Sub(st.start)
-	p.metrics.observe(st, rec.status)
-
-	p.countStreamOutcome(r, st)
-
-	if p.logger.Enabled(r.Context(), slog.LevelDebug) {
-		p.logger.Debug("proxied",
-			"operation", st.operation, "code", rec.status,
-			"streamed", st.streamed, "tokens", st.tokens,
-			"ttftMS", st.ttft.Milliseconds(), "durationMS", st.duration.Milliseconds())
-	}
 }
 
 // countStreamOutcome attributes a stream that did not finish cleanly.
@@ -319,6 +334,13 @@ func (p *proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = resp.Body.Close() }()
 
 	copyHeader(w.Header(), resp.Header)
+	// The body below is TRUNCATED at 64 KiB, so the upstream's Content-Length
+	// may not describe what is actually written. Forwarding it would promise a
+	// length the shim then fails to deliver, and net/http answers a short write
+	// by killing the connection — turning an oversized health body into a probe
+	// that fails for a reason unrelated to the engine's health. Dropping it lets
+	// the response be chunked or length-computed from what is really sent.
+	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 	// A health body is small and bounded; the cap is only there so a
 	// misconfigured -upstream pointing at something enormous cannot be used to

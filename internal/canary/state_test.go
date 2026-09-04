@@ -160,7 +160,7 @@ func TestNextTable(t *testing.T) {
 				Now: t0, Plan: testPlan(func(p *Plan) { p.Weights = nil }),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
 			},
-			wantAction: ActionPromote, wantPhase: PhasePromoting, wantWeight: 100,
+			wantAction: ActionPromote, wantPhase: PhasePromoting, wantWeight: 100, wantRequeue: plan.Interval,
 			wantReason: inferencev1alpha1.ReasonCanaryPromoted,
 		},
 		{
@@ -181,6 +181,40 @@ func TestNextTable(t *testing.T) {
 			name: "unavailable canary holds without analysing",
 			in: Input{
 				Now: t0.Add(time.Minute), Plan: plan,
+				State:          warmState(0),
+				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
+				CanaryAvailable: false,
+			},
+			wantAction: ActionWait, wantPhase: PhaseWaiting, wantWeight: 20,
+			wantReason: inferencev1alpha1.ReasonCanaryProgressing, wantRequeue: plan.Interval,
+		},
+		{
+			// ...but not forever. A canary whose pods never start produces no
+			// traffic, so no analysis round is ever due, so no budget is spent
+			// and no verdict is ever reached. Without a deadline the rollout
+			// simply hangs in Canarying — and the controller's stall guard
+			// cannot rescue it, because that guard reads the PRIMARY Deployment
+			// and is skipped outright while a canary is active.
+			name: "a canary that never becomes available is rolled back at the deadline",
+			in: Input{
+				Now: t0.Add(11 * time.Minute),
+				Plan: testPlan(func(p *Plan) {
+					p.ProgressDeadline = 10 * time.Minute
+				}),
+				State:          warmState(0),
+				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
+				CanaryAvailable: false,
+			},
+			wantAction: ActionRollback, wantPhase: PhaseRollingBack,
+			wantReason: inferencev1alpha1.ReasonCanaryProgressDeadlineExceeded,
+		},
+		{
+			name: "an unavailable canary still inside the deadline keeps waiting",
+			in: Input{
+				Now: t0.Add(9 * time.Minute),
+				Plan: testPlan(func(p *Plan) {
+					p.ProgressDeadline = 10 * time.Minute
+				}),
 				State:          warmState(0),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
 				CanaryAvailable: false,
@@ -213,7 +247,7 @@ func TestNextTable(t *testing.T) {
 		{
 			name:       "a pass at the last rung promotes",
 			in:         analysed(plan, warmState(2), inferencev1alpha1.VerdictPass),
-			wantAction: ActionPromote, wantPhase: PhasePromoting, wantStep: 2, wantWeight: 100,
+			wantAction: ActionPromote, wantPhase: PhasePromoting, wantStep: 2, wantWeight: 100, wantRequeue: plan.Interval,
 			wantReason: inferencev1alpha1.ReasonCanaryPromoted,
 		},
 		{
@@ -286,7 +320,7 @@ func TestNextTable(t *testing.T) {
 			in: analysed(testPlan(func(p *Plan) { p.OnInconclusive = inferencev1alpha1.InconclusivePromote }),
 				warmState(0, func(s *State) { s.SetCounters(0, 0, 4) }),
 				inferencev1alpha1.VerdictInconclusive),
-			wantAction: ActionPromote, wantPhase: PhasePromoting, wantWeight: 100,
+			wantAction: ActionPromote, wantPhase: PhasePromoting, wantWeight: 100, wantRequeue: plan.Interval,
 			wantReason: inferencev1alpha1.ReasonCanaryPromoted,
 		},
 
@@ -319,7 +353,7 @@ func TestNextTable(t *testing.T) {
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
 				CanaryAvailable: true, Approved: true,
 			},
-			wantAction: ActionPromote, wantPhase: PhasePromoting, wantStep: 2, wantWeight: 100,
+			wantAction: ActionPromote, wantPhase: PhasePromoting, wantStep: 2, wantWeight: 100, wantRequeue: plan.Interval,
 			wantReason: inferencev1alpha1.ReasonCanaryPromoted,
 		},
 		{
@@ -364,7 +398,7 @@ func TestNextTable(t *testing.T) {
 				State:          warmState(2, func(s *State) { s.Phase = PhasePromoting }),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
 			},
-			wantAction: ActionPromote, wantPhase: PhasePromoting, wantStep: 2, wantWeight: 100,
+			wantAction: ActionPromote, wantPhase: PhasePromoting, wantStep: 2, wantWeight: 100, wantRequeue: plan.Interval,
 			wantReason: inferencev1alpha1.ReasonCanaryPromoted,
 		},
 		{

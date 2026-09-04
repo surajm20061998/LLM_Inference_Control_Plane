@@ -27,8 +27,11 @@ CLUSTER_NAME="${CLUSTER_NAME:-llmcp}"
 REGISTRY_NAME="${REGISTRY_NAME:-kind-registry}"
 REGISTRY_PORT="${REGISTRY_PORT:-5001}"
 
-# Pinned by digest so that upgrading kind does not silently change the
-# Kubernetes version under the project.
+# Pinned to an explicit TAG, so that upgrading kind does not silently change the
+# Kubernetes version under the project. A tag rather than a digest is a
+# deliberate trade: a digest would also pin the image contents, but it has to be
+# re-looked-up by hand on every bump and reads as an opaque hash in a file
+# people edit. Override NODE_IMAGE to test against another version.
 NODE_IMAGE="${NODE_IMAGE:-kindest/node:v1.35.8}"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

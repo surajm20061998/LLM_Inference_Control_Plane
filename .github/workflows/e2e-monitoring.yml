@@ -68,12 +68,47 @@ jobs:
       - name: Verify the anti-buffering exit criterion
         run: |
           set -euo pipefail
-          kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 9091:9090 &
-          sleep 5
+
+          # A TARGET OF ITS OWN, deliberately.
+          #
+          # The canary suites above run in Chainsaw's generated namespaces, and
+          # test/chainsaw/config.yaml sets cleanup.skipDelete: false — so by the
+          # time this step runs, their shim pods and their load Job have been
+          # deleted and rate(...[2m]) is decaying toward zero. Measuring here
+          # meant racing a window that was already closing, which is how a check
+          # this important came to be written with `|| true` after it.
+          kubectl apply -f config/samples/inference_v1alpha1_modeldeployment.yaml
+          kubectl wait --for=condition=Ready modeldeployment/demo --timeout=5m
+
+          # Backgrounded WITH its output redirected: a background process that
+          # inherits the step's stdout pipe can keep the runner waiting on that
+          # pipe after bash exits.
+          kubectl -n monitoring port-forward \
+            svc/kps-kube-prometheus-stack-prometheus 9091:9090 >/dev/null 2>&1 &
+          pf=$!
+          trap 'kill "$pf" 2>/dev/null || true' EXIT
+
+          # Polled, not slept. `sleep 5` was a guess, and when it was wrong the
+          # first curl inside ttft-ratio.sh aborted the script under `set -e`
+          # with curl's exit 7 — which `|| true` then swallowed.
+          for _ in $(seq 30); do
+            curl -sf http://localhost:9091/-/ready >/dev/null && break
+            sleep 1
+          done
+
+          # WAIT=false returns immediately; the Job keeps generating for its
+          # full duration while ttft-ratio.sh waits for the series to appear.
+          make load MD=demo WAIT=false
+
           # ttft_p95 < 0.5 x duration_p95. Every way of getting the shim wrong —
           # a missing FlushInterval, gzip on the upstream hop, timing the first
           # byte instead of the first token — collapses this ratio to 1.0.
-          make verify-ttft || true
+          #
+          # NOT `|| true`. hack/verify/ttft-ratio.sh exits non-zero precisely so
+          # it can gate CI ("Exits non-zero when the criterion is not met, so it
+          # can gate CI", its own header). Discarding that made the single most
+          # valuable signal in this job decorative.
+          make verify-ttft
 
       - name: Collect diagnostics
         if: failure()

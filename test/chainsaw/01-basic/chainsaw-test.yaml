@@ -27,8 +27,16 @@ spec:
                 # Looked up by JMESPath, not by position. Chainsaw compares arrays
                 # element by element BY INDEX, and status.conditions[0] is SpecValid —
                 # so a positional assertion here silently checks the wrong condition.
-                (conditions[?type == 'Ready'])[0].status: "True"
-                (conditions[?type == 'ModelReady'])[0].status: "True"
+                #
+                # The ENTIRE path lives inside the parentheses. Chainsaw only treats a
+                # key as an expression when it both opens with "(" and closes with ")";
+                # `(conditions[?type == 'Ready'])[0].status` is read as a literal field
+                # name and fails with "field not found in the input object", which looks
+                # exactly like the controller never set the condition. And `|` is what
+                # closes the filter PROJECTION, so that [0] indexes the matched list
+                # rather than each element of it.
+                (conditions[?type == 'Ready'] | [0].status): "True"
+                (conditions[?type == 'ModelReady'] | [0].status): "True"
 
     - name: the-shim-is-a-native-sidecar
       try:
@@ -51,7 +59,7 @@ spec:
               spec:
                 template:
                   spec:
-                    (initContainers[?name == 'shim'])[0].restartPolicy: Always
+                    (initContainers[?name == 'shim'] | [0].restartPolicy): Always
         - assert:
             # And the ORDER: weights are staged before anything starts serving
             # or measuring.

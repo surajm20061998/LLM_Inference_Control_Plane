@@ -37,9 +37,13 @@ capacity planning. It is simply not an objective.
 A latency SLI is a ratio over a histogram bucket:
 
 ```promql
-sum(rate(llmcp_inference_ttft_seconds_bucket{le="1.5"}[1h]))
-  / sum(rate(llmcp_inference_ttft_seconds_count[1h]))
+1 - ( sum(rate(llmcp_inference_ttft_seconds_count[1h]))
+      - sum(rate(llmcp_inference_ttft_seconds_bucket{le="1.5"}[1h])) )
+    / sum(rate(llmcp_inference_ttft_seconds_count[1h]))
 ```
+
+(Written as `1 - bad/total` rather than the equivalent-looking `good/total`, for
+a reason that only shows up with no traffic — see below.)
 
 Prometheus matches `le` as an **exact string**. A rule asking for `le="0.5"`
 against a histogram whose nearest boundaries are `0.4` and `0.6` does not
@@ -106,10 +110,28 @@ spec:
 `LLMCPNoTraffic` exists because **the burn-rate alerts cannot fire without
 traffic**, and that is arithmetic rather than a gap in them.
 
-With no requests, both SLIs are ratios whose denominators are clamped away from
-zero, so both evaluate to a perfect `1.0` and every budget alert stays silent. A
-ModelDeployment whose Service selector broke, or whose shim stopped being
-scraped, therefore looks flawless on every SLO panel.
+With no requests, both SLIs evaluate to a perfect `1.0` and every budget alert
+stays silent. A ModelDeployment whose Service selector broke, or whose shim
+stopped being scraped, therefore looks flawless on every SLO panel.
+
+Getting that `1.0` takes more than clamping the denominator, and both halves are
+load-bearing:
+
+- **`1 - bad/total`, never `good/total`.** A plain histogram is exported from
+  the very first scrape with `_count` at `0` and every bucket present. So on an
+  idle deployment `good/total` is `0 / 1e-9` = **`0`** — a zero SLI, not a
+  perfect one, which the burn ladder reads as a 100% error rate and pages
+  `critical` on about two minutes after start-up. `bad/total` is `0` in the same
+  state, which makes the SLI `1.0`.
+- **`or vector(0)` on the availability numerator.** A counter series that was
+  never incremented does not exist, and the shim pre-initialises only
+  `code="200"` — so `{code=~"5.."}` selects *nothing* while the deployment is
+  healthy. `sum()` over no series is an empty vector, not zero, and empty
+  propagates through every operator: without the guard the recording rule emits
+  no samples at all and the SLO dashboard reads "No Data" for a service that is
+  working perfectly.
+
+Both are asserted by `TestEverySLIReadsPerfectWithNoTraffic`.
 
 `LLMCPNoTraffic` fires when the shims are reporting (so the pods exist and are
 scraped) but no request has arrived for ten minutes. It is the alert that can

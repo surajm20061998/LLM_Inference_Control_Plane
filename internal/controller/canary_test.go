@@ -273,6 +273,21 @@ var _ = Describe("Canary rollout", func() {
 		h.reconcile()
 		Expect(h.canaryExists()).To(BeFalse())
 		Expect(mdtGet(h.mdKey).Status.Canary.FailedRevision).NotTo(BeEmpty())
+
+		By("and not quietly re-pointing the primary AT the rejected revision")
+		// The rollback is only real if it survives the next reconcile. The
+		// state machine answers ActionNone for a rejected target — the same
+		// answer it gives for "already stable" and "nothing to fall back to" —
+		// so a planner that treats all three alike puts 100% of traffic back on
+		// the revision the gate just rejected, while status still reports a
+		// rollback.
+		after := mdtGet(h.mdKey)
+		Expect(mdtGetDeployment(h.primaryKey).Labels[naming.LabelRevision]).
+			To(Equal(after.Status.LastGoodRevision),
+				"the primary must stay on the last known-good revision")
+		Expect(mdtGetDeployment(h.primaryKey).Labels[naming.LabelRevision]).
+			NotTo(Equal(after.Status.Canary.FailedRevision),
+				"the rejected revision must not come back")
 	})
 
 	It("reports Error, never a rollback, when the metric provider is down", func() {

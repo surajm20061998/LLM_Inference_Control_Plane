@@ -4,10 +4,11 @@
 # and this operator's whole purpose is rolling out and comparing replicas across
 # nodes. Two workers is the minimum that makes pod placement observable.
 #
-# The node image is pinned by digest. kind's default node image tracks the
-# kind release, so an unpinned cluster silently changes Kubernetes version when
-# kind is upgraded — which is exactly the kind of drift that turns a working
-# demo into a debugging session.
+# The node image is pinned to an explicit TAG (see hack/kind-with-registry.sh).
+# kind's default node image tracks the kind release, so an unpinned cluster
+# silently changes Kubernetes version when kind is upgraded — which is exactly
+# the kind of drift that turns a working demo into a debugging session. Note a
+# tag is mutable: it pins the Kubernetes version, not the image bytes.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: llmcp

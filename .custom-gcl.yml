@@ -6,6 +6,13 @@
 version: v2.12.2
 plugins:
   # logcheck validates structured logging calls and parameters (e.g., balanced key-value pairs)
+  # PINNED. Everything else in this repo is pinned with care — golangci-lint
+  # v2.12.2, chainsaw v0.2.15, kustomize v5.8.1, the kind node image, and all
+  # four GitHub Actions by SHA — and this was the one line that resolved fresh
+  # on every build. A logtools release that breaks the golangci-lint v2 plugin
+  # API turns every open pull request red with no code change, and because this
+  # dependency lives outside go.sum, setup-go's cache key does not even notice
+  # the version moved.
   - module: "sigs.k8s.io/logtools"
     import: "sigs.k8s.io/logtools/logcheck/gclplugin"
-    version: latest
+    version: v0.10.1

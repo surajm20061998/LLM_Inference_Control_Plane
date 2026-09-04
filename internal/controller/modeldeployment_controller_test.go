@@ -314,6 +314,48 @@ var _ = Describe("ModelDeployment controller", func() {
 			Expect(progressing.Reason).To(Equal(inferencev1alpha1.ReasonProgressDeadlineExceeded))
 			Expect(md.Status.Phase).To(Equal(inferencev1alpha1.PhaseDegraded))
 		})
+
+		It("keeps the revert once the stall condition clears", func() {
+			// The revert is driven by the child Deployment's
+			// ProgressDeadlineExceeded condition, and that condition goes away
+			// as soon as the reverted template starts rolling out. If the
+			// rejection is not remembered independently, the next reconcile
+			// re-applies the failed revision, the rollout stalls again, and the
+			// operator settles into an endless bad-revision -> stall -> revert
+			// loop with a period of spec.rollout.progressDeadline — churning
+			// ReplicaSets and pods forever while status flaps.
+			mdtCreate(helpers.NewModelDeployment(name, namespace))
+			mdtReconcile(r, mdKey)
+
+			By("banking a known-good revision")
+			Expect(helpers.MarkDeploymentAvailable(ctx, k8sClient, depKey, 1)).To(Succeed())
+			mdtReconcile(r, mdKey)
+			good := mdtGet(mdKey).Status.LastGoodRevision
+			Expect(good).NotTo(BeEmpty())
+
+			By("rolling out a revision that stalls")
+			md := mdtGet(mdKey)
+			md.Spec.Engine.ContextSize = ptr.To(int32(2048))
+			Expect(k8sClient.Update(ctx, md)).To(Succeed())
+			mdtReconcile(r, mdKey)
+			bad := mdtGetDeployment(depKey).Labels[naming.LabelRevision]
+			Expect(bad).NotTo(Equal(good))
+
+			Expect(helpers.MarkDeploymentStalled(ctx, k8sClient, depKey)).To(Succeed())
+			mdtReconcile(r, mdKey)
+
+			By("reverting to the last known-good revision")
+			Expect(mdtGetDeployment(depKey).Labels[naming.LabelRevision]).To(Equal(good))
+
+			By("and STAYING there after the stall condition clears")
+			Expect(helpers.MarkDeploymentProgressing(ctx, k8sClient, depKey, 1, 1)).To(Succeed())
+			mdtReconcile(r, mdKey)
+			Expect(mdtGetDeployment(depKey).Labels[naming.LabelRevision]).To(Equal(good),
+				"the rejected revision was re-applied once the Deployment stopped reporting a stall")
+
+			mdtReconcile(r, mdKey)
+			Expect(mdtGetDeployment(depKey).Labels[naming.LabelRevision]).To(Equal(good))
+		})
 	})
 
 	Context("when the spec is one the engine cannot serve", func() {
@@ -343,6 +385,20 @@ var _ = Describe("ModelDeployment controller", func() {
 			specValid := mdtExpectCondition(mdtGet(mdKey), inferencev1alpha1.ConditionSpecValid, metav1.ConditionFalse)
 			Expect(specValid.Reason).To(Equal(inferencev1alpha1.ReasonInvalidSpec))
 			Expect(specValid.Message).To(ContainSubstring("persistentVolumeClaim"))
+
+			By("still reporting every condition, so nothing waits on one that never appears")
+			// The API contract is that every condition is present from the
+			// first reconcile, as Unknown when nothing is known — that is what
+			// lets a consumer tell "not yet evaluated" from "evaluated and
+			// false". A terminal failure on the FIRST reconcile is the one case
+			// where nothing else runs, so it is also the one case where the
+			// contract can silently lapse: a client polling for ModelReady
+			// would block forever on a condition that is never written.
+			final := mdtGet(mdKey)
+			for _, tp := range inferencev1alpha1.AllConditionTypes() {
+				Expect(apimeta.FindStatusCondition(final.Status.Conditions, tp)).NotTo(BeNil(),
+					"condition %s was never reported", tp)
+			}
 
 			By("creating no children")
 			err = k8sClient.Get(ctx, depKey, &appsv1.Deployment{})

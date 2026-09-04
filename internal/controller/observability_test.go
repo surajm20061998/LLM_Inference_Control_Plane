@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -223,6 +224,51 @@ var _ = Describe("Metric collection", func() {
 			cond := mdtExpectCondition(mdtGet(mdKey),
 				inferencev1alpha1.ConditionMetricsRegistered, metav1.ConditionTrue)
 			Expect(cond.Message).To(ContainSubstring("SLO rules disabled"))
+		})
+
+		It("removes a ServiceMonitor and PrometheusRule that are later disabled", func() {
+			// Disabling has to REMOVE, not merely stop creating. A
+			// ServiceMonitor left behind keeps Prometheus scraping and a
+			// PrometheusRule left behind keeps paging — both while the status
+			// says in plain words that nothing is collected. A cluster that
+			// contradicts its own status is the hardest kind of discrepancy to
+			// notice, because every reasonable place you would look agrees with
+			// you.
+			mdtCreate(helpers.NewModelDeployment(name, namespace))
+			mdtReconcile(r, mdKey)
+
+			ruleKey := types.NamespacedName{Namespace: namespace, Name: naming.PrometheusRule(name)}
+			sm := &unstructured.Unstructured{}
+			sm.SetGroupVersionKind(observability.ServiceMonitorGVK)
+			Expect(k8sClient.Get(ctx, smKey, sm)).To(Succeed())
+			rule := &unstructured.Unstructured{}
+			rule.SetGroupVersionKind(observability.PrometheusRuleGVK)
+			Expect(k8sClient.Get(ctx, ruleKey, rule)).To(Succeed())
+
+			By("turning both off")
+			md := mdtGet(mdKey)
+			md.Spec.Observability.ServiceMonitor = &inferencev1alpha1.ServiceMonitorSpec{
+				Enabled: ptr.To(false),
+			}
+			md.Spec.Observability.PrometheusRule = &inferencev1alpha1.PrometheusRuleSpec{
+				Enabled: ptr.To(false),
+			}
+			Expect(k8sClient.Update(ctx, md)).To(Succeed())
+			mdtReconcile(r, mdKey)
+
+			By("and finding neither object still in the cluster")
+			smAfter := &unstructured.Unstructured{}
+			smAfter.SetGroupVersionKind(observability.ServiceMonitorGVK)
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, smKey, smAfter))).To(BeTrue(),
+				"the ServiceMonitor survived being disabled; Prometheus is still scraping")
+
+			ruleAfter := &unstructured.Unstructured{}
+			ruleAfter.SetGroupVersionKind(observability.PrometheusRuleGVK)
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, ruleKey, ruleAfter))).To(BeTrue(),
+				"the PrometheusRule survived being disabled; its burn-rate alerts still page")
+
+			By("and staying deleted on the next pass")
+			mdtReconcile(r, mdKey)
 		})
 
 		It("reports MetricsRegistered=False when the shim is disabled", func() {

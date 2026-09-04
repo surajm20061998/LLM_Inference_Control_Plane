@@ -20,7 +20,11 @@ import (
 	"context"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
@@ -67,7 +71,45 @@ func (r *ModelDeploymentReconciler) reconcileObservability(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
 ) (metricsVerdict, error) {
+	// Reconciled FIRST, and on EVERY path below.
+	//
+	// The SLO rules are not a sub-object of the ServiceMonitor. They are
+	// generated from spec.observability.slo, they are applied to a different
+	// kind, and they page on their own. Reaching them only after a successful
+	// ServiceMonitor apply meant that turning scraping off — or simply running
+	// on a cluster with no ServiceMonitor CRD — left the PrometheusRule frozen
+	// at whatever it last was: still loaded, still alerting, and with nothing
+	// in the controller ever revisiting it again.
+	rulesMsg, rulesStatus, err := r.reconcilePrometheusRule(ctx, md)
+	if err != nil {
+		// rulesStatus carries the DISTINCTION the message cannot: a failed
+		// probe means nothing was learned about the cluster (Unknown), while a
+		// rejected apply means something definite went wrong (False). Reporting
+		// a probe failure as False would tell a user their SLO rules are
+		// missing because the API server hiccuped.
+		return metricsVerdict{
+			Status:  rulesStatus,
+			Reason:  inferencev1alpha1.ReasonReconciling,
+			Message: "Reconciling the PrometheusRule failed: " + err.Error(),
+		}, err
+	}
+
 	if !md.Spec.Observability.ServiceMonitorEnabled() {
+		// Disabling has to REMOVE the object, not merely stop creating it.
+		// Turning the field off on a deployment that already had a
+		// ServiceMonitor otherwise leaves the old one in place and Prometheus
+		// still scraping, while the condition below says in plain words that
+		// nothing does — a status that contradicts the cluster, and the
+		// hardest kind of discrepancy to notice.
+		if err := r.deleteObservabilityChild(
+			ctx, md, observability.ServiceMonitorGVK, naming.ServiceMonitor(md.Name),
+		); err != nil {
+			return metricsVerdict{
+				Status:  metav1.ConditionUnknown,
+				Reason:  inferencev1alpha1.ReasonReconciling,
+				Message: "Could not remove the disabled ServiceMonitor: " + err.Error(),
+			}, err
+		}
 		return metricsVerdict{
 			Status: metav1.ConditionFalse,
 			Reason: inferencev1alpha1.ReasonServiceMonitorDisabled,
@@ -87,16 +129,16 @@ func (r *ModelDeploymentReconciler) reconcileObservability(
 		}, nil
 	}
 
-	present, err := r.Discovery.Has(ctx, observability.ServiceMonitorGVK)
-	if err != nil {
+	present, probeErr := r.Discovery.Has(ctx, observability.ServiceMonitorGVK)
+	if probeErr != nil {
 		// Discovery itself failed. This is NOT evidence that the CRD is absent,
 		// and reporting it as such would tell a user their monitoring stack is
 		// uninstalled because the API server hiccuped. Unknown, and retry.
 		return metricsVerdict{
 			Status:  metav1.ConditionUnknown,
 			Reason:  inferencev1alpha1.ReasonReconciling,
-			Message: "Could not determine whether the cluster serves ServiceMonitor: " + err.Error(),
-		}, fmt.Errorf("probing for %s: %w", observability.ServiceMonitorGVK.Kind, err)
+			Message: "Could not determine whether the cluster serves ServiceMonitor: " + probeErr.Error(),
+		}, fmt.Errorf("probing for %s: %w", observability.ServiceMonitorGVK.Kind, probeErr)
 	}
 
 	if !present {
@@ -117,24 +159,15 @@ func (r *ModelDeploymentReconciler) reconcileObservability(
 		ShimEnabled: md.Spec.Serving.ShimEnabled(),
 	})
 
-	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(sm),
+	if applyErr := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(sm),
 		client.FieldOwner(naming.FieldManager),
 		client.ForceOwnership,
 	); err != nil {
 		return metricsVerdict{
 			Status:  metav1.ConditionFalse,
 			Reason:  inferencev1alpha1.ReasonReconciling,
-			Message: "Applying the ServiceMonitor failed: " + err.Error(),
-		}, fmt.Errorf("applying ServiceMonitor: %w", err)
-	}
-
-	rulesMsg, err := r.reconcilePrometheusRule(ctx, md)
-	if err != nil {
-		return metricsVerdict{
-			Status:  metav1.ConditionFalse,
-			Reason:  inferencev1alpha1.ReasonReconciling,
-			Message: "Applying the PrometheusRule failed: " + err.Error(),
-		}, err
+			Message: "Applying the ServiceMonitor failed: " + applyErr.Error(),
+		}, fmt.Errorf("applying ServiceMonitor: %w", applyErr)
 	}
 
 	if !md.Spec.Serving.ShimEnabled() {
@@ -173,20 +206,41 @@ func (r *ModelDeploymentReconciler) reconcileObservability(
 // cluster running a cut-down prometheus-operator install, or one mid-upgrade,
 // can genuinely serve one and not the other, and assuming otherwise turns into
 // a failed apply rather than a clear message.
+//
+// The second return value is the condition status to report if the third is
+// non-nil: Unknown when the cluster could not be probed, False when an apply
+// was rejected.
 func (r *ModelDeploymentReconciler) reconcilePrometheusRule(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
-) (string, error) {
+) (string, metav1.ConditionStatus, error) {
 	if !md.Spec.Observability.PrometheusRuleEnabled() {
-		return "; SLO rules disabled", nil
+		// Same reason as the ServiceMonitor above: a PrometheusRule left behind
+		// keeps its burn-rate alerts loaded and paging, on an SLO the spec says
+		// is switched off.
+		if err := r.deleteObservabilityChild(
+			ctx, md, observability.PrometheusRuleGVK, naming.PrometheusRule(md.Name),
+		); err != nil {
+			return "", metav1.ConditionFalse, err
+		}
+		return "; SLO rules disabled", metav1.ConditionTrue, nil
+	}
+
+	if r.Discovery == nil {
+		// No prober: a unit test, or a deliberately offline mode. Nothing was
+		// checked, so nothing is claimed.
+		return "; SLO rules not probed", metav1.ConditionUnknown, nil
 	}
 
 	present, err := r.Discovery.Has(ctx, observability.PrometheusRuleGVK)
 	if err != nil {
-		return "", fmt.Errorf("probing for %s: %w", observability.KindPrometheusRule, err)
+		// A probe that failed says NOTHING about whether the CRD exists.
+		return "", metav1.ConditionUnknown,
+			fmt.Errorf("probing for %s: %w", observability.KindPrometheusRule, err)
 	}
 	if !present {
-		return "; no PrometheusRule CRD in this cluster, so no SLO alerts", nil
+		return "; no PrometheusRule CRD in this cluster, so no SLO alerts",
+			metav1.ConditionTrue, nil
 	}
 
 	rule := observability.BuildPrometheusRule(observability.PrometheusRuleInput{
@@ -201,7 +255,7 @@ func (r *ModelDeploymentReconciler) reconcilePrometheusRule(
 		client.FieldOwner(naming.FieldManager),
 		client.ForceOwnership,
 	); err != nil {
-		return "", fmt.Errorf("applying PrometheusRule: %w", err)
+		return "", metav1.ConditionFalse, fmt.Errorf("applying PrometheusRule: %w", err)
 	}
 
 	msg := "; SLO rules in " + naming.PrometheusRule(md.Name)
@@ -217,7 +271,7 @@ func (r *ModelDeploymentReconciler) reconcilePrometheusRule(
 				"no bucket and the alert could never fire)", snapped)
 	}
 
-	return msg, nil
+	return msg, metav1.ConditionTrue, nil
 }
 
 // kindModelDeployment is this operator's own kind, as it appears in an owner
@@ -238,5 +292,33 @@ func ownerReferenceFor(md *inferencev1alpha1.ModelDeployment) metav1.OwnerRefere
 		UID:                md.UID,
 		Controller:         &t,
 		BlockOwnerDeletion: &t,
+	}
+}
+
+// deleteObservabilityChild removes a generated monitoring object that the spec
+// has since disabled.
+//
+// Both classes of "it is not there" are tolerated, and they are different
+// things: IsNotFound means the object is already gone, which is the goal;
+// IsNoMatchError means the cluster does not serve the KIND at all, so there was
+// never anything to delete and probing for it would be a wasted round trip.
+// Neither is a reason to fail a reconcile of the workload itself.
+func (r *ModelDeploymentReconciler) deleteObservabilityChild(
+	ctx context.Context,
+	md *inferencev1alpha1.ModelDeployment,
+	gvk schema.GroupVersionKind,
+	name string,
+) error {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	obj.SetNamespace(md.Namespace)
+	obj.SetName(name)
+
+	err := r.Delete(ctx, obj)
+	switch {
+	case err == nil, apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		return nil
+	default:
+		return fmt.Errorf("deleting disabled %s %s: %w", gvk.Kind, name, err)
 	}
 }

@@ -214,6 +214,14 @@ const (
 	// ReasonCanaryPromoted indicates the canary became the primary.
 	ReasonCanaryPromoted = "CanaryPromoted"
 
+	// ReasonCanaryProgressDeadlineExceeded indicates the canary's pods never
+	// became available within spec.rollout.progressDeadline, so it was rolled
+	// back without any analysis round having run. It is deliberately distinct
+	// from CanaryRolledBack: nothing was measured, so nothing was judged, and
+	// an operator reading the condition needs to look at the canary's PODS
+	// rather than at its metrics.
+	ReasonCanaryProgressDeadlineExceeded = "CanaryProgressDeadlineExceeded"
+
 	// ReasonAnalysisError indicates the metric provider could not be queried.
 	//
 	// Kept strictly distinct from ChecksFailed. A Prometheus outage says

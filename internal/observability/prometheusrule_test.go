@@ -440,6 +440,51 @@ func TestEveryRatioClampsItsDenominatorInRules(t *testing.T) {
 	}
 }
 
+func TestEverySLIReadsPerfectWithNoTraffic(t *testing.T) {
+	t.Parallel()
+
+	// The claim TestNoTrafficAlertExists rests on — that an idle deployment's
+	// SLIs sit at 1.0 and only LLMCPNoTraffic speaks — is a property of how the
+	// ratio is WRITTEN, and clamping the denominator is not enough to get it.
+	//
+	// `good/total` is 0/1e-9 = 0 on an idle deployment, because a plain
+	// histogram exports _count and every bucket from the first scrape. The burn
+	// ladder reads that as a 100% error rate and pages critical within minutes
+	// of start-up. Only `1 - bad/total` yields 1.0 there.
+	//
+	// The availability numerator additionally needs `or vector(0)`: the shim
+	// pre-initialises only code="200", so `{code=~"5.."}` selects no series at
+	// all while the deployment is healthy, and sum() over nothing is an empty
+	// vector — which propagates through every operator and makes the rule
+	// record no samples at all.
+	u := BuildPrometheusRule(ruleInput())
+
+	checked := 0
+	for _, r := range allRules(t, u) {
+		name, ok := r[fieldRecord].(string)
+		if !ok {
+			continue
+		}
+		expr := r[fieldExpr].(string)
+		checked++
+
+		if !strings.HasPrefix(expr, "1 - ") {
+			t.Errorf("recording rule %s is not written as `1 - bad/total`, so it reads 0 "+
+				"rather than 1.0 on an idle deployment and the burn alerts fire on "+
+				"start-up: %s", name, expr)
+		}
+		if strings.HasPrefix(name, recordAvailSLI) && !strings.Contains(expr, "or vector(0)") {
+			t.Errorf("recording rule %s selects 5xx series that do not exist while the "+
+				"deployment is healthy; without `or vector(0)` it records nothing at all "+
+				"and the dashboard shows No Data: %s", name, expr)
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("no recording rules were generated; the scan is broken")
+	}
+}
+
 func TestLatencySLIDividesByTheHistogramsOwnCount(t *testing.T) {
 	t.Parallel()
 

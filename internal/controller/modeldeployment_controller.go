@@ -520,12 +520,18 @@ func (r *ModelDeploymentReconciler) updateStatus(
 			return client.IgnoreNotFound(err)
 		}
 
+		// Read BEFORE computeStatus, not after. computeStatus copies the
+		// condition slice so this is no longer load-bearing, but reading a
+		// "before" value after the call that computes the "after" one is the
+		// shape of the bug rather than a detail of it — the ordering is the
+		// thing that makes the transition detectable.
+		wasReady := isConditionTrue(latest.Status.Conditions, inferencev1alpha1.ConditionReady)
+
 		newStatus := computeStatus(&latest, obs, latest.Status)
 		if apiequality.Semantic.DeepEqual(latest.Status, newStatus) {
 			return nil
 		}
 
-		wasReady := isConditionTrue(latest.Status.Conditions, inferencev1alpha1.ConditionReady)
 		nowReady := isConditionTrue(newStatus.Conditions, inferencev1alpha1.ConditionReady)
 
 		latest.Status = newStatus

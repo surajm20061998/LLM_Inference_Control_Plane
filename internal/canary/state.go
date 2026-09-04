@@ -133,6 +133,17 @@ type Plan struct {
 	// RequireApproval holds before the final promotion.
 	RequireApproval bool
 
+	// ProgressDeadline bounds how long the canary may sit without ever
+	// becoming available. Zero disables the bound.
+	//
+	// Without it a canary whose pods never start — a bad image, an unschedulable
+	// resource request, a missing secret — holds in PhaseWaiting forever: no
+	// analysis round is ever due, so no budget is spent, no verdict is reached
+	// and no rollback fires. The controller's stall guard cannot cover it
+	// either, because that guard inspects the PRIMARY Deployment and is skipped
+	// outright while a canary is active.
+	ProgressDeadline time.Duration
+
 	// CanaryReplicaOverride pins the canary's pod count independently of its
 	// weight. Nil means size it proportionally.
 	CanaryReplicaOverride *int32
@@ -396,6 +407,7 @@ func begin(in Input) Output {
 				StartedAt:      in.Now,
 			},
 			Action:         ActionPromote,
+			RequeueAfter:   in.Plan.Interval,
 			Primary:        in.TotalReplicas,
 			DesiredWeight:  100,
 			RealizedWeight: 100,
@@ -498,6 +510,7 @@ func promoting(in Input, st State) Output {
 	return Output{
 		State:          st,
 		Action:         ActionPromote,
+		RequeueAfter:   in.Plan.Interval,
 		DesiredWeight:  100,
 		Primary:        in.TotalReplicas,
 		RealizedWeight: 100,
@@ -520,6 +533,7 @@ func paused(in Input, st State) Output {
 		return Output{
 			State:          st,
 			Action:         ActionPromote,
+			RequeueAfter:   in.Plan.Interval,
 			DesiredWeight:  100,
 			Primary:        in.TotalReplicas,
 			RealizedWeight: 100,
@@ -570,6 +584,22 @@ func analyse(in Input, st State) Output {
 	// a condition that is entirely expected.
 	if !in.CanaryAvailable {
 		st.AvailableSince = time.Time{}
+
+		// Bounded, not indefinite. A canary whose pods never become ready is
+		// the most common way a bad release presents — a bad image reference,
+		// an unschedulable resource request, a model file that will not parse —
+		// and none of it produces a verdict, because no analysis round is ever
+		// due over a canary that serves no traffic. Holding here forever leaves
+		// the rollout wedged with no budget spent and no rollback, and the
+		// controller's stall guard cannot rescue it: that guard reads the
+		// PRIMARY Deployment and is skipped entirely while a canary is active.
+		if in.Plan.ProgressDeadline > 0 && !st.StartedAt.IsZero() &&
+			in.Now.Sub(st.StartedAt) > in.Plan.ProgressDeadline {
+			return rollback(in, st, inferencev1alpha1.ReasonCanaryProgressDeadlineExceeded,
+				"Canary replicas never became available within "+
+					in.Plan.ProgressDeadline.String()+"; rolling back")
+		}
+
 		return hold(PhaseWaiting, inferencev1alpha1.ReasonCanaryProgressing,
 			"Waiting for canary replicas to become available", in.Plan.Interval)
 	}
@@ -660,6 +690,7 @@ func advance(in Input, st State) Output {
 		return Output{
 			State:          st,
 			Action:         ActionPromote,
+			RequeueAfter:   in.Plan.Interval,
 			DesiredWeight:  100,
 			Primary:        in.TotalReplicas,
 			RealizedWeight: 100,
@@ -698,6 +729,7 @@ func onInconclusive(in Input, st State, primary, canary, weight int32) Output {
 		return Output{
 			State:          st,
 			Action:         ActionPromote,
+			RequeueAfter:   in.Plan.Interval,
 			DesiredWeight:  100,
 			Primary:        in.TotalReplicas,
 			RealizedWeight: 100,

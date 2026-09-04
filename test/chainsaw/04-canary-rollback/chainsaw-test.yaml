@@ -95,7 +95,7 @@ spec:
                 # Looked up by JMESPath, not by position. Chainsaw compares arrays
                 # element by element BY INDEX, and status.conditions[0] is SpecValid —
                 # so a positional assertion here silently checks the wrong condition.
-                (conditions[?type == 'CanaryHealthy'])[0].status: "False"
+                (conditions[?type == 'CanaryHealthy'] | [0].status): "False"
         - error:
             resource:
               apiVersion: apps/v1

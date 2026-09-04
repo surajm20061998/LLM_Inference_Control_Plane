@@ -19,6 +19,7 @@ package build
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -27,8 +28,8 @@ import (
 
 // The Chainsaw suites cannot be RUN without a cluster, which makes them the one
 // tier where an authoring mistake can sit undetected for a long time.
-// `chainsaw lint` validates their schema; these two tests check the semantics
-// that a schema cannot express, and both exist because the mistake was actually
+// `chainsaw lint` validates their schema; these tests check the semantics
+// that a schema cannot express, and each exists because the mistake was actually
 // made.
 
 // TestEveryChainsawScriptDeclaresBash guards a portability trap that is
@@ -92,7 +93,7 @@ func TestEveryChainsawScriptDeclaresBash(t *testing.T) {
 //
 // The correct form is a JMESPath lookup, which is also order-independent:
 //
-//	(conditions[?type == 'Ready'])[0].status: "True"
+//	(conditions[?type == 'Ready'] | [0].status): "True"
 func TestChainsawConditionsAreLookedUpNotIndexed(t *testing.T) {
 	t.Parallel()
 
@@ -118,12 +119,116 @@ func TestChainsawConditionsAreLookedUpNotIndexed(t *testing.T) {
 							"    Chainsaw matches arrays by index, and conditions[0] is whatever the\n"+
 							"    controller set first — SpecValid here, never Ready.\n"+
 							"    Use a JMESPath lookup instead:\n"+
-							"        (conditions[?type == 'Ready'])[0].status: \"True\"",
+							"        (conditions[?type == 'Ready'] | [0].status): \"True\"",
 						suite.path)
 				}
 			}
 		}
 	}
+}
+
+// TestChainsawExpressionKeysAreFullyParenthesized guards the trap that the
+// lookup form above walks straight into.
+//
+// Chainsaw decides whether a map key is a JMESPath EXPRESSION or a literal
+// FIELD NAME with one regexp, `^\((?:(\w+);)?(.+)\)$` — the key must open
+// with "(" and CLOSE with ")". So this, which reads perfectly naturally:
+//
+//	(conditions[?type == 'Ready'])[0].status: "True"
+//
+// is not an expression at all. The trailing "[0].status" sits outside the
+// parentheses, the regexp does not match, and Chainsaw looks for a field
+// literally named `(conditions[?type == 'Ready'])[0].status`. It reports
+//
+//	status.(conditions[?type == 'Ready'])[0].status: Required value: field not
+//	found in the input object
+//
+// which reads like the CONTROLLER failed to set the condition, and sends you
+// debugging the operator instead of the assertion. The whole path has to live
+// inside the parentheses:
+//
+//	(conditions[?type == 'Ready'] | [0].status): "True"
+//
+// The pipe is load-bearing too. `[?...]` opens a JMESPath PROJECTION, and a
+// following `[0]` applies to each projected element rather than to the list —
+// so `(conditions[?type == 'Ready'][0].status)` indexes a map by 0 and fails
+// with "types are not comparable". `|` closes the projection first.
+func TestChainsawExpressionKeysAreFullyParenthesized(t *testing.T) {
+	t.Parallel()
+
+	// The same shapes Chainsaw's own expression parser recognises: a
+	// parenthesised expression, or a backslash-escaped literal.
+	expression := regexp.MustCompile(`^\((?:\w+;)?.+\)$`)
+	escaped := regexp.MustCompile(`^\\.+\\$`)
+
+	checked := 0
+
+	for _, suite := range chainsawFiles(t) {
+		var doc any
+		if err := yaml.Unmarshal(suite.body, &doc); err != nil {
+			t.Fatalf("%s: %v", suite.path, err)
+		}
+
+		for _, key := range mapKeys(doc) {
+			// Strip the foreach and binding decorations Chainsaw peels off
+			// before it looks for parentheses.
+			stripped := key
+			if m := foreachPrefix.FindStringSubmatch(stripped); m != nil {
+				stripped = m[1]
+			}
+			if m := bindingSuffix.FindStringSubmatch(stripped); m != nil {
+				stripped = m[1]
+			}
+
+			if !strings.ContainsAny(stripped, "()[]?|") {
+				continue // an ordinary field name
+			}
+			checked++
+
+			if expression.MatchString(stripped) || escaped.MatchString(stripped) {
+				continue
+			}
+
+			t.Errorf(
+				"%s uses the key %q, which Chainsaw reads as a LITERAL FIELD NAME.\n"+
+					"    An expression key must open with \"(\" and close with \")\" — the whole\n"+
+					"    path, not just the lookup. The assertion does not fail loudly; it\n"+
+					"    reports \"field not found in the input object\" and looks like the\n"+
+					"    controller never set the field.\n"+
+					"    Write it as:\n"+
+					"        (conditions[?type == 'Ready'] | [0].status): \"True\"",
+				suite.path, key)
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("no expression-shaped keys were found; either the suites have none or the scan is broken")
+	}
+	t.Logf("checked %d expression-shaped keys", checked)
+}
+
+// Mirrors the decorations Chainsaw's expression parser strips before it decides
+// whether what is left is a parenthesised expression.
+var (
+	foreachPrefix = regexp.MustCompile(`^~(?:\w+)?\.(.*)`)
+	bindingSuffix = regexp.MustCompile(`(.*)\s*->\s*\w+$`)
+)
+
+// mapKeys walks a decoded YAML tree and returns every map key in it.
+func mapKeys(node any) []string {
+	var out []string
+	switch v := node.(type) {
+	case map[string]any:
+		for k, child := range v {
+			out = append(out, k)
+			out = append(out, mapKeys(child)...)
+		}
+	case []any:
+		for _, child := range v {
+			out = append(out, mapKeys(child)...)
+		}
+	}
+	return out
 }
 
 // suiteFile is one parsed Chainsaw YAML document.

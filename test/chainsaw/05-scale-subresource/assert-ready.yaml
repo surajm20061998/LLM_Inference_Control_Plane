@@ -9,4 +9,4 @@ status:
   # Looked up by JMESPath, not by position. Chainsaw compares arrays element by
   # element BY INDEX, and status.conditions[0] is SpecValid — so a positional
   # assertion here silently checks the wrong condition.
-  (conditions[?type == 'Ready'])[0].status: "True"
+  (conditions[?type == 'Ready'] | [0].status): "True"

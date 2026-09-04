@@ -398,6 +398,51 @@ func TestDerivePhaseSeparatesFirstRolloutFromRegression(t *testing.T) {
 	})
 }
 
+func TestComputeStatusDoesNotMutateItsPreviousStatus(t *testing.T) {
+	t.Parallel()
+
+	// apimeta.SetStatusCondition updates an existing condition IN PLACE, so
+	// handing computeStatus the caller's own slice makes every write land in
+	// the caller's "before" snapshot as well.
+	//
+	// The damage is entirely silent. updateStatus compares the previous status
+	// against the computed one to avoid a status-write/watch/reconcile hot
+	// loop; if the two share a backing array, that comparison can never see a
+	// condition-only change, and every such transition is computed and then
+	// thrown away — MetricsRegistered flipping when prometheus-operator
+	// appears, AutoscalingReady, CanaryHealthy, and every reason or message
+	// change. The same aliasing made the Ready transition undetectable, which
+	// silently retired the RolloutComplete event.
+	md := cuStatusMD()
+	obs := cuObserved(cuDeployment(3, 3, 3, 3), 3)
+
+	prev := computeStatus(md, obs, v1alpha1.ModelDeploymentStatus{})
+	if len(prev.Conditions) == 0 {
+		t.Fatal("no conditions were produced; the fixture is wrong")
+	}
+
+	// A sentinel that computeStatus is guaranteed to overwrite in its own
+	// output. It must survive in prev.
+	const sentinel = "SentinelReasonThatMustSurvive"
+	for i := range prev.Conditions {
+		prev.Conditions[i].Reason = sentinel
+	}
+
+	next := computeStatus(md, obs, prev)
+
+	for i, c := range prev.Conditions {
+		if c.Reason != sentinel {
+			t.Fatalf("computeStatus mutated the status it was given: prev.Conditions[%d] (%s) "+
+				"reason became %q. The no-op guard in updateStatus compares against this "+
+				"slice, so condition-only changes are silently never persisted.",
+				i, c.Type, c.Reason)
+		}
+	}
+	if len(next.Conditions) > 0 && &next.Conditions[0] == &prev.Conditions[0] {
+		t.Error("computeStatus returned a status sharing prev's backing array")
+	}
+}
+
 func TestStatusConditionTransitionTimesDoNotChurn(t *testing.T) {
 	t.Parallel()
 

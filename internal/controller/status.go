@@ -102,7 +102,22 @@ func computeStatus(
 		// NOT the target.
 		StableRevision:   primaryRevision,
 		LastGoodRevision: prev.LastGoodRevision,
-		Conditions:       prev.Conditions,
+		// COPIED, not aliased. apimeta.SetStatusCondition updates an existing
+		// condition through &conditions[i], i.e. in place — so sharing the
+		// backing array with prev would make every condition write land in the
+		// caller's "before" snapshot too.
+		//
+		// Two things break when it does, and both are silent. The caller's
+		// no-op guard (DeepEqual(latest.Status, newStatus), which exists to stop
+		// a status-write/watch/reconcile hot loop) could never see a
+		// CONDITION-ONLY change, so any transition unaccompanied by a scalar
+		// field moving — MetricsRegistered flipping when prometheus-operator is
+		// installed, AutoscalingReady, CanaryHealthy, every reason and message
+		// change — was computed and then dropped. And the Ready transition that
+		// drives the RolloutComplete event was read from an array that had
+		// already been updated, so wasReady always equalled nowReady and the
+		// event stopped firing after the first reconcile.
+		Conditions: append([]metav1.Condition(nil), prev.Conditions...),
 	}
 
 	// Replica counters SUM both variants.
@@ -588,6 +603,33 @@ func setInvalidSpec(status *inferencev1alpha1.ModelDeploymentStatus, generation 
 		Message:            msg,
 		ObservedGeneration: generation,
 	})
+
+	// Everything else is seeded as Unknown, and only if it is not already set.
+	//
+	// The API's contract (see api/v1alpha1/conditions.go) is that EVERY
+	// condition is reported from the first reconcile, so that a consumer can
+	// tell "not yet evaluated" from "evaluated and false". A terminal failure
+	// on the very first reconcile is precisely the case where nothing else ever
+	// gets a chance to run, so without this it is also the one case where the
+	// contract was broken — seven of the nine types simply absent, and a
+	// consumer polling for, say, ModelReady=False waiting forever on a
+	// condition that will never appear.
+	//
+	// Unknown is the honest value: the spec could not be used, so nothing about
+	// the workload was evaluated.
+	for _, t := range inferencev1alpha1.AllConditionTypes() {
+		if apimeta.FindStatusCondition(status.Conditions, t) != nil {
+			continue
+		}
+		setCondition(status, metav1.Condition{
+			Type:               t,
+			Status:             metav1.ConditionUnknown,
+			Reason:             inferencev1alpha1.ReasonInvalidSpec,
+			Message:            "Not evaluated: " + msg,
+			ObservedGeneration: generation,
+		})
+	}
+
 	status.Phase = inferencev1alpha1.PhaseDegraded
 }
 
@@ -620,5 +662,5 @@ func pluralReplicas(n int32) string {
 
 // endpointFor renders the published in-cluster endpoint.
 func endpointFor(md *inferencev1alpha1.ModelDeployment) string {
-	return naming.Endpoint(md.Name, md.Namespace)
+	return naming.Endpoint(md.Name, md.Namespace, md.Spec.Serving.Port)
 }

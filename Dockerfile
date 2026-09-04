@@ -1,5 +1,13 @@
-# Build the manager binary
-FROM golang:1.26 AS builder
+# Build the manager binary.
+#
+# --platform=$BUILDPLATFORM pins the builder stage to the HOST's architecture
+# and cross-compiles to $TARGETARCH below, instead of running the whole Go
+# toolchain under QEMU: emulated builds are an order of magnitude slower, and
+# nothing here needs CGO. Dockerfile.shim, Dockerfile.fakeengine and
+# Dockerfile.loadgen all do this already; this one was the outlier, which is
+# invisible on an amd64 runner and painful on an arm64 laptop building for
+# linux/amd64. `make docker-buildx` existed largely to sed this line in.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 

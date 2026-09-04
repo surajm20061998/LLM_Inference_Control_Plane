@@ -52,7 +52,7 @@ spec:
                 # Looked up by JMESPath, not by position. Chainsaw compares arrays
                 # element by element BY INDEX, and status.conditions[0] is SpecValid —
                 # so a positional assertion here silently checks the wrong condition.
-                (conditions[?type == 'Ready'])[0].status: "True"
+                (conditions[?type == 'Ready'] | [0].status): "True"
 
     - name: the-scale-subresource-is-readable
       try:
@@ -113,7 +113,7 @@ spec:
                 name: hpa-demo
               status:
                 currentReplicas: 1
-                (conditions[?type == 'AbleToScale'])[0].status: "True"
+                (conditions[?type == 'AbleToScale'] | [0].status): "True"
 
     - name: the-hpa-can-write-back
       try:

@@ -80,7 +80,7 @@ spec:
                 # Looked up by JMESPath, not by position. Chainsaw compares arrays
                 # element by element BY INDEX, and status.conditions[0] is SpecValid —
                 # so a positional assertion here silently checks the wrong condition.
-                (conditions[?type == 'CanaryHealthy'])[0].status: "True"
+                (conditions[?type == 'CanaryHealthy'] | [0].status): "True"
         - error:
             # Removed, not scaled to zero. A Deployment left at zero keeps its
             # ReplicaSets and keeps the canary's llmcp_shim_info series alive

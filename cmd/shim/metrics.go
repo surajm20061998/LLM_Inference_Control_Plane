@@ -62,8 +62,8 @@ type metrics struct {
 	ttft        prometheus.Observer
 	tpot        prometheus.Observer
 	outTokens   prometheus.Counter
-	inFlight    prometheus.Gauge
-	queueDepth  prometheus.Gauge
+	inFlight    prometheus.GaugeFunc
+	queueDepth  prometheus.GaugeFunc
 	upstreamErr *prometheus.CounterVec
 
 	// concurrency mirrors the engine's --parallel and is the subtrahend in the
@@ -116,16 +116,7 @@ func newMetrics(cfg config) *metrics {
 			Help:        "Generated tokens observed on streamed responses.",
 			ConstLabels: constLabels,
 		}),
-		inFlight: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name:        llmcpmetrics.RequestsInFlight,
-			Help:        "Inference requests currently being proxied.",
-			ConstLabels: constLabels,
-		}),
-		queueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name:        llmcpmetrics.QueueDepth,
-			Help:        "In-flight requests beyond the engine's concurrency, i.e. waiting for a slot.",
-			ConstLabels: constLabels,
-		}),
+
 		upstreamErr: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        llmcpmetrics.UpstreamErrorsTotal,
 			Help:        "Failures reaching or reading from the engine, as opposed to errors it returned.",
@@ -146,6 +137,29 @@ func newMetrics(cfg config) *metrics {
 		ConstLabels: constLabels,
 	})
 	m.ttft, m.tpot = ttft, tpot
+
+	// PULLED at scrape time, not pushed on every begin/end.
+	//
+	// The push form — atomic Add, then Gauge.Set of the result — is two
+	// independent steps, so two concurrent requests can interleave such that the
+	// OLDER count is written last and the gauge stays above the true value until
+	// the next request happens to arrive. There is no data race for -race to
+	// find, because Gauge.Set is internally atomic; only the pair is not.
+	//
+	// It is not a cosmetic drift: llmcp_inference_queue_depth is the built-in
+	// autoscaler's scaling signal, and a queue depth stuck above zero on an idle
+	// deployment holds replicas up indefinitely. Deriving both gauges from the
+	// one atomic at collection time makes the lost update impossible.
+	m.inFlight = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:        llmcpmetrics.RequestsInFlight,
+		Help:        "Inference requests currently being proxied.",
+		ConstLabels: constLabels,
+	}, func() float64 { return float64(m.live.Load()) })
+	m.queueDepth = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name:        llmcpmetrics.QueueDepth,
+		Help:        "In-flight requests beyond the engine's concurrency, i.e. waiting for a slot.",
+		ConstLabels: constLabels,
+	}, func() float64 { return float64(max(m.live.Load()-m.concurrency, 0)) })
 
 	info := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: llmcpmetrics.ShimInfo,
@@ -173,8 +187,8 @@ func newMetrics(cfg config) *metrics {
 	// those must produce different verdicts, because one is a pass and the
 	// other must never be. Initialising the series here means an idle-but-
 	// healthy variant reports honest zeroes from the first scrape.
-	m.inFlight.Set(0)
-	m.queueDepth.Set(0)
+	// inFlight and queueDepth need no priming: a GaugeFunc is evaluated on every
+	// scrape, so both report an honest 0 from the first one.
 	m.outTokens.Add(0)
 	for _, op := range []string{
 		llmcpmetrics.OperationChat,
@@ -186,21 +200,14 @@ func newMetrics(cfg config) *metrics {
 	return m
 }
 
-// begin records the start of a proxied request and updates the in-flight and
-// queue-depth gauges.
+// begin records the start of a proxied request.
 func (m *metrics) begin() {
-	m.setLive(m.live.Add(1))
+	m.live.Add(1)
 }
 
 // end records the completion of a proxied request.
 func (m *metrics) end() {
-	m.setLive(m.live.Add(-1))
-}
-
-// setLive publishes the in-flight count and the queue depth derived from it.
-func (m *metrics) setLive(n int64) {
-	m.inFlight.Set(float64(n))
-	m.queueDepth.Set(float64(max(n-m.concurrency, 0)))
+	m.live.Add(-1)
 }
 
 // observe records one completed request.

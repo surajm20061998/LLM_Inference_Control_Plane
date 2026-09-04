@@ -577,7 +577,7 @@ func TestEndpointRendersThePublishedURL(t *testing.T) {
 	t.Run("short name", func(t *testing.T) {
 		t.Parallel()
 
-		got := Endpoint(mdName, nsName)
+		got := Endpoint(mdName, nsName, 0)
 		want := "http://demo.prod.svc:8080/v1"
 		if got != want {
 			t.Errorf("Endpoint(%q, %q) = %q, want %q: this exact string is published in status and copied into client configuration by users — changing its shape breaks every client that already resolved it",
@@ -585,13 +585,29 @@ func TestEndpointRendersThePublishedURL(t *testing.T) {
 		}
 	})
 
-	t.Run("uses ServicePort", func(t *testing.T) {
+	t.Run("defaults to ServicePort when the port is unset", func(t *testing.T) {
 		t.Parallel()
 
-		got := Endpoint(mdName, nsName)
+		got := Endpoint(mdName, nsName, 0)
 		if !strings.Contains(got, fmt.Sprintf(":%d/", ServicePort)) {
-			t.Errorf("Endpoint(%q, %q) = %q, which does not contain the ServicePort (%d): the published endpoint must point at the port the Service actually listens on, or every client connection is refused",
+			t.Errorf("Endpoint(%q, %q, 0) = %q, which does not contain the ServicePort (%d): the published endpoint must point at the port the Service actually listens on, or every client connection is refused",
 				mdName, nsName, got, ServicePort)
+		}
+	})
+
+	t.Run("uses the configured serving port", func(t *testing.T) {
+		t.Parallel()
+
+		// The Service listens on spec.serving.port, so the endpoint published
+		// in status has to as well. Hard-coding the constant here produced a
+		// URL that was refused by every client of any deployment that moved
+		// its port — and the failure surfaces in the CLIENT, a long way from
+		// the operator that printed the wrong address.
+		const custom int32 = 9000
+		got := Endpoint(mdName, nsName, custom)
+		if !strings.Contains(got, fmt.Sprintf(":%d/", custom)) {
+			t.Errorf("Endpoint(%q, %q, %d) = %q, which does not contain the configured port",
+				mdName, nsName, custom, got)
 		}
 	})
 
@@ -599,7 +615,7 @@ func TestEndpointRendersThePublishedURL(t *testing.T) {
 		t.Parallel()
 
 		mdName := longName(80, "x")
-		got := Endpoint(mdName, nsName)
+		got := Endpoint(mdName, nsName, 0)
 		want := fmt.Sprintf("http://%s.prod.svc:%d/v1", Service(mdName), ServicePort)
 
 		if got != want {

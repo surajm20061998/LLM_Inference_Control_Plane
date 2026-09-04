@@ -247,7 +247,11 @@ type streamResult struct {
 	chunks   []chatChunk
 	rawLines []string
 	firstAt  time.Duration
-	totalAt  time.Duration
+	// firstContentAt is when the first frame carrying a TOKEN arrived, which
+	// is what TTFT means. It is distinct from firstAt because the role frame
+	// goes out immediately and carries no content.
+	firstContentAt time.Duration
+	totalAt        time.Duration
 }
 
 // readChatStream consumes an SSE body incrementally, timing the first event.
@@ -275,6 +279,10 @@ func readChatStream(t *testing.T, body io.Reader, start time.Time) streamResult 
 		var chunk chatChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			t.Fatalf("decoding chunk %q: %v", payload, err)
+		}
+		if out.firstContentAt == 0 && len(chunk.Choices) > 0 &&
+			chunk.Choices[0].Delta.Content != "" {
+			out.firstContentAt = time.Since(start)
 		}
 		out.chunks = append(out.chunks, chunk)
 	}
@@ -392,15 +400,24 @@ func TestStreamingIsIncremental(t *testing.T) {
 	if want := tokens + 2; len(res.chunks) != want {
 		t.Fatalf("got %d chunks, want %d", len(res.chunks), want)
 	}
-	// The first event must not arrive before the configured TTFT has elapsed.
-	if res.firstAt < ttft {
-		t.Errorf("first chunk arrived after %v, want at least %v", res.firstAt, ttft)
+	// The role frame goes out at once — that is what a real llama.cpp does, and
+	// a stub that delayed it would let a shim which timed the first FRAME
+	// rather than the first TOKEN look correct.
+	if res.firstAt > ttft/2 {
+		t.Errorf("role frame arrived after %v, want promptly: a delayed role frame hides "+
+			"a shim that measures the first frame instead of the first token", res.firstAt)
+	}
+	// TTFT is spent before the first frame that carries CONTENT.
+	if res.firstContentAt < ttft {
+		t.Errorf("first content chunk arrived after %v, want at least %v",
+			res.firstContentAt, ttft)
 	}
 	// And it must arrive well before the stream completes. The remaining
 	// chunks account for ~350ms of sleeps; requiring only 150ms of separation
 	// leaves plenty of slack for a loaded CI machine.
-	if gap := res.totalAt - res.firstAt; gap < 150*time.Millisecond {
-		t.Errorf("first chunk at %v, stream done at %v: response looks buffered", res.firstAt, res.totalAt)
+	if gap := res.totalAt - res.firstContentAt; gap < 150*time.Millisecond {
+		t.Errorf("first content chunk at %v, stream done at %v: response looks buffered",
+			res.firstContentAt, res.totalAt)
 	}
 }
 

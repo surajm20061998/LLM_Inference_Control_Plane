@@ -3,8 +3,21 @@ name: E2E Tests
 on:
   push:
   pull_request:
+  # This job takes up to 40 minutes. Without a manual trigger the only way to
+  # re-run it after fixing something in the environment is to push a commit.
+  workflow_dispatch:
 
 permissions: {}
+
+# One run per ref, and supersede rather than queue.
+#
+# Without this every same-repo pull request runs each workflow TWICE — once for
+# the push to the branch, once for the pull_request event — and pushing a fixup
+# leaves the run for the previous commit burning a runner to report on code
+# nobody is looking at any more. test-e2e.yml alone has timeout-minutes: 40.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   chainsaw:

@@ -378,10 +378,17 @@ func readStream(r io.Reader, start time.Time) (ttft time.Duration, tokens int, e
 
 	for sc.Scan() {
 		line := sc.Bytes()
-		if !bytes.HasPrefix(line, []byte("data: ")) {
+		// The space after the colon is OPTIONAL in the SSE specification. The
+		// shim tolerates its absence deliberately (see cmd/shim/sse.go), and
+		// this parser has to agree: against a server that omits it, requiring
+		// the space makes every stream look like it carried zero tokens, so
+		// loadgen reports 100% errors and exits non-zero while the shim reports
+		// perfectly normal TTFT. The independent cross-check would then
+		// contradict the thing it exists to corroborate.
+		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
-		payload := bytes.TrimPrefix(line, []byte("data: "))
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 		if bytes.Equal(payload, []byte("[DONE]")) {
 			break
 		}
