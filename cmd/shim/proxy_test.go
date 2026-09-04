@@ -64,6 +64,15 @@ func newTestProxy(t *testing.T, upstream string, opts ...func(*config)) (*proxy,
 	return newProxy(cfg, m, discardLogger(), time.Now), m
 }
 
+// roundTripFunc adapts a function into an http.RoundTripper. Tests that are
+// about the proxy's downstream behaviour can provide an exact upstream
+// response without introducing a second loopback server and connection pool.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
 // gather reads one metric family out of the shim's registry.
 func gather(t *testing.T, m *metrics, name string) *dto.MetricFamily {
 	t.Helper()
@@ -235,21 +244,55 @@ func TestProxyRecordsTTFTSeparatelyFromDuration(t *testing.T) {
 func TestProxyStreamsIncrementally(t *testing.T) {
 	// The anti-buffering assertion from the client's side: the first frame must
 	// arrive long before the last. A proxy without FlushInterval: -1 delivers
-	// the whole body at once and this fails.
+	// the whole body at once and this fails. The upstream is an io.Pipe rather
+	// than a second httptest.Server: this test is about downstream flushing, and
+	// an extra loopback connection only adds an unrelated source of transient
+	// EOFs on loaded CI runners.
 	const (
 		ttft   = 50 * time.Millisecond
 		itl    = 60 * time.Millisecond
 		tokens = 5
 	)
-	engine := httptest.NewServer(streamingEngine(ttft, itl, tokens))
-	defer engine.Close()
+	p, _ := newTestProxy(t, "http://engine.test")
+	p.rp.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		reader, writer := io.Pipe()
+		go func() {
+			defer func() { _ = writer.Close() }()
 
-	p, _ := newTestProxy(t, engine.URL)
+			write := func(frame string) bool {
+				_, err := io.WriteString(writer, frame)
+				return err == nil
+			}
+			if !write(`data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n") {
+				return
+			}
+			time.Sleep(ttft)
+			for i := range tokens {
+				if i > 0 {
+					time.Sleep(itl)
+				}
+				if !write(fmt.Sprintf(`data: {"choices":[{"delta":{"content":"t%d"}}]}`+"\n\n", i)) {
+					return
+				}
+			}
+			_ = write("data: [DONE]\n\n")
+		}()
+
+		return &http.Response{
+			Status:        "200 OK",
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": {contentTypeSSE}},
+			Body:          reader,
+			ContentLength: -1,
+			Request:       r,
+		}, nil
+	})
 	shim := httptest.NewServer(p.handler())
 	defer shim.Close()
 
 	start := time.Now()
-	resp, err := http.Post(shim.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	resp, err := shim.Client().Post(
+		shim.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
