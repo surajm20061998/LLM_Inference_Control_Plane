@@ -143,6 +143,8 @@ func TestShimArgsCarryTheMetricIdentity(t *testing.T) {
 		args := shimFrom(t, pod).Args
 
 		want := []string{
+			"--namespace=" + md.Namespace,
+			"--model-deployment=" + md.Name,
 			"--model=qwen3",
 			"--variant=" + string(variant),
 			// Queue depth is derived from this: in-flight requests beyond the

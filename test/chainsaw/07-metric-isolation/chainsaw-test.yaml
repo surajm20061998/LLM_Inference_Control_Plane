@@ -1,0 +1,251 @@
+# Proves that resource identity, rather than the human-facing model name, scopes
+# every automated decision. Five ModelDeployments deliberately use the same
+# model name. Three start canaries together: one emits 100% HTTP 5xx responses,
+# while the healthy resources share its namespace or its name's metric space
+# from a second namespace. Two more enable queue-depth autoscaling, but only one
+# receives load.
+#
+# With the former model-only selectors, all three canary error rates were merged
+# and the hot queue could scale the idle resource. Passing this suite proves the
+# complete producer -> Prometheus -> analysis/autoscaler path is isolated. It
+# also inspects generated SLO series so producer-only label changes cannot pass.
+#
+# Requires kube-prometheus-stack: make monitoring-install
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: metric-isolation
+spec:
+  timeouts:
+    assert: 8m
+    exec: 8m
+  steps:
+    - name: create-identical-model-identities
+      try:
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              peer="${NAMESPACE}-peer"
+              kubectl create namespace "${peer}"
+              kubectl label namespace "${peer}" llmcp.io/e2e=true
+              kubectl -n "${peer}" apply -f peer-modeldeployment.yaml
+        - apply:
+            file: rollout-modeldeployments.yaml
+        - apply:
+            file: scaler-modeldeployments.yaml
+      cleanup:
+        # Step cleanup runs after the whole test, including when a later step
+        # fails. Chainsaw tracks resources applied in its generated namespace;
+        # this explicit cleanup owns the one namespace created by the script.
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              kubectl delete namespace "${NAMESPACE}-peer" --ignore-not-found --wait=false
+
+    - name: all-five-baselines-are-serving
+      try:
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-bad
+              status:
+                phase: Available
+                readyReplicas: 2
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-good
+              status:
+                phase: Available
+                readyReplicas: 2
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-hot
+              status:
+                phase: Available
+                readyReplicas: 1
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-idle
+              status:
+                phase: Available
+                readyReplicas: 1
+        - script:
+            shell: bash
+            timeout: 8m
+            content: |
+              set -euo pipefail
+              peer="${NAMESPACE}-peer"
+              kubectl -n "${peer}" wait --for=jsonpath='{.status.phase}'=Available \
+                modeldeployment/isolation-peer --timeout=8m
+              test "$(kubectl -n "${peer}" get modeldeployment isolation-peer \
+                -o jsonpath='{.status.readyReplicas}')" = "2"
+
+    - name: apply-distinct-load-and-start-three-canaries
+      try:
+        - apply:
+            file: rollout-loads.yaml
+        - apply:
+            file: hot-load.yaml
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              peer="${NAMESPACE}-peer"
+              kubectl -n "${peer}" apply -f peer-load.yaml
+
+              # All three edits create workload revisions. Only isolation-bad
+              # injects errors; the other two change a harmless deterministic
+              # latency while remaining comfortably inside the error-rate gate.
+              kubectl -n "${NAMESPACE}" patch modeldeployment isolation-bad --type=merge -p '
+              {"spec":{"engine":{"env":[
+                {"name":"LLMCP_FAKE_TTFT_MS","value":"60"},
+                {"name":"LLMCP_FAKE_TOKENS","value":"24"},
+                {"name":"LLMCP_FAKE_ERROR_RATE","value":"1"}
+              ]}}}'
+              kubectl -n "${NAMESPACE}" patch modeldeployment isolation-good --type=merge -p '
+              {"spec":{"engine":{"env":[
+                {"name":"LLMCP_FAKE_TTFT_MS","value":"65"},
+                {"name":"LLMCP_FAKE_TOKENS","value":"24"},
+                {"name":"LLMCP_FAKE_ERROR_RATE","value":"0"}
+              ]}}}'
+              kubectl -n "${peer}" patch modeldeployment isolation-peer --type=merge -p '
+              {"spec":{"engine":{"env":[
+                {"name":"LLMCP_FAKE_TTFT_MS","value":"70"},
+                {"name":"LLMCP_FAKE_TOKENS","value":"24"},
+                {"name":"LLMCP_FAKE_ERROR_RATE","value":"0"}
+              ]}}}'
+
+    - name: only-the-regressed-canary-rolls-back
+      try:
+        - assert:
+            timeout: 8m
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-bad
+              status:
+                phase: Available
+                (canary.failedRevision != ''): true
+        - assert:
+            timeout: 8m
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-good
+              status:
+                phase: Available
+        - script:
+            shell: bash
+            timeout: 8m
+            content: |
+              set -euo pipefail
+              peer="${NAMESPACE}-peer"
+              kubectl -n "${peer}" wait --for=jsonpath='{.status.phase}'=Available \
+                modeldeployment/isolation-peer --timeout=8m
+
+              # CanaryHealthy describes an active candidate. Promotion removes
+              # that candidate, so the durable proof is the stable phase plus
+              # the controller's promotion event in each resource's namespace.
+              for namespace in "${NAMESPACE}" "${peer}"; do
+                events=$(kubectl -n "${namespace}" get events \
+                  --field-selector reason=CanaryPromoted -o name)
+                printf '%s\n' "${events}" >&2
+                grep -q . <<< "${events}"
+              done
+
+              rollback_events=$(kubectl -n "${NAMESPACE}" get events \
+                --field-selector reason=CanaryRolledBack -o name)
+              printf '%s\n' "${rollback_events}" >&2
+              grep -q . <<< "${rollback_events}"
+
+    - name: only-the-loaded-resource-scales
+      try:
+        - assert:
+            timeout: 8m
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-hot
+              spec:
+                replicas: 3
+              status:
+                readyReplicas: 3
+                (conditions[?type == 'AutoscalingReady'] | [0].status): "True"
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: isolation-idle
+              spec:
+                replicas: 1
+              status:
+                readyReplicas: 1
+
+    - name: prometheus-and-slo-series-retain-resource-identity
+      try:
+        - script:
+            shell: bash
+            timeout: 2m
+            content: |
+              set -euo pipefail
+              peer="${NAMESPACE}-peer"
+              prom_pod=$(kubectl -n monitoring get pod \
+                -l app.kubernetes.io/name=prometheus \
+                -o jsonpath='{.items[0].metadata.name}')
+              test -n "${prom_pod}"
+
+              prom_query() {
+                kubectl -n monitoring exec "${prom_pod}" -c prometheus -- \
+                  promtool query instant http://localhost:9090 "$1"
+              }
+
+              assert_scoped_series() {
+                local metric=$1 namespace=$2 deployment=$3 output
+                output=$(prom_query "count by (namespace,model_deployment,model) (${metric}{namespace=\"${namespace}\",model_deployment=\"${deployment}\",model=\"shared-stub-model\"})")
+                printf '%s\n' "${output}" >&2
+                test "$(grep -c '=>' <<< "${output}")" = "1"
+                grep -q "namespace=\"${namespace}\"" <<< "${output}"
+                grep -q "model_deployment=\"${deployment}\"" <<< "${output}"
+                grep -q 'model="shared-stub-model"' <<< "${output}"
+                grep -Eq '=> [1-9][0-9]*(\.[0-9]+)? ' <<< "${output}"
+              }
+
+              # Direct producer series prove that the shim itself emits the
+              # identity; this does not rely on ServiceMonitor relabeling.
+              assert_scoped_series llmcp_shim_info "${NAMESPACE}" isolation-bad
+              assert_scoped_series llmcp_shim_info "${NAMESPACE}" isolation-good
+              assert_scoped_series llmcp_shim_info "${NAMESPACE}" isolation-hot
+              assert_scoped_series llmcp_shim_info "${NAMESPACE}" isolation-idle
+              assert_scoped_series llmcp_shim_info "${peer}" isolation-peer
+
+              # Generated SLO outputs must preserve the same identity. A rule
+              # that aggregates by model alone would fail these exact selectors.
+              assert_scoped_series 'llmcp:slo_availability:objective' "${NAMESPACE}" isolation-bad
+              assert_scoped_series 'llmcp:slo_availability:objective' "${NAMESPACE}" isolation-good
+              assert_scoped_series 'llmcp:slo_availability:objective' "${NAMESPACE}" isolation-hot
+              assert_scoped_series 'llmcp:slo_availability:objective' "${NAMESPACE}" isolation-idle
+              assert_scoped_series 'llmcp:slo_availability:objective' "${peer}" isolation-peer
+      catch:
+        - events: {}
+        - describe:
+            apiVersion: inference.llmcp.io/v1alpha1
+            kind: ModelDeployment
+        - podLogs:
+            selector: app.kubernetes.io/name=llmcp

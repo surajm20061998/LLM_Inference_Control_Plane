@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/canary"
 )
 
 // cuGeneration is the ModelDeployment generation used across these tests. It is
@@ -184,6 +185,27 @@ func TestComputeStatusBeforeTheDeploymentExists(t *testing.T) {
 	}
 	if got.LastGoodRevision != "" {
 		t.Errorf("lastGoodRevision = %q, want empty before anything has ever served", got.LastGoodRevision)
+	}
+}
+
+func TestComputeStatusReportsCanaryLadderLength(t *testing.T) {
+	t.Parallel()
+
+	md := cuStatusMD()
+	md.Spec.Rollout.Canary = &v1alpha1.CanarySpec{StepWeights: []int32{25, 50, 75}}
+	obs := cuObserved(cuDeployment(4, 4, 4, 4), 4)
+	obs.Rollout.Output = canary.Output{State: canary.State{
+		Phase:          canary.PhaseWaiting,
+		Revision:       obs.Revision,
+		StableRevision: cuLastGood,
+	}}
+
+	got := computeStatus(md, obs, v1alpha1.ModelDeploymentStatus{LastGoodRevision: cuLastGood})
+	if got.Canary == nil {
+		t.Fatal("canary status is nil for an active canary")
+	}
+	if got.Canary.Steps != 3 {
+		t.Fatalf("canary steps = %d, want 3", got.Canary.Steps)
 	}
 }
 

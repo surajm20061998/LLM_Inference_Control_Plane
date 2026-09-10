@@ -24,9 +24,10 @@ budget for reasons the service cannot act on, and stays green through incidents
 it should have caught.
 
 TTFT is length-independent — it is how long the user waits before anything
-happens. TPOT is the other half, also length-independent. That split is exactly
-why OpenTelemetry's `gen_ai` semantic conventions define the two as separate
-metrics rather than one latency number.
+happens. The shim also records observed gaps between successive content-bearing
+SSE events so operators can distinguish "slow to start" from "slow while
+streaming". Those gaps are not tokenizer-token timing—one event can carry
+multiple tokens—so this operator's latency SLI remains TTFT.
 
 Duration is still measured and still graphed, on a panel titled "NOT the SLI",
 because it is the right number for capacity planning. It is simply not an

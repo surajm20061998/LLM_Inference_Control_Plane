@@ -368,11 +368,16 @@ func TestDashboardConfigMapCarriesTheSidecarLabel(t *testing.T) {
 func emittedSeries() []string {
 	return []string{
 		// Inference metrics, from the shim.
+		llmcpmetrics.RequestsStartedTotal,
 		llmcpmetrics.RequestsTotal,
 		llmcpmetrics.RequestDurationSeconds,
 		llmcpmetrics.TTFTSeconds,
 		llmcpmetrics.TPOTSeconds,
 		llmcpmetrics.OutputTokensTotal,
+		llmcpmetrics.OutputChunksTotal,
+		llmcpmetrics.InterChunkSeconds,
+		llmcpmetrics.ReportedOutputTokensTotal,
+		llmcpmetrics.UsageRequestsTotal,
 		llmcpmetrics.RequestsInFlight,
 		llmcpmetrics.QueueDepth,
 		llmcpmetrics.UpstreamErrorsTotal,
@@ -403,6 +408,8 @@ func emittedSeries() []string {
 		// Recording rules this operator defines.
 		recordTTFTSLI,
 		recordAvailSLI,
+		recordTTFTObjective,
+		recordAvailabilityObjective,
 	}
 }
 
@@ -597,6 +604,44 @@ func TestEveryDashboardPanelQueriesAnEmittedSeries(t *testing.T) {
 
 	if checked == 0 {
 		t.Fatal("no series references were extracted at all; the check is not checking anything")
+	}
+}
+
+func TestWorkloadDashboardQueriesHaveResourceScope(t *testing.T) {
+	t.Parallel()
+	dashboards, err := Dashboards()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range dashboards {
+		for _, expr := range dashboardExprs(t, d.JSON) {
+			if !strings.Contains(expr, "llmcp") {
+				continue
+			}
+			resourceScoped := strings.Contains(expr, `model_deployment="$model_deployment"`) ||
+				strings.Contains(expr, `name="$model_deployment"`)
+			if !strings.Contains(expr, `namespace="$namespace"`) || !resourceScoped {
+				t.Errorf("unscoped workload expression in %s: %s", d.Key, expr)
+			}
+			if strings.Contains(expr, ":ratio_rate") && (strings.Contains(expr, "/ 0.01") || strings.Contains(expr, "/ 0.005")) {
+				t.Errorf("hard-coded SLO budget in %s: %s", d.Key, expr)
+			}
+		}
+	}
+}
+
+func TestDashboardQueriesDoNotFilterByMutableModelName(t *testing.T) {
+	t.Parallel()
+	dashboards, err := Dashboards()
+	if err != nil {
+		t.Fatalf("Dashboards: %v", err)
+	}
+	for _, dashboard := range dashboards {
+		for _, expr := range dashboardExprs(t, dashboard.JSON) {
+			if strings.Contains(expr, `model=~"$model"`) || strings.Contains(expr, `model="$model"`) {
+				t.Errorf("%s filters deployment-scoped evidence by mutable model name: %s", dashboard.Key, expr)
+			}
+		}
 	}
 }
 

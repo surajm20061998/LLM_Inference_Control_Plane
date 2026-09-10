@@ -94,10 +94,11 @@ spec:
               metadata:
                 name: rollback-demo
               status:
-                # Looked up by JMESPath, not by position. Chainsaw compares arrays
-                # element by element BY INDEX, and status.conditions[0] is SpecValid —
-                # so a positional assertion here silently checks the wrong condition.
-                (conditions[?type == 'CanaryHealthy'] | [0].status): "False"
+                # CanaryHealthy=False describes the transition that initiated
+                # rollback. The durable terminal evidence is the stable phase,
+                # sticky failed identity, absent candidate, and audit Event.
+                phase: Available
+                (canary.failedRevision != ''): true
         - error:
             resource:
               apiVersion: apps/v1

@@ -178,6 +178,8 @@ func shimArgs(
 		fmt.Sprintf("--upstream=http://127.0.0.1:%d", naming.EnginePort),
 		"--health-path=" + healthPath,
 		"--model=" + md.Spec.Model.Name,
+		"--namespace=" + md.Namespace,
+		"--model-deployment=" + md.Name,
 		"--variant=" + string(variant),
 		// The engine's concurrency, so the shim can derive queue depth:
 		// in-flight requests beyond this many are, by definition, waiting.

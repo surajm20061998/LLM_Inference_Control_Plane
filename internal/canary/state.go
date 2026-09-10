@@ -121,6 +121,9 @@ type Plan struct {
 	// before the first round.
 	InitialDelay time.Duration
 
+	// Window is the complete post-warm-up lookback required for each rung.
+	Window time.Duration
+
 	// FailureThreshold, ConsecutiveErrorLimit and InconclusiveLimit are the
 	// three disjoint budgets. See counters in verdict.go.
 	FailureThreshold      int32
@@ -133,8 +136,9 @@ type Plan struct {
 	// RequireApproval holds before the final promotion.
 	RequireApproval bool
 
-	// ProgressDeadline bounds how long the canary may sit without ever
-	// becoming available. Zero disables the bound.
+	// ProgressDeadline bounds how long a started candidate may take to establish
+	// a complete ready measurement window. Zero disables the bound. Waiting for
+	// enough replica capacity does not start this clock.
 	//
 	// Without it a canary whose pods never start — a bad image, an unschedulable
 	// resource request, a missing secret — holds in PhaseWaiting forever: no
@@ -143,10 +147,6 @@ type Plan struct {
 	// either, because that guard inspects the PRIMARY Deployment and is skipped
 	// outright while a canary is active.
 	ProgressDeadline time.Duration
-
-	// CanaryReplicaOverride pins the canary's pod count independently of its
-	// weight. Nil means size it proportionally.
-	CanaryReplicaOverride *int32
 }
 
 // State is the canary's persisted position. It round-trips through
@@ -164,6 +164,11 @@ type State struct {
 	// not restarted for it; see the field's doc on the API type.
 	FailedRevision string
 
+	// MetricScopeReady records that this candidate has supplied a complete
+	// window of namespace/name-scoped metrics. It is deliberately persisted so
+	// an operator restart cannot forget a completed migration handshake.
+	MetricScopeReady bool
+
 	// Step is the zero-based index into Plan.Weights.
 	Step int32
 
@@ -172,6 +177,10 @@ type State struct {
 	// canary that spent four minutes pulling a model image has not been warm
 	// for four minutes.
 	AvailableSince time.Time
+
+	// ReadinessTarget binds the evidence clock to a rung and a concrete
+	// Deployment incarnation. It survives operator restarts.
+	ReadinessTarget inferencev1alpha1.CanaryReadinessTarget
 
 	// LastAnalysis is when the previous round ran. Zero means none has.
 	LastAnalysis time.Time
@@ -206,9 +215,8 @@ type Input struct {
 	// TotalReplicas is spec.replicas: the total across both variants.
 	TotalReplicas int32
 
-	// CanaryAvailable reports whether the canary Deployment has at least one
-	// ready pod.
-	CanaryAvailable bool
+	// Deployment is the observed candidate, not merely its availability flag.
+	Deployment DeploymentObservation
 
 	// Round is this pass's analysis outcome, or nil when no round was run —
 	// either because it was not due, or because the canary is not being
@@ -221,8 +229,66 @@ type Input struct {
 	Aborted  bool
 }
 
+// DeploymentObservation contains the Kubernetes readiness evidence without
+// importing a client or Kubernetes workload object into the state machine.
+type DeploymentObservation struct {
+	UID                string
+	Revision           string
+	Generation         int64
+	ObservedGeneration int64
+	Replicas           int32
+	UpdatedReplicas    int32
+	ReadyReplicas      int32
+	AvailableReplicas  int32
+}
+
+// Observe binds readiness to the current rung before either querying metrics or
+// consuming a supplied verdict. A replaced Deployment or a capacity change must
+// collect a fresh warm-up and measurement window even if old pods remain ready.
+func Observe(in Input) Input {
+	if !isActive(in.State.Phase) || in.State.Revision != in.TargetRevision {
+		return in
+	}
+	st := &in.State
+	_, count := splitFor(in, currentWeight(in.Plan, *st))
+	target := inferencev1alpha1.CanaryReadinessTarget{
+		Step: st.Step, Weight: currentWeight(in.Plan, *st),
+		TotalReplicas: in.TotalReplicas, CanaryReplicas: count,
+		Generation: in.Deployment.Generation, DeploymentUID: in.Deployment.UID,
+	}
+	changed := target != st.ReadinessTarget
+	if st.ReadinessTarget.DeploymentUID != "" &&
+		st.ReadinessTarget.DeploymentUID != target.DeploymentUID {
+		// A replacement candidate must prove its own metric schema. In
+		// particular, a delete/recreate under the same name must not inherit a
+		// window collected by the prior object's shims.
+		st.MetricScopeReady = false
+	}
+	ready := count > 0 && in.Deployment.Revision == st.Revision &&
+		in.Deployment.Generation > 0 && in.Deployment.UID != "" &&
+		in.Deployment.ObservedGeneration >= in.Deployment.Generation &&
+		in.Deployment.Replicas == count && in.Deployment.UpdatedReplicas == count &&
+		in.Deployment.ReadyReplicas == count && in.Deployment.AvailableReplicas == count
+	if changed || !ready {
+		st.ReadinessTarget = target
+		st.AvailableSince = time.Time{}
+		st.LastAnalysis = time.Time{}
+		st.consecErr, st.consecInconcl = 0, 0
+		st.Phase = PhaseWaiting
+		in.Round = nil
+	}
+	if ready && st.AvailableSince.IsZero() {
+		st.AvailableSince = in.Now
+	}
+	return in
+}
+
 // Output is the decision. Nothing here has happened yet.
 type Output struct {
+	// Observation is display-only telemetry supplied by the controller after
+	// Next returns. The state machine never reads it or changes verdict budgets.
+	Observation TrafficObservation
+
 	// State is the position to persist.
 	State State
 
@@ -235,6 +301,11 @@ type Output struct {
 	// Primary and Canary are the replica counts implementing DesiredWeight.
 	Primary int32
 	Canary  int32
+
+	// ReadyReplicas and AvailableReplicas are observed candidate counts for
+	// status display, filled by the controller independently of desired counts.
+	ReadyReplicas     int32
+	AvailableReplicas int32
 
 	// RealizedWeight is the share those counts actually achieve. It differs
 	// from DesiredWeight whenever the replica count cannot express it.
@@ -252,6 +323,15 @@ type Output struct {
 
 	// Message is the human-readable form.
 	Message string
+}
+
+// TrafficObservation describes sampled request-start share independently of
+// the desired replica split and operational rollout checks.
+type TrafficObservation struct {
+	Weight *int32
+	At     time.Time
+	Window time.Duration
+	Reason string
 }
 
 // DueForAnalysis reports whether an analysis round should run this pass.
@@ -280,7 +360,7 @@ func DueForAnalysis(now time.Time, plan Plan, state State) bool {
 	if state.AvailableSince.IsZero() {
 		return false
 	}
-	if now.Before(state.AvailableSince.Add(plan.InitialDelay)) {
+	if now.Before(state.AvailableSince.Add(plan.InitialDelay + plan.Window)) {
 		return false
 	}
 	if state.LastAnalysis.IsZero() {
@@ -296,6 +376,7 @@ func DueForAnalysis(now time.Time, plan Plan, state State) bool {
 // no-op — the idempotency property the caller relies on, since a reconcile may
 // run any number of times between two actual changes.
 func Next(in Input) Output {
+	in = Observe(in)
 	st := in.State
 
 	// --- Terminal and external signals, checked before anything else. -------
@@ -315,6 +396,9 @@ func Next(in Input) Output {
 	// on the strength of checks run against a different one. Restarting costs
 	// time; the clever version costs correctness.
 	if isActive(st.Phase) && st.Revision != in.TargetRevision {
+		if _, canary := splitFor(in, weightAt(in.Plan, 0)); canary == 0 {
+			return capacityHold(in)
+		}
 		return start(in, inferencev1alpha1.ReasonCanaryProgressing,
 			"Spec changed mid-rollout; restarting the canary at step 0 for revision "+in.TargetRevision)
 	}
@@ -423,21 +507,37 @@ func begin(in Input) Output {
 	// forever for it to become available, and report "waiting for canary
 	// replicas" with no hint that it never can.
 	if _, c := splitFor(in, weightAt(in.Plan, 0)); c == 0 {
-		return Output{
-			State:          State{Phase: PhaseIdle, FailedRevision: in.State.FailedRevision},
-			Action:         ActionNone,
-			Primary:        in.TotalReplicas,
-			DesiredWeight:  0,
-			RealizedWeight: 0,
-			Reason:         inferencev1alpha1.ReasonInsufficientReplicas,
-			Message: "Replica-based traffic splitting needs at least 2 replicas to divide; " +
-				"spec.replicas is " + itoa(in.TotalReplicas) + ", so revision " + in.TargetRevision +
-				" is being rolled out directly without analysis",
-		}
+		return capacityHold(in)
 	}
 
 	return start(in, inferencev1alpha1.ReasonCanaryProgressing,
 		"Canary started for revision "+in.TargetRevision)
+}
+
+// capacityHold preserves the stable revision until replica routing can assign
+// at least one pod to both variants. StartedAt deliberately remains zero: no
+// candidate exists yet, so this state must not spend the candidate's progress
+// deadline or poison FailedRevision merely because the requested capacity
+// cannot express a split. Once capacity increases, analyse calls start and the
+// deadline begins from that later instant.
+func capacityHold(in Input) Output {
+	return Output{
+		State: State{
+			Phase:          PhaseWaiting,
+			Revision:       in.TargetRevision,
+			StableRevision: in.StableRevision,
+			FailedRevision: in.State.FailedRevision,
+		},
+		Action:         ActionWait,
+		Primary:        in.TotalReplicas,
+		DesiredWeight:  0,
+		RealizedWeight: 0,
+		Reason:         inferencev1alpha1.ReasonInsufficientReplicas,
+		Message: "Replica-based traffic splitting needs at least 2 replicas to divide; " +
+			"spec.replicas is " + itoa(in.TotalReplicas) + ", so revision " + in.TargetRevision +
+			" cannot start; holding the stable revision until capacity is increased",
+		RequeueAfter: in.Plan.Interval,
+	}
 }
 
 // start creates a fresh canary at step zero.
@@ -562,6 +662,19 @@ func analyse(in Input, st State) Output {
 	weight := currentWeight(in.Plan, st)
 	primary, canary := splitFor(in, weight)
 
+	// Capacity is a prerequisite, not candidate progress. There is no canary
+	// Deployment to judge while the split resolves to zero candidate replicas,
+	// so hold without a clock or failure identity. If capacity disappeared
+	// mid-rollout, this also restarts the future attempt at step zero rather
+	// than carrying evidence collected under a different replica topology.
+	if canary == 0 {
+		return capacityHold(in)
+	}
+	if st.StartedAt.IsZero() {
+		return start(in, inferencev1alpha1.ReasonCanaryProgressing,
+			"Capacity is sufficient; starting the canary at step 0 for revision "+in.TargetRevision)
+	}
+
 	hold := func(phase Phase, reason, message string, requeue time.Duration) Output {
 		st.Phase = phase
 		return Output{
@@ -582,41 +695,29 @@ func analyse(in Input, st State) Output {
 	// analyse: a canary with no ready pods produces no traffic, and every
 	// metric over it would be Inconclusive — burning the inconclusive budget on
 	// a condition that is entirely expected.
-	if !in.CanaryAvailable {
-		st.AvailableSince = time.Time{}
-
-		// Bounded, not indefinite. A canary whose pods never become ready is
-		// the most common way a bad release presents — a bad image reference,
-		// an unschedulable resource request, a model file that will not parse —
-		// and none of it produces a verdict, because no analysis round is ever
-		// due over a canary that serves no traffic. Holding here forever leaves
-		// the rollout wedged with no budget spent and no rollback, and the
-		// controller's stall guard cannot rescue it: that guard reads the
-		// PRIMARY Deployment and is skipped entirely while a canary is active.
-		if in.Plan.ProgressDeadline > 0 && !st.StartedAt.IsZero() &&
-			in.Now.Sub(st.StartedAt) > in.Plan.ProgressDeadline {
-			return rollback(in, st, inferencev1alpha1.ReasonCanaryProgressDeadlineExceeded,
-				"Canary replicas never became available within "+
-					in.Plan.ProgressDeadline.String()+"; rolling back")
-		}
-
-		return hold(PhaseWaiting, inferencev1alpha1.ReasonCanaryProgressing,
-			"Waiting for canary replicas to become available", in.Plan.Interval)
+	// Bound fresh evidence acquisition from the original start, including
+	// readiness flaps that repeatedly restart the warm-up clock.
+	if st.LastAnalysis.IsZero() && in.Plan.ProgressDeadline > 0 && !st.StartedAt.IsZero() &&
+		!in.Now.Before(st.StartedAt.Add(in.Plan.ProgressDeadline)) &&
+		(st.AvailableSince.IsZero() || in.Now.Before(st.AvailableSince.Add(in.Plan.InitialDelay+in.Plan.Window))) {
+		return rollback(in, st, inferencev1alpha1.ReasonCanaryProgressDeadlineExceeded,
+			"Canary did not establish a complete ready measurement window within "+in.Plan.ProgressDeadline.String()+"; rolling back")
 	}
-
 	if st.AvailableSince.IsZero() {
-		st.AvailableSince = in.Now
+		reason := inferencev1alpha1.ReasonCanaryProgressing
+		message := "Waiting for the current canary generation and all planned replicas to become ready and available"
+		return hold(PhaseWaiting, reason, message, in.Plan.Interval)
 	}
 
-	warmUntil := st.AvailableSince.Add(in.Plan.InitialDelay)
+	warmUntil := st.AvailableSince.Add(in.Plan.InitialDelay + in.Plan.Window)
 	if in.Now.Before(warmUntil) {
 		return hold(PhaseProgressing, inferencev1alpha1.ReasonCanaryProgressing,
-			"Warming up before the first analysis round", warmUntil.Sub(in.Now))
+			"Waiting for warm-up and a full measurement window for this rung", warmUntil.Sub(in.Now))
 	}
 
 	// No round was supplied: the caller decided it was not due. Come back when
 	// it is.
-	if in.Round == nil {
+	if in.Round == nil || !DueForAnalysis(in.Now, in.Plan, st) {
 		return hold(PhaseProgressing, inferencev1alpha1.ReasonCanaryProgressing,
 			"Canary is progressing", nextAnalysisIn(in, st))
 	}
@@ -700,7 +801,9 @@ func advance(in Input, st State) Output {
 	}
 
 	st.Step++
-	st.Phase = PhaseProgressing
+	st.Phase = PhaseWaiting
+	st.AvailableSince = time.Time{}
+	st.LastAnalysis = time.Time{}
 	weight := currentWeight(in.Plan, st)
 	primary, canary := splitFor(in, weight)
 
@@ -778,10 +881,10 @@ func rollback(in Input, st State, reason, message string) Output {
 	}
 }
 
-// splitFor distributes the total replica count for a weight, honouring an
-// explicit canary size.
+// splitFor implements Replica routing: capacity and configured share are the
+// same mechanism, so a fixed candidate count cannot override a ladder.
 func splitFor(in Input, weight int32) (primary, canary int32) {
-	return CanaryReplicas(in.TotalReplicas, weight, in.Plan.CanaryReplicaOverride)
+	return Split(in.TotalReplicas, weight)
 }
 
 // weightAt returns the ladder's weight at an index, clamped into range.

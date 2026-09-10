@@ -154,8 +154,15 @@ func (p *ScriptedProvider) next(query string) (Step, bool) {
 	}
 
 	if p.Repeat && len(p.steps) > 0 {
-		p.pos = 0
-		return p.next(query)
+		// Only positional answers can repeat here: matching standing answers
+		// were already checked above. An all-matched script has no fallback,
+		// so recursing from its start would never terminate for a new query.
+		for i, s := range p.steps {
+			if s.Match == "" {
+				p.pos = i + 1
+				return s, true
+			}
+		}
 	}
 	return Step{}, false
 }

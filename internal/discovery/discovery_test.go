@@ -270,3 +270,37 @@ func TestStaticProber(t *testing.T) {
 		t.Fatalf("err = %v, want %v", err, boom)
 	}
 }
+
+func TestAggregatedDiscoveryDoesNotHideFailuresAsAbsence(t *testing.T) {
+	resource := schema.GroupResource{Group: serviceMonitorGVK.Group, Resource: pluralSMs}
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		absent bool
+	}{
+		{"not found", apierrors.NewNotFound(resource, ""), true},
+		{"forbidden", apierrors.NewForbidden(resource, "", errors.New("denied")), false},
+		{"unavailable", apierrors.NewServiceUnavailable("discovery unavailable"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dc := newCounting(nil)
+			dc.err = &discovery.ErrGroupDiscoveryFailed{Groups: map[schema.GroupVersion]error{
+				serviceMonitorGVK.GroupVersion(): tc.cause,
+			}}
+			prober := NewFor(dc)
+			for range 2 {
+				present, err := prober.Has(context.Background(), serviceMonitorGVK)
+				if present || (err == nil) != tc.absent {
+					t.Fatalf("Has = (%v, %v), want absent=%v", present, err, tc.absent)
+				}
+			}
+			wantCalls := 2
+			if tc.absent {
+				wantCalls = 1
+			}
+			if dc.calls != wantCalls {
+				t.Fatalf("discovery calls = %d, want %d", dc.calls, wantCalls)
+			}
+		})
+	}
+}

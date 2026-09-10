@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ladder-load
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: localhost:5001/llmcp-loadgen:dev
+          imagePullPolicy: Always
+          args:
+            - --url=http://ladder-demo:8080
+            - --model=stub-model
+            - --duration=12m
+            - --concurrency=8
+            - --tokens=24
+            # Replica routing balances connections. Reusing them would pin the
+            # generators to a subset of pods for the entire evidence window.
+            - --keepalive=false
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

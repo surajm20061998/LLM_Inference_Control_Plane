@@ -18,6 +18,7 @@ package analysis
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
@@ -62,6 +63,9 @@ func Query(m inferencev1alpha1.AnalysisMetric, qc QueryContext) (string, error) 
 
 // builtinQuery renders one of the named built-ins.
 func builtinQuery(b inferencev1alpha1.BuiltinMetric, qc QueryContext) (string, error) {
+	if err := validateIdentity(qc); err != nil {
+		return "", err
+	}
 	sel := selector(qc)
 
 	switch b {
@@ -95,11 +99,25 @@ func builtinQuery(b inferencev1alpha1.BuiltinMetric, qc QueryContext) (string, e
 
 	case inferencev1alpha1.MetricOutputTokenRate:
 		return fmt.Sprintf("sum(rate(%s{%s}[%s]))",
-			llmcpmetrics.OutputTokensTotal, sel, qc.Window), nil
+			llmcpmetrics.ReportedOutputTokensTotal, sel, qc.Window), nil
+
+	case inferencev1alpha1.MetricOutputChunkRate:
+		return fmt.Sprintf("sum(rate(%s{%s}[%s]))",
+			llmcpmetrics.OutputChunksTotal, sel, qc.Window), nil
 
 	default:
 		return "", fmt.Errorf("unknown builtin metric %q", b)
 	}
+}
+
+// UsageSamplesQuery counts usage-bearing completions in a variant's window.
+// increase() can be fractional through scrape extrapolation, so the configured
+// floor is applied without rounding samples upward.
+func UsageSamplesQuery(qc QueryContext) (string, error) {
+	if err := validateIdentity(qc); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sum(increase(%s{%s}[%s]))", llmcpmetrics.UsageRequestsTotal, selector(qc), qc.Window), nil
 }
 
 // AutoscalingQuery renders the fleet-wide query the built-in autoscaler tracks.
@@ -124,6 +142,9 @@ func builtinQuery(b inferencev1alpha1.BuiltinMetric, qc QueryContext) (string, e
 // number, but summing an instantaneous gauge would not: it would sample
 // whichever microsecond each scrape happened to land on.
 func AutoscalingQuery(metric inferencev1alpha1.AutoscalingMetric, qc QueryContext) (string, error) {
+	if err := validateIdentity(qc); err != nil {
+		return "", err
+	}
 	var name string
 	switch metric {
 	case inferencev1alpha1.AutoscalingQueueDepth:
@@ -138,9 +159,20 @@ func AutoscalingQuery(metric inferencev1alpha1.AutoscalingMetric, qc QueryContex
 		name, fleetSelector(qc), qc.Window), nil
 }
 
-// fleetSelector pins the model but not the variant.
+// fleetSelector pins only resource identity. A model update intentionally leaves
+// the stable primary serving the previous model, so filtering by the candidate's
+// model name would erase the primary's evidence and part of fleet demand.
 func fleetSelector(qc QueryContext) string {
-	return fmt.Sprintf(`%s=%q`, llmcpmetrics.LabelModel, qc.Model)
+	return fmt.Sprintf(`%s=%q,%s=%q`,
+		llmcpmetrics.LabelNamespace, qc.Namespace,
+		llmcpmetrics.LabelModelDeployment, qc.ModelDeployment)
+}
+
+func validateIdentity(qc QueryContext) error {
+	if strings.TrimSpace(qc.Namespace) == "" || strings.TrimSpace(qc.ModelDeployment) == "" {
+		return fmt.Errorf("metric queries require namespace and ModelDeployment identity")
+	}
+	return nil
 }
 
 // RequestRateQuery is the traffic gate's query: requests per second for one
@@ -150,9 +182,12 @@ func fleetSelector(qc QueryContext) string {
 // check — it is the precondition every other check depends on. A canary that
 // received no traffic has not been tested, and running the latency comparison
 // against it produces a confident answer about nothing.
-func RequestRateQuery(qc QueryContext) string {
+func RequestRateQuery(qc QueryContext) (string, error) {
+	if err := validateIdentity(qc); err != nil {
+		return "", err
+	}
 	return fmt.Sprintf("sum(rate(%s{%s}[%s]))",
-		llmcpmetrics.RequestsTotal, selector(qc), qc.Window)
+		llmcpmetrics.RequestsTotal, selector(qc), qc.Window), nil
 }
 
 // RatioQuery divides a canary query by the same query against the primary.
@@ -205,15 +240,13 @@ func errorRateQuery(qc QueryContext) string {
 
 // selector renders the label matcher shared by every built-in.
 //
-// Both labels are always present. Omitting `variant` would merge the canary's
+// Resource identity and variant are always present. Omitting `variant` would merge the canary's
 // series with the primary's, which for a comparison between the two is not an
 // imprecision but an inversion — the canary would be measured partly against
 // itself, and a regression would be diluted by exactly the traffic it was
 // supposed to be detected in.
 func selector(qc QueryContext) string {
-	return fmt.Sprintf(`%s=%q,%s=%q`,
-		llmcpmetrics.LabelModel, qc.Model,
-		llmcpmetrics.LabelVariant, qc.Variant)
+	return fleetSelector(qc) + fmt.Sprintf(`,%s=%q`, llmcpmetrics.LabelVariant, qc.Variant)
 }
 
 // substitute expands the template variables allowed in a raw query.
@@ -225,14 +258,27 @@ func selector(qc QueryContext) string {
 // that a plain string replacement simply leaves in place for Prometheus to
 // reject clearly.
 func substitute(query string, qc QueryContext) string {
+	// Identity variables are escaped CONTENTS for double-quoted PromQL label
+	// strings, for example namespace="{{.Namespace}}". They are not complete
+	// literals or safe substitutions in regex/unquoted expression positions.
+	// Custom PromQL remains user-authored and is not automatically isolated.
 	return strings.NewReplacer(
-		"{{.Model}}", qc.Model,
-		"{{.Variant}}", qc.Variant,
+		"{{.Namespace}}", labelContents(qc.Namespace),
+		"{{.ModelDeployment}}", labelContents(qc.ModelDeployment),
+		"{{.Model}}", labelContents(qc.Model),
+		"{{.Variant}}", labelContents(qc.Variant),
 		"{{.Window}}", qc.Window,
 		// Tolerated spellings. Someone will write them, and failing on a space
 		// inside a brace would be a poor use of everybody's afternoon.
-		"{{ .Model }}", qc.Model,
-		"{{ .Variant }}", qc.Variant,
+		"{{ .Namespace }}", labelContents(qc.Namespace),
+		"{{ .ModelDeployment }}", labelContents(qc.ModelDeployment),
+		"{{ .Model }}", labelContents(qc.Model),
+		"{{ .Variant }}", labelContents(qc.Variant),
 		"{{ .Window }}", qc.Window,
 	).Replace(query)
+}
+
+func labelContents(value string) string {
+	quoted := strconv.Quote(value)
+	return quoted[1 : len(quoted)-1]
 }

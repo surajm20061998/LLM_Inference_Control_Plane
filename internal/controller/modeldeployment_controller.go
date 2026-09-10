@@ -57,7 +57,7 @@ const revisionHistoryLimit int32 = 10
 //
 // The reconcile loop is deliberately thin: fetch, plan, apply, observe, report.
 // All the logic worth testing lives in pure functions (buildChildren,
-// computeStatus, revision.Hash, engine.Profile.Build) that take no client and
+// computeStatus, revision.NewSnapshot, engine.Profile.Build) that take no client and
 // no clock, so the bulk of the test suite needs neither an API server nor
 // wall-clock waiting.
 type ModelDeploymentReconciler struct {
@@ -161,6 +161,9 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
+	if err := validateCanaryRouting(&md.Spec); err != nil {
+		return r.failTerminally(ctx, &md, err)
+	}
 	prof, err := engine.Get(md.Spec.Engine.Type)
 	if err != nil {
 		return r.failTerminally(ctx, &md, err)
@@ -169,10 +172,10 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return r.failTerminally(ctx, &md, err)
 	}
 
-	rev := revision.Hash(&md.Spec)
-
-	if err := r.recordRevision(ctx, &md, rev); err != nil {
-		return ctrl.Result{}, fmt.Errorf("recording revision: %w", err)
+	resolvedSpec := resolvedRevisionSpec(&md, prof, r.renderOptions())
+	snapshot, err := revision.NewSnapshot(&resolvedSpec)
+	if err != nil {
+		return r.failTerminally(ctx, &md, err)
 	}
 
 	primaryDep, err := r.deploymentFor(ctx, &md, naming.PrimaryDeployment(md.Name))
@@ -182,6 +185,31 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	canaryDep, err := r.canaryDeploymentFor(ctx, &md)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// The v2 payload deliberately has a different wire identity from legacy
+	// history. On an operator upgrade that fact alone must not look like a user
+	// changed the workload: doing so would restart an active canary, retry a
+	// sticky failed revision, or launch a new steady-state rollout. Reuse the
+	// persisted legacy identity only after the migration resolver proves that
+	// its stored payload and matching live workload describe today's target.
+	rev, adoptedLegacy, holdLegacy, err := r.targetRevisionForMigration(
+		ctx, &md, prof, resolvedSpec, snapshot.Revision, primaryDep, canaryDep)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolving revision migration: %w", err)
+	}
+	if holdLegacy && !annotationTrue(&md, naming.AnnoAbort) {
+		if err := r.holdLegacyTelemetryMigration(ctx, &md, rev); err != nil {
+			return ctrl.Result{}, err
+		}
+		// This is an intentional operator-action hold, not a transient failure.
+		// No timer is needed: changing the abort annotation wakes the watch.
+		return ctrl.Result{}, nil
+	}
+	if !adoptedLegacy {
+		if err := r.recordRevision(ctx, &md, rev, snapshot.Raw); err != nil {
+			return ctrl.Result{}, fmt.Errorf("recording revision: %w", err)
+		}
 	}
 
 	// Autoscaling runs BEFORE the rollout is planned, so a scale decision and
@@ -200,7 +228,7 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// plain rolling update.
 	plan := r.planRollout(ctx, &md, rev, primaryDep, canaryDep)
 
-	desired, err := r.renderRollout(ctx, &md, prof, rev, plan)
+	desired, err := r.renderRollout(ctx, &md, prof, resolvedSpec, rev, plan)
 	if err != nil {
 		// A build failure is a spec the controller cannot render. Retrying
 		// cannot fix it, so do not spin.
@@ -261,22 +289,49 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		"canaryRevision", plan.CanaryRevision,
 		"action", plan.Output.Action)
 
-	// RequeueAfter comes from the state machine and the autoscaler as VALUES,
-	// and is zero whenever nothing is time-dependent.
-	//
-	// At rest that means no timer at all: the child Deployments are watched via
-	// Owns(), so every status change — including the Deployment controller
-	// declaring a rollout stalled — wakes this reconciler already. Polling on a
-	// timer would be strictly worse there: slower to react and more API traffic
-	// for nothing.
-	//
-	// Two things are exceptions, and both for the same reason — the passage of
-	// time is not an event any Kubernetes object emits. A canary needs waking
-	// when its analysis interval elapses; the autoscaler needs waking to look
-	// at the load at all. The SHORTER of the two wins, because a timer that
-	// fires too often merely costs a no-op reconcile whereas one that fires too
-	// rarely misses a decision.
-	return ctrl.Result{RequeueAfter: soonest(plan.RequeueAfter, scaling.RequeueAfter)}, nil
+	// Workload watches handle readiness changes. Timers handle rollout analysis,
+	// autoscaling, and optional monitoring discovery/drift; the earliest wins.
+	return ctrl.Result{RequeueAfter: soonest(soonest(plan.RequeueAfter, scaling.RequeueAfter), verdict.RequeueAfter)}, nil
+}
+
+// holdLegacyTelemetryMigration exposes an actionable, durable hold without
+// touching either serving Deployment or any canary evidence. Returning a normal
+// error here would create an endless exponential-backoff loop for a condition
+// only a human can resolve; returning silently would make the paused rollout
+// indistinguishable from a stuck controller.
+func (r *ModelDeploymentReconciler) holdLegacyTelemetryMigration(
+	ctx context.Context,
+	md *inferencev1alpha1.ModelDeployment,
+	revisionID string,
+) error {
+	message := fmt.Sprintf(
+		"Legacy rollout %s is using pre-migration telemetry. Serving workloads, rung, counters, and timestamps are preserved; set %s=true to abort safely before telemetry migration",
+		revisionID, naming.AnnoAbort)
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest inferencev1alpha1.ModelDeployment
+		if err := r.Get(ctx, client.ObjectKeyFromObject(md), &latest); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		status := *latest.Status.DeepCopy()
+		if status.Canary == nil || status.Canary.Revision != revisionID {
+			return fmt.Errorf("legacy rollout state changed while publishing the telemetry migration hold")
+		}
+		status.Canary.MetricScopeReady = false
+		status.Canary.Message = message
+		setCondition(&status, metav1.Condition{
+			Type:               inferencev1alpha1.ConditionMetricScopeReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             inferencev1alpha1.ReasonMetricsScopePending,
+			Message:            message,
+			ObservedGeneration: latest.Generation,
+		})
+		if apiequality.Semantic.DeepEqual(latest.Status, status) {
+			return nil
+		}
+		latest.Status = status
+		return r.Status().Update(ctx, &latest)
+	})
 }
 
 // soonest returns the smallest positive duration, or zero when neither is set.
@@ -303,10 +358,11 @@ func (r *ModelDeploymentReconciler) renderRollout(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
 	prof engine.Profile,
+	targetSpec inferencev1alpha1.ModelDeploymentSpec,
 	target string,
 	plan rollout,
 ) (desiredChildren, error) {
-	primarySpec, err := r.specForRevision(ctx, md, target, plan.PrimaryRevision)
+	primarySpec, err := r.specForRevision(ctx, md, target, plan.PrimaryRevision, targetSpec)
 	if err != nil {
 		return desiredChildren{}, err
 	}
@@ -321,7 +377,7 @@ func (r *ModelDeploymentReconciler) renderRollout(
 		return buildChildren(md, prof, primary, nil, r.renderOptions())
 	}
 
-	canarySpec, err := r.specForRevision(ctx, md, target, plan.CanaryRevision)
+	canarySpec, err := r.specForRevision(ctx, md, target, plan.CanaryRevision, targetSpec)
 	if err != nil {
 		return desiredChildren{}, err
 	}
@@ -337,23 +393,26 @@ func (r *ModelDeploymentReconciler) renderRollout(
 // specForRevision reconstructs the spec a revision was recorded with.
 //
 // The reconstruction is a MERGE, never a wholesale replacement, and the
-// distinction is load-bearing. A ControllerRevision stores only the fields that
-// define a revision — model, engine, serving port and shim — so everything else
-// comes back zero. Assigning it directly would set Replicas to nil, undoing
-// whatever an autoscaler had decided, and clear the rollout settings, turning a
-// rollback into an unintended scale-down at the worst possible moment.
+// distinction is load-bearing. A v2 ControllerRevision stores only the fields
+// that define a workload — model, engine, startup timeout and shim — so
+// everything else comes back zero. Assigning it directly would set Replicas to
+// nil, undoing whatever an autoscaler had decided, and clear the rollout
+// settings, turning a rollback into an unintended scale-down at the worst
+// possible moment.
 //
-// A missing revision falls back to the live spec rather than failing. History
-// can legitimately be gone — pruned, or never recorded because the operator was
-// upgraded mid-rollout — and refusing to render anything would leave a
-// ModelDeployment with no pods at all, which is a far worse outcome than
-// rolling forward.
+// Missing history is an error. Substituting the live candidate would overwrite
+// the stable workload under its old revision label. Returning before applying
+// children preserves existing workloads while history is restored.
 func (r *ModelDeploymentReconciler) specForRevision(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
 	target, want string,
+	resolvedTarget ...inferencev1alpha1.ModelDeploymentSpec,
 ) (inferencev1alpha1.ModelDeploymentSpec, error) {
 	if want == "" || want == target {
+		if len(resolvedTarget) > 0 {
+			return mergeWorkloadSpec(md.Spec, resolvedTarget[0], false), nil
+		}
 		return md.Spec, nil
 	}
 
@@ -363,26 +422,34 @@ func (r *ModelDeploymentReconciler) specForRevision(
 
 	cr, err := r.revisions.Get(ctx, md, want)
 	if apierrors.IsNotFound(err) {
-		logf.FromContext(ctx).Info(
-			"revision history is missing; rendering from the live spec instead",
-			"revision", want)
-		return md.Spec, nil
+		return inferencev1alpha1.ModelDeploymentSpec{}, fmt.Errorf(
+			"revision history %s is missing; refusing to replace the stable workload with the live candidate: %w", want, err)
 	}
 	if err != nil {
 		return inferencev1alpha1.ModelDeploymentSpec{}, fmt.Errorf("reading revision %s: %w", want, err)
 	}
 
-	stored, err := revision.SpecFrom(cr)
+	stored, err := revision.Decode(cr.Data.Raw)
 	if err != nil {
 		return inferencev1alpha1.ModelDeploymentSpec{}, fmt.Errorf("decoding revision %s: %w", want, err)
 	}
-
-	merged := *md.Spec.DeepCopy()
-	merged.Model = stored.Model
-	merged.Engine = stored.Engine
-	merged.Serving.Port = stored.Serving.Port
-	merged.Serving.Shim = stored.Serving.Shim
-	return merged, nil
+	if stored.Legacy() {
+		legacyType := stored.Spec.Engine.Type
+		if legacyType == "" {
+			legacyType = inferencev1alpha1.EngineLlamaCPP
+		}
+		legacyProfile, profileErr := engine.Get(legacyType)
+		if profileErr != nil {
+			return inferencev1alpha1.ModelDeploymentSpec{}, fmt.Errorf(
+				"resolving legacy revision %s: %w", want, profileErr)
+		}
+		stored.Spec, profileErr = r.resolveLegacyRevisionSpec(ctx, md, want, stored.Spec, legacyProfile)
+		if profileErr != nil {
+			return inferencev1alpha1.ModelDeploymentSpec{}, fmt.Errorf(
+				"resolving legacy revision %s: %w", want, profileErr)
+		}
+	}
+	return mergeWorkloadSpec(md.Spec, stored.Spec, stored.Legacy()), nil
 }
 
 // deploymentFor reads one child Deployment by name, tolerating its absence.
@@ -411,6 +478,7 @@ func (r *ModelDeploymentReconciler) recordRevision(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
 	rev string,
+	payload ...[]byte,
 ) error {
 	if r.revisions == nil {
 		r.revisions = &revision.Recorder{Client: r.Client, Scheme: r.Scheme}
@@ -421,7 +489,7 @@ func (r *ModelDeploymentReconciler) recordRevision(
 	// cache-based check reports "new" on every reconcile until it catches up —
 	// which is exactly how an audit trail fills with duplicate entries for one
 	// revision.
-	_, created, err := r.revisions.Record(ctx, md, rev)
+	_, created, err := r.revisions.Record(ctx, md, rev, payload...)
 	if err != nil {
 		return err
 	}
@@ -431,8 +499,14 @@ func (r *ModelDeploymentReconciler) recordRevision(
 			"RecordRevision", fmt.Sprintf("Recorded revision %s", rev))
 	}
 
-	// Never prune the revision currently serving or the rollback target.
-	return r.revisions.Prune(ctx, md, revisionHistoryLimit, rev, md.Status.LastGoodRevision)
+	// A new spec can arrive while a candidate is active. Retain every recorded
+	// identity needed to resume or roll back that rollout, even if its revisions
+	// are older than the normal history limit.
+	keep := []string{rev, md.Status.StableRevision, md.Status.LastGoodRevision}
+	if cs := md.Status.Canary; cs != nil {
+		keep = append(keep, cs.Revision, cs.StableRevision, cs.FailedRevision)
+	}
+	return r.revisions.Prune(ctx, md, revisionHistoryLimit, keep...)
 }
 
 // applyChildren writes the desired child objects with Server-Side Apply.

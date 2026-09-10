@@ -90,15 +90,15 @@ func defaultLlamaArgs() llamaArgs {
 
 func (a llamaArgs) build() []string {
 	args := []string{
-		"--host", "0.0.0.0",
-		"--port", a.port,
+		llamaCPPHostFlag, "0.0.0.0",
+		llamaCPPPortFlag, a.port,
 	}
 	if a.modelPath != "" {
 		args = append(args, "-m", a.modelPath)
 	}
 	args = append(args,
 		"-c", a.ctxSize,
-		"--parallel", a.parallel,
+		llamaCPPParallelFlag, a.parallel,
 		"-t", a.threads,
 		"--metrics",
 		"--alias", a.alias,
@@ -143,10 +143,10 @@ func TestLlamaCPPBuildArgs(t *testing.T) {
 		{
 			name: "extra args land last, verbatim and in order",
 			mutate: func(md *v1alpha1.ModelDeployment) {
-				md.Spec.Engine.ExtraArgs = []string{flagFlashAttn, flagNoMmap, "-c", "8192"}
+				md.Spec.Engine.ExtraArgs = []string{flagFlashAttn, flagNoMmap, "--temp", "0.7"}
 			},
 			wantArgs: func(a *llamaArgs) {
-				a.extra = []string{flagFlashAttn, flagNoMmap, "-c", "8192"}
+				a.extra = []string{flagFlashAttn, flagNoMmap, "--temp", "0.7"}
 			},
 			wantImage: LlamaCPPDefaultImage,
 		},

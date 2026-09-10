@@ -79,9 +79,9 @@ type AnalysisSpec struct {
 	//
 	// Errors are counted separately from failures and are reset by any
 	// successful check, because a Prometheus that is unreachable says nothing
-	// whatsoever about the canary. Rolling back on it would mean a monitoring
-	// outage causes a production rollback — the exact inversion of what the
-	// monitoring is for.
+	// whatsoever about the canary. Provider errors therefore do not spend the
+	// measured-failure budget: the controller holds first, then aborts back to
+	// stable only when this separate consecutive limit is reached.
 	//
 	// +optional
 	// +kubebuilder:default=5
@@ -115,6 +115,14 @@ type AnalysisSpec struct {
 	// +optional
 	// +kubebuilder:default="500m"
 	MinRequestRate *resource.Quantity `json:"minRequestRate,omitempty"`
+
+	// MinUsageSamples is the minimum number of successful responses with
+	// explicit completion-token usage in each variant's measurement window
+	// before output-token-rate can be evaluated. Missing usage is not inferred.
+	// +optional
+	// +kubebuilder:default=20
+	// +kubebuilder:validation:Minimum=1
+	MinUsageSamples *int32 `json:"minUsageSamples,omitempty"`
 
 	// Provider points at the metric backend.
 	// +optional
@@ -194,7 +202,7 @@ type AnalysisProviderSpec struct {
 // AnalysisSpec, so the common cases cannot be got wrong. The Query escape hatch
 // remains for the cases that are not common.
 //
-// +kubebuilder:validation:Enum=ttft-p95;ttft-p99;request-duration-p95;error-rate;success-rate;queue-depth;output-token-rate
+// +kubebuilder:validation:Enum=ttft-p95;ttft-p99;request-duration-p95;error-rate;success-rate;queue-depth;output-token-rate;output-chunk-rate
 type BuiltinMetric string
 
 const (
@@ -220,9 +228,14 @@ const (
 	// MetricQueueDepth is the mean number of requests waiting for a slot.
 	MetricQueueDepth BuiltinMetric = "queue-depth"
 
-	// MetricOutputTokenRate is generated tokens per second — the throughput
-	// signal that reflects work done, rather than requests accepted.
+	// MetricOutputTokenRate is explicit completion-token usage per second from
+	// successful completed responses. MinUsageSamples gates the measurement;
+	// missing usage is never estimated from stream chunks.
 	MetricOutputTokenRate BuiltinMetric = "output-token-rate"
+
+	// MetricOutputChunkRate counts observable content-bearing SSE events per
+	// second. A chunk can contain multiple tokenizer tokens.
+	MetricOutputChunkRate BuiltinMetric = "output-chunk-rate"
 )
 
 // AnalysisMetric is one gate a canary must pass.
@@ -243,8 +256,10 @@ type AnalysisMetric struct {
 
 	// Query is raw PromQL, for checks the built-ins do not cover.
 	//
-	// Two template variables are substituted before execution: {{.Variant}} and
-	// {{.Model}} for the label values, and {{.Window}} for the analysis window.
+	// Identity variables {{.Namespace}}, {{.ModelDeployment}}, {{.Model}} and
+	// {{.Variant}} are substituted as escaped contents for double-quoted label
+	// matchers; {{.Window}} supplies the analysis lookback. Custom queries are
+	// not isolated automatically and must select the resource identity.
 	// A query returning more than one series is an Error, not a silent
 	// first-match — picking arbitrarily from an ambiguous result is how a gate
 	// ends up measuring the wrong pod.
@@ -385,6 +400,35 @@ type CanaryStatus struct {
 	// +optional
 	CurrentWeight int32 `json:"currentWeight,omitempty"`
 
+	// ObservedWeight is the rounded percentage of inference requests started at
+	// canary shims over ObservationWindow. It is absent when evidence is missing,
+	// stale or below the traffic floor. It never drives rollout decisions.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	ObservedWeight *int32 `json:"observedWeight,omitempty"`
+
+	// ObservedAt is the shared Prometheus evaluation timestamp of the last
+	// observation attempt, including attempts that yielded an unknown weight.
+	// +optional
+	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
+
+	// ObservationWindow is the lookback used for the request-start rates.
+	// +optional
+	ObservationWindow *metav1.Duration `json:"observationWindow,omitempty"`
+
+	// ObservationReason explains whether the measurement is available. An
+	// unknown observation does not spend any rollout failure or error budget.
+	// +optional
+	ObservationReason string `json:"observationReason,omitempty"`
+
+	// MetricScopeReady reports whether the controller has observed a complete
+	// analysis window from shims carrying this ModelDeployment's namespace and
+	// name labels. Automatic analysis holds while this is false so metrics from
+	// another resource, or from a pinned legacy shim, cannot drive the rollout.
+	// +optional
+	MetricScopeReady bool `json:"metricScopeReady,omitempty"`
+
 	// Step is the zero-based index into the weight ladder.
 	// +optional
 	Step int32 `json:"step,omitempty"`
@@ -430,6 +474,20 @@ type CanaryStatus struct {
 	//
 	// +optional
 	AvailableSince *metav1.Time `json:"availableSince,omitempty"`
+
+	// ReadinessTarget binds AvailableSince to the current rung, capacity and
+	// candidate Deployment. A change requires fresh warm-up and evidence.
+	// +optional
+	ReadinessTarget CanaryReadinessTarget `json:"readinessTarget,omitempty"`
+
+	// ReadyReplicas is the observed ready candidate count, distinct from the
+	// desired count in ReadinessTarget. Old-generation pods do not satisfy the gate.
+	// +optional
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
+	// AvailableReplicas is the observed available candidate count.
+	// +optional
+	AvailableReplicas int32 `json:"availableReplicas,omitempty"`
 
 	// Message is a human-readable summary of the current state.
 	// +optional
@@ -531,6 +589,14 @@ func (a *AnalysisSpec) ResolvedMinRequestRate() float64 {
 		return float64(defaultMinRequestRateMilli) / 1000
 	}
 	return float64(a.MinRequestRate.MilliValue()) / 1000
+}
+
+// ResolvedMinUsageSamples returns the usage-bearing completion sample floor.
+func (a *AnalysisSpec) ResolvedMinUsageSamples() int32 {
+	if a == nil || a.MinUsageSamples == nil || *a.MinUsageSamples < 1 {
+		return 20
+	}
+	return *a.MinUsageSamples
 }
 
 // CompareToPrimaryEnabled reports whether this metric is evaluated as a ratio

@@ -14,7 +14,11 @@ The figure above was reproduced from the repository's deterministic engine and s
 ## What the demo proves
 
 - A single resource creates a working OpenAI-compatible inference endpoint.
-- Every request passes through the shim that measures TTFT, duration, status, concurrency, and queue depth.
+- Every request passes through the shim that measures request starts, TTFT,
+  inter-content-chunk gaps, duration, status, concurrency, queue depth, and
+  explicit server-reported usage when it is present.
+- Built-in decisions and SLOs are isolated by Kubernetes namespace and
+  ModelDeployment name, even when another deployment serves the same model.
 - A candidate with successful readiness checks and HTTP responses can still fail the rollout on latency.
 - Low traffic, a measured failure, and an unavailable metrics provider are different outcomes.
 - Rollback restores the stable pod template and records the rejected revision so it is not retried forever.
@@ -82,6 +86,12 @@ kubectl get modeldeployment rollback-demo \
   -o jsonpath='{.status.conditions[?(@.type=="MetricsRegistered")].message}{"\n"}'
 ```
 
+During the first candidate window, `MetricScopeReady=False` is expected. It
+becomes true only after every active variant has supplied a complete window of
+metrics carrying this resource's `namespace` and `model_deployment` identity.
+Missing legacy labels hold the rollout without spending failure, error, or
+inconclusive budgets.
+
 ## 4. Inject a healthy latency regression
 
 The stable fake engine emits its first token after 60 ms. Change the candidate to 400 ms while leaving readiness and the HTTP success path intact:
@@ -98,10 +108,14 @@ Watch the control-plane state:
 
 ```bash
 kubectl get modeldeployment rollback-demo -w -o custom-columns=\
-'PHASE:.status.phase,STEP:.status.canary.step,WANT:.status.canary.desiredWeight,CONFIGURED:.status.canary.currentWeight,FAIL:.status.canary.failedChecks,ERROR:.status.canary.consecutiveErrors'
+'PHASE:.status.phase,STEP:.status.canary.step,WANT:.status.canary.desiredWeight,CONFIGURED:.status.canary.currentWeight,OBSERVED:.status.canary.observedWeight,EVIDENCE:.status.canary.observationReason,FAIL:.status.canary.failedChecks,ERROR:.status.canary.consecutiveErrors'
 ```
 
-At the first rung, the four-pod fixture configures three primary replicas and one canary replica. `currentWeight` is therefore 25—the configured replica share, not a measured request percentage.
+At the first rung, the four-pod fixture configures three primary replicas and
+one canary replica. `currentWeight` is therefore 25—the configured replica
+share. `observedWeight` is calculated separately from admitted-request rates
+over the displayed observation window and can differ because Kubernetes
+balances connections. It is informational and never changes a verdict.
 
 ## 5. Observe the automatic rollback
 
@@ -139,7 +153,7 @@ make grafana
 
 In the **LLMCP — Canary** dashboard:
 
-1. choose `stub-model`;
+1. choose namespace `default` and ModelDeployment `rollback-demo`;
 2. use a time range covering the last 15 minutes;
 3. set refresh to 5 seconds;
 4. compare **Traffic weight over time** and **TTFT p95 — canary against primary**;
@@ -216,7 +230,7 @@ make kind-down
 |---|---|
 | `Ready` never becomes `True` | `kubectl describe modeldeployment <name>` and the `ModelReady` condition. |
 | Grafana panels are empty | `MetricsRegistered`, then Prometheus **Status → Targets**. |
-| Canary never advances | `status.canary.checks[*].verdict`; `Inconclusive` commonly means insufficient traffic. |
+| Canary never advances | Inspect `MetricScopeReady`, `status.canary.observationReason`, and `status.canary.checks[*].verdict`; `Inconclusive` commonly means insufficient traffic. |
 | Canary aborts without a failed metric | Inspect `consecutiveErrors` and Prometheus availability. |
 | The load Job cannot pull its image | Run `make loadgen-image`; it is intentionally separate from `dev-images`. |
 | HPA reports `<unknown>` CPU | The serving pod needs a CPU request because utilization is a percentage of the request. |

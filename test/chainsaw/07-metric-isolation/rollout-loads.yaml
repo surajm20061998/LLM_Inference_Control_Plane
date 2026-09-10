@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: isolation-bad-load
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: localhost:5001/llmcp-loadgen:dev
+          imagePullPolicy: Always
+          args:
+            - --url=http://isolation-bad:8080
+            - --model=shared-stub-model
+            - --duration=10m
+            - --concurrency=4
+            - --tokens=24
+            - --keepalive=false
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: isolation-good-load
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: localhost:5001/llmcp-loadgen:dev
+          imagePullPolicy: Always
+          args:
+            - --url=http://isolation-good:8080
+            - --model=shared-stub-model
+            - --duration=10m
+            - --concurrency=4
+            - --tokens=24
+            - --keepalive=false
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

@@ -20,8 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/utils/ptr"
-
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
@@ -66,12 +64,13 @@ func round(v inferencev1alpha1.Verdict) *Round {
 // warmState is a canary that has been running long enough to be analysed.
 func warmState(step int32, mutate ...func(*State)) State {
 	st := State{
-		Phase:          PhaseProgressing,
-		Revision:       revTarget,
-		StableRevision: revStable,
-		Step:           step,
-		StartedAt:      t0,
-		AvailableSince: t0,
+		Phase:           PhaseProgressing,
+		Revision:        revTarget,
+		StableRevision:  revStable,
+		Step:            step,
+		StartedAt:       t0,
+		AvailableSince:  t0,
+		ReadinessTarget: readinessTarget(testPlan(), step, 10),
 	}
 	for _, m := range mutate {
 		m(&st)
@@ -79,18 +78,31 @@ func warmState(step int32, mutate ...func(*State)) State {
 	return st
 }
 
+func readyDeployment(plan Plan, step, total int32) DeploymentObservation {
+	_, count := Split(total, weightAt(plan, step))
+	return DeploymentObservation{UID: "candidate-uid", Revision: revTarget,
+		Generation: 1, ObservedGeneration: 1, Replicas: count,
+		UpdatedReplicas: count, ReadyReplicas: count, AvailableReplicas: count}
+}
+
+func readinessTarget(plan Plan, step, total int32) inferencev1alpha1.CanaryReadinessTarget {
+	d := readyDeployment(plan, step, total)
+	return inferencev1alpha1.CanaryReadinessTarget{Step: step, Weight: weightAt(plan, step),
+		TotalReplicas: total, CanaryReplicas: d.Replicas, Generation: d.Generation, DeploymentUID: d.UID}
+}
+
 // analysed returns an input positioned just after the warm-up, carrying a
 // verdict.
 func analysed(plan Plan, st State, verdict inferencev1alpha1.Verdict, mutate ...func(*Input)) Input {
 	in := Input{
-		Now:             t0.Add(plan.InitialDelay + time.Second),
-		Plan:            plan,
-		State:           st,
-		TargetRevision:  revTarget,
-		StableRevision:  revStable,
-		TotalReplicas:   10,
-		CanaryAvailable: true,
-		Round:           round(verdict),
+		Now:            t0.Add(plan.InitialDelay + plan.Window + time.Second),
+		Plan:           plan,
+		State:          st,
+		TargetRevision: revTarget,
+		StableRevision: revStable,
+		TotalReplicas:  10,
+		Deployment:     readyDeployment(plan, st.Step, 10),
+		Round:          round(verdict),
 	}
 	for _, m := range mutate {
 		m(&in)
@@ -146,13 +158,13 @@ func TestNextTable(t *testing.T) {
 			wantReason: inferencev1alpha1.ReasonNoLastGoodRevision,
 		},
 		{
-			name: "one replica cannot be split, so no canary runs",
+			name: "one replica holds the stable revision until capacity increases",
 			in: Input{
 				Now: t0, Plan: plan,
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 1,
 			},
-			wantAction: ActionNone, wantPhase: PhaseIdle,
-			wantReason: inferencev1alpha1.ReasonInsufficientReplicas,
+			wantAction: ActionWait, wantPhase: PhaseWaiting,
+			wantReason: inferencev1alpha1.ReasonInsufficientReplicas, wantRequeue: plan.Interval,
 		},
 		{
 			name: "an empty ladder promotes immediately",
@@ -183,7 +195,6 @@ func TestNextTable(t *testing.T) {
 				Now: t0.Add(time.Minute), Plan: plan,
 				State:          warmState(0),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: false,
 			},
 			wantAction: ActionWait, wantPhase: PhaseWaiting, wantWeight: 20,
 			wantReason: inferencev1alpha1.ReasonCanaryProgressing, wantRequeue: plan.Interval,
@@ -203,7 +214,6 @@ func TestNextTable(t *testing.T) {
 				}),
 				State:          warmState(0),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: false,
 			},
 			wantAction: ActionRollback, wantPhase: PhaseRollingBack,
 			wantReason: inferencev1alpha1.ReasonCanaryProgressDeadlineExceeded,
@@ -217,7 +227,6 @@ func TestNextTable(t *testing.T) {
 				}),
 				State:          warmState(0),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: false,
 			},
 			wantAction: ActionWait, wantPhase: PhaseWaiting, wantWeight: 20,
 			wantReason: inferencev1alpha1.ReasonCanaryProgressing, wantRequeue: plan.Interval,
@@ -230,7 +239,7 @@ func TestNextTable(t *testing.T) {
 				Now: t0.Add(10 * time.Second), Plan: plan,
 				State:          warmState(0),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: true, Round: round(inferencev1alpha1.VerdictFail),
+				Deployment: readyDeployment(plan, 0, 10), Round: round(inferencev1alpha1.VerdictFail),
 			},
 			wantAction: ActionWait, wantPhase: PhaseProgressing, wantWeight: 20,
 			wantReason:  inferencev1alpha1.ReasonCanaryProgressing,
@@ -241,7 +250,7 @@ func TestNextTable(t *testing.T) {
 		{
 			name:       "a pass advances one rung",
 			in:         analysed(plan, warmState(0), inferencev1alpha1.VerdictPass),
-			wantAction: ActionAdvance, wantPhase: PhaseProgressing, wantStep: 1, wantWeight: 40,
+			wantAction: ActionAdvance, wantPhase: PhaseWaiting, wantStep: 1, wantWeight: 40,
 			wantReason: inferencev1alpha1.ReasonCanaryChecksPassed, wantRequeue: plan.Interval,
 		},
 		{
@@ -340,7 +349,7 @@ func TestNextTable(t *testing.T) {
 				Now: t0, Plan: plan,
 				State:          warmState(2, func(s *State) { s.Phase = PhasePaused }),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: true, Approved: true, Aborted: true,
+				Deployment: readyDeployment(plan, 2, 10), Approved: true, Aborted: true,
 			},
 			wantAction: ActionRollback, wantPhase: PhaseRollingBack, wantStep: 2,
 			wantReason: inferencev1alpha1.ReasonCanaryAborted,
@@ -351,7 +360,7 @@ func TestNextTable(t *testing.T) {
 				Now: t0, Plan: plan,
 				State:          warmState(2, func(s *State) { s.Phase = PhasePaused }),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: true, Approved: true,
+				Deployment: readyDeployment(plan, 2, 10), Approved: true,
 			},
 			wantAction: ActionPromote, wantPhase: PhasePromoting, wantStep: 2, wantWeight: 100, wantRequeue: plan.Interval,
 			wantReason: inferencev1alpha1.ReasonCanaryPromoted,
@@ -364,7 +373,7 @@ func TestNextTable(t *testing.T) {
 				Now: t0.Add(time.Hour), Plan: plan,
 				State:          warmState(2, func(s *State) { s.Phase = PhasePaused }),
 				TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: true,
+				Deployment: readyDeployment(plan, 2, 10),
 			},
 			wantAction: ActionPause, wantPhase: PhasePaused, wantStep: 2, wantWeight: 50,
 			wantReason: inferencev1alpha1.ReasonAwaitingApproval, wantRequeue: 0,
@@ -380,7 +389,7 @@ func TestNextTable(t *testing.T) {
 				Now: t0, Plan: plan,
 				State:          warmState(2, func(s *State) { s.SetCounters(2, 0, 0) }),
 				TargetRevision: revOther, StableRevision: revStable, TotalReplicas: 10,
-				CanaryAvailable: true,
+				Deployment: readyDeployment(plan, 2, 10),
 			},
 			wantAction: ActionStart, wantPhase: PhaseWaiting, wantStep: 0, wantWeight: 20,
 			wantReason: inferencev1alpha1.ReasonCanaryProgressing, wantRequeue: plan.Interval,
@@ -519,19 +528,14 @@ func TestFullLadderPromotes(t *testing.T) {
 	state := out.State
 
 	for i, want := range wantWeights {
-		// The canary becomes available, then the warm-up elapses.
-		now = now.Add(plan.InitialDelay + time.Second)
-
 		in = Input{
 			Now: now, Plan: plan, State: state,
 			TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-			CanaryAvailable: true,
+			Deployment: readyDeployment(plan, state.Step, 10),
 		}
-		if state.AvailableSince.IsZero() {
-			// The first pass records availability; supply it as the controller
-			// would from the canary Deployment's status.
-			in.State.AvailableSince = t0
-		}
+		in = Observe(in)
+		now = now.Add(plan.InitialDelay + plan.Window + time.Second)
+		in.Now = now
 
 		if !DueForAnalysis(in.Now, plan, in.State) {
 			t.Fatalf("round %d: analysis should be due at %v", i, in.Now)
@@ -581,11 +585,17 @@ func TestRollbackOnExactlySecondFailure(t *testing.T) {
 	now := t0.Add(plan.InitialDelay + time.Second)
 
 	step := func(v inferencev1alpha1.Verdict) Output {
-		out := Next(Input{
+		in := Observe(Input{
 			Now: now, Plan: plan, State: state,
 			TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-			CanaryAvailable: true, Round: round(v),
+			Deployment: readyDeployment(plan, state.Step, 10),
 		})
+		if !DueForAnalysis(now, plan, in.State) {
+			now = now.Add(plan.InitialDelay + plan.Window)
+			in.Now = now
+		}
+		in.Round = round(v)
+		out := Next(in)
 		state = out.State
 		now = now.Add(plan.Interval)
 		return out
@@ -618,9 +628,9 @@ func TestNextIsIdempotent(t *testing.T) {
 	inputs := []Input{
 		{Now: t0, Plan: plan, TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10},
 		{Now: t0, Plan: plan, State: warmState(1), TargetRevision: revTarget,
-			StableRevision: revStable, TotalReplicas: 10, CanaryAvailable: true},
+			StableRevision: revStable, TotalReplicas: 10, Deployment: readyDeployment(plan, 1, 10)},
 		{Now: t0, Plan: plan, State: warmState(2, func(s *State) { s.Phase = PhasePaused }),
-			TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10, CanaryAvailable: true},
+			TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10, Deployment: readyDeployment(plan, 2, 10)},
 	}
 
 	for i, in := range inputs {
@@ -657,11 +667,17 @@ func TestWeightsAreMonotonic(t *testing.T) {
 
 	last := int32(0)
 	for range len(plan.Weights) {
-		out := Next(Input{
+		in := Observe(Input{
 			Now: now, Plan: plan, State: state,
 			TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 20,
-			CanaryAvailable: true, Round: round(inferencev1alpha1.VerdictPass),
+			Deployment: readyDeployment(plan, state.Step, 20),
 		})
+		in.Now = now.Add(plan.InitialDelay + plan.Window)
+		in.Round = round(inferencev1alpha1.VerdictPass)
+		out := Next(in)
+		if out.Action != ActionAdvance && out.Action != ActionPromote {
+			t.Fatalf("rung %d did not advance: %+v", state.Step, out)
+		}
 		if out.Action == ActionPromote {
 			break
 		}
@@ -670,7 +686,7 @@ func TestWeightsAreMonotonic(t *testing.T) {
 		}
 		last = out.DesiredWeight
 		state = out.State
-		now = now.Add(plan.Interval)
+		now = in.Now.Add(plan.Interval)
 	}
 }
 
@@ -737,26 +753,16 @@ func TestDueForAnalysis(t *testing.T) {
 	}
 }
 
-func TestCanaryScaleOverrideIsHonoured(t *testing.T) {
+func TestReplicaCapacityFollowsEveryRung(t *testing.T) {
 	t.Parallel()
 
-	// A fixed canary size means the pod is warm before it is measured, instead
-	// of spending the first analysis window of every step loading a model.
-	plan := testPlan(func(p *Plan) { p.CanaryReplicaOverride = ptr.To(int32(2)) })
-
-	out := Next(Input{
-		Now: t0, Plan: plan,
-		TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 10,
-	})
-	if out.Canary != 2 || out.Primary != 8 {
-		t.Fatalf("split = (%d, %d), want (8, 2)", out.Primary, out.Canary)
-	}
-
-	// And it does not change as the weight climbs.
-	state := warmState(0)
-	out = Next(analysed(plan, state, inferencev1alpha1.VerdictPass))
-	if out.Canary != 2 {
-		t.Fatalf("canary replicas = %d after advancing, want a constant 2", out.Canary)
+	plan := testPlan(func(p *Plan) { p.Weights = []int32{25, 50, 75} })
+	for step := range int32(3) {
+		out := Next(Input{Now: t0, Plan: plan, State: warmState(step),
+			TargetRevision: revTarget, StableRevision: revStable, TotalReplicas: 4})
+		if out.Canary != step+1 || out.Primary != 3-step || out.RealizedWeight != plan.Weights[step] {
+			t.Fatalf("rung %d: split = (%d, %d), weight=%d", step, out.Primary, out.Canary, out.RealizedWeight)
+		}
 	}
 }
 

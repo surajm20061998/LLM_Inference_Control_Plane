@@ -23,9 +23,21 @@ it and writes back.
 ## Running
 
 ```bash
-make kind-up dev-images dev-deploy    # cluster + operator
-make e2e-chainsaw                     # all suites
+make e2e-up                           # cluster + stub images + operator
+make loadgen-image monitoring-install # prerequisites for suites 03/04/07/08
+make e2e-chainsaw                     # all non-destructive suites
 make e2e-chainsaw SUITE=05-scale-subresource
+```
+
+Suite `09-observability-resync` deliberately creates and removes the canonical
+Prometheus Operator CRDs. It is excluded from the default set and refuses to run
+unless the current context is a disposable Kind cluster whose name contains
+`observability-resync`. Run it only before installing a monitoring stack:
+
+```bash
+CLUSTER_NAME=llmcp-observability-resync make kind-up
+make dev-deploy
+make e2e-observability-resync
 ```
 
 Every suite uses the **deterministic stub engine**, not llama.cpp. A real model
@@ -39,4 +51,6 @@ produces exactly the latency, token count and failure pattern it is told to.
   polls until an assertion holds or the step times out, which is the only form
   of waiting that does not encode one machine's speed into the test.
 - **One namespace per suite**, created and torn down by Chainsaw, so suites can
-  run in parallel and a failure leaves its evidence behind.
+  run independently. Suite 07 additionally owns and removes one labeled peer
+  namespace. Suite 09 is isolated at the cluster level because CRDs are
+  cluster-scoped.

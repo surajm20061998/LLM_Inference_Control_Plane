@@ -13,7 +13,7 @@
 
 LLMCP turns one `ModelDeployment` into an OpenAI-compatible inference service, then watches the signals Kubernetes readiness cannot see: time to first token, errors, request pressure, and queueing. A candidate can remain healthy and return HTTP 200 while becoming much slower; LLMCP can detect that regression and restore the last known-good revision.
 
-[Quick start](#five-minute-quick-start) · [Architecture](#architecture) · [Canary workflow](#how-a-canary-decision-is-made) · [Use cases](#where-it-fits) · [Current scope](#current-scope-and-limitations) · [Demo guide](docs/demo.md) · [API reference](docs/api.md)
+[Quick start](#five-minute-quick-start) · [Architecture](#architecture) · [Canary workflow](#how-a-canary-decision-is-made) · [Use cases](#where-it-fits) · [Metrics](docs/metrics.md) · [Current scope](#current-scope-and-limitations) · [Demo guide](docs/demo.md) · [API reference](docs/api.md)
 
 </div>
 
@@ -65,7 +65,7 @@ flowchart TB
     reconciler --> serving[ClusterIP serving Service]
     reconciler --> metrics[Headless metrics Service]
     reconciler -. optional .-> monitor[ServiceMonitor and PrometheusRule]
-    reconciler -. installs .-> dashboards[Grafana dashboard ConfigMaps]
+    manager[Manager startup] -. publishes .-> dashboards[Grafana dashboard ConfigMaps]
 
     serving --> primary
     serving -. replica-based share .-> canary
@@ -85,12 +85,12 @@ flowchart TB
     classDef control fill:#ede9fe,stroke:#7c3aed,color:#1f2937
     classDef workload fill:#e0f2fe,stroke:#0284c7,color:#1f2937
     classDef observe fill:#dcfce7,stroke:#16a34a,color:#1f2937
-    class md,reconciler,revision,analysis,autoscaler control
+    class md,reconciler,revision,analysis,autoscaler,manager control
     class primary,canary,pod1,pod2,serving workload
     class metrics,monitor,prometheus,dashboards,grafana observe
 ```
 
-The reconciliation order is visible in [`ModelDeploymentReconciler.Reconcile`](internal/controller/modeldeployment_controller.go): validate the resource, identify and record the revision, sample autoscaling, compute the rollout plan, apply child resources, reconcile observability, then publish status and Events.
+The reconciliation order is visible in [`ModelDeploymentReconciler.Reconcile`](internal/controller/modeldeployment_controller.go): validate the resource, resolve or safely adopt its revision identity, record new history, sample autoscaling, compute the rollout plan, apply child resources, reconcile observability, then publish status and Events. Dashboards are operator-wide assets published once when the [manager starts](cmd/main.go); per-deployment `ServiceMonitor` and `PrometheusRule` resources are reconciled continuously.
 
 ### Request and telemetry path
 
@@ -104,13 +104,14 @@ flowchart LR
     engine -->|streamed SSE| shim
     shim -->|streamed response| client
 
-    shim -->|TTFT, duration, requests,<br/>in-flight, queue depth| endpoint[metrics :9090]
-    engine -. diagnostic metrics .-> endpoint
-    endpoint --> headless[Headless metrics Service]
+    shim -->|request starts, TTFT, inter-chunk gaps,<br/>reported usage, in-flight, queue depth| shimmetrics[shim metrics :9090]
+    engine -. diagnostic metrics .-> enginemetrics[engine metrics :8000/metrics]
+    shimmetrics --> headless[Headless metrics Service]
+    enginemetrics --> headless
     headless --> prometheus[Prometheus]
 ```
 
-The [`cmd/shim`](cmd/shim) reverse proxy measures streaming responses and exports the canonical `llmcp_*` metrics used by analysis and autoscaling. It is rendered as a [Kubernetes native sidecar](internal/controller/shim.go), so readiness includes the measurement path.
+The [`cmd/shim`](cmd/shim) reverse proxy measures streaming responses and exports the canonical `llmcp_*` metrics used by analysis and autoscaling. Every workload series carries `namespace`, `model_deployment`, `model`, and `variant`; automated queries use the first two as resource identity and deliberately do not fall back to legacy model-only data. It is rendered as a [Kubernetes native sidecar](internal/controller/shim.go), so readiness includes the measurement path. The exact telemetry semantics are documented in [Metrics and decision evidence](docs/metrics.md).
 
 ## How a canary decision is made
 
@@ -122,11 +123,12 @@ sequenceDiagram
     participant K as Kubernetes workloads
     participant P as Prometheus
 
-    User->>API: Change model, engine, or serving configuration
-    C->>C: Hash target and record ControllerRevision
+    User->>API: Change model, engine, startup, or shim configuration
+    C->>C: Resolve runtime defaults and record a v2 ControllerRevision
     C->>K: Keep stable primary and create candidate canary
-    K-->>C: Candidate replicas become ready
-    C->>C: Wait for configured warm-up
+    K-->>C: Every candidate replica for this rung becomes ready
+    C->>C: Start a fresh warm-up and full analysis window
+    C->>P: Verify resource-scoped shim identity
     C->>P: Require request-rate evidence and query checks
     P-->>C: Verdict is Pass, Fail, Inconclusive, or Error
     alt Pass
@@ -153,6 +155,52 @@ The analyzer deliberately distinguishes four outcomes:
 
 This behavior is implemented in [`analysis.Analyzer`](internal/analysis/analyzer.go), [`analysis.Evaluate`](internal/analysis/evaluate.go), and the pure [`canary.Next`](internal/canary/state.go) state transition function.
 
+The four results deliberately use three separate budgets:
+
+```mermaid
+flowchart LR
+    sample[Prometheus round] --> classify{Evidence result}
+    classify -->|all checks within bounds| pass[Pass]
+    classify -->|measured regression| fail[Fail budget]
+    classify -->|too little or incomplete evidence| inconclusive[Inconclusive budget]
+    classify -->|provider or query failure| error[Consecutive error budget]
+    pass --> advance[Advance rung or promote]
+    fail -->|threshold reached| rollback[Restore stable revision]
+    fail -->|budget remains| hold1[Hold current rung]
+    inconclusive --> policy[Configured wait, rollback, or promote policy]
+    error -->|below limit| hold2[Hold and retry]
+    error -->|limit reached| rollback
+```
+
+Provider/schema readiness is checked before this classification. A pinned legacy shim or incomplete resource-scoped window holds the candidate under `MetricScopeReady=False` without spending any of the three decision budgets.
+
+### Release lifecycle and restart safety
+
+```mermaid
+flowchart TD
+    first[First specification] --> bootstrap[Roll primary directly]
+    bootstrap --> stable[Record last-good revision]
+    stable --> change[Serving-affecting specification changes]
+    change --> candidate[Create candidate at first rung]
+    candidate --> ready{All candidate replicas ready?}
+    ready -->|no| wait[Wait; do not analyse]
+    wait --> ready
+    ready -->|yes| window[Warm-up plus complete lookback]
+    window --> gates[Scoped operational gates]
+    gates -->|Pass and more rungs| candidate
+    gates -->|Pass at final rung| approval{Approval required?}
+    approval -->|no| promote[Promote candidate]
+    approval -->|yes| pause[Pause for promote or abort annotation]
+    pause -->|promote| promote
+    pause -->|abort| rollback[Restore recorded stable revision]
+    gates -->|Failure or error policy| rollback
+    promote --> stable
+    rollback --> sticky[Remember failed revision]
+    sticky -->|new specification| change
+```
+
+The position, counters, readiness target, metric-schema handshake, and rollback identities live in status rather than controller memory. Leader changes and manager restarts therefore resume the same rollout. Versioned history freezes effective runtime images and defaults, while legacy revision bytes remain decodable by their stored identity. A steady equivalent legacy workload is adopted without inventing a release; a legacy rollout using the old telemetry shape is held unchanged with an explicit abort instruction instead of being restarted under a new hash. Missing or contradictory history fails closed. The wire contract and upgrade behavior are documented in [ADR 0008](docs/adr/0008-versioned-workload-revisions.md).
+
 ### Traffic exposure today
 
 The implemented `Replica` routing mode puts both variants behind one Service and approximates exposure from their replica counts. With four total replicas, the representable configured shares are 25%, 50%, and 75%:
@@ -164,7 +212,7 @@ flowchart LR
     s3 --> promote[Promote candidate<br/>4 primary · 0 canary]
 ```
 
-This is a configured pod ratio, not a measurement of request distribution. Kubernetes balances connections, and clients may reuse them. Exact request-level weights require a routing layer such as Gateway API; that is [planned, not implemented](improvement_plan.md#exact-routing-with-gateway-api).
+`status.canary.currentWeight` is this configured pod ratio, not a measurement of request distribution. Kubernetes balances connections, and clients may reuse them. Once a complete request-start window exists, `status.canary.observedWeight` reports the measured share with its timestamp, window, and an explicit reason when evidence is missing or stale. That observation is display-only: rollout gates still compare operational quality rather than trying to steer from a noisy short-window percentage. Exact request-level weights require a routing layer such as Gateway API; that is [planned, not implemented](improvement_plan.md#request-weighted-routing-with-gateway-api).
 
 ## Demand-aware autoscaling
 
@@ -200,7 +248,7 @@ flowchart LR
     cache --> engine2[llama.cpp]
 ```
 
-OCI delivery is deterministic, cacheable by the container runtime, and usable offline. Hugging Face delivery is convenient for exploration but each new pod downloads into ephemeral storage. The model-source rendering is in [`buildModelStorage`](internal/controller/children.go); PVC delivery is represented in the API but is not implemented by the llama.cpp profile.
+OCI delivery is deterministic, cacheable by the container runtime, and usable offline. Hugging Face delivery is convenient for exploration but each new pod downloads into ephemeral storage. The model-source rendering is in [`buildModelDelivery`](internal/controller/children.go); PVC delivery is represented in the API but is not implemented by the llama.cpp profile.
 
 ## Five-minute quick start
 
@@ -295,7 +343,7 @@ When the corresponding CRDs are installed, each `ModelDeployment` can own:
 - multi-window burn-rate alerts plus a no-traffic alert;
 - three embedded Grafana dashboards: **Control Plane**, **Canary**, and **Inference SLO**.
 
-The SLO model and operational response are documented in the [SLO runbook](docs/slo.md). Dashboard definitions are versioned with the controller under [`internal/observability/dashboards`](internal/observability/dashboards).
+The controller periodically rechecks optional monitoring discovery and repairs its owned monitoring children after deletion or drift. Apply failures are surfaced as `MetricsRegistered=False`; they no longer report a false success. The SLO model and operational response are documented in the [SLO runbook](docs/slo.md). Dashboard definitions are versioned with the controller under [`internal/observability/dashboards`](internal/observability/dashboards).
 
 ## Current scope and limitations
 
@@ -308,7 +356,9 @@ LLMCP is an early `v1alpha1` project. Its current boundary is explicit:
 | Service exposure | **Implemented:** in-cluster `ClusterIP`. **Not implemented:** public ingress or Gateway ownership. |
 | Canary routing | **Implemented:** approximate replica-based distribution behind one Service. **Not implemented:** exact request-level weights. |
 | Safety signals | **Implemented:** operational Prometheus metrics and custom PromQL. **Not implemented:** semantic evaluation or shadow traffic. |
-| Metric identity | Currently keyed by model and variant; deployments reusing the same model name can contaminate decisions. Use unique model names until resource-scoped labels are implemented. |
+| Metric identity | **Implemented:** built-in decisions, recording rules, alerts, and dashboards are isolated by namespace and ModelDeployment name. This is metric isolation, not an authorization or multi-tenant security boundary; custom PromQL must use the documented identity variables. |
+| Stream throughput | **Implemented:** content-chunk rate and explicit server-reported output-token rate with a configurable usage-sample floor. Missing usage is not estimated. Deprecated `output_tokens`/TPOT series retain their original chunk-based approximation for compatibility only. |
+| Rollback history | **Implemented:** v2 workload snapshots freeze effective engine/shim images, startup timeout, and derived runtime defaults; legacy identities are adopted only from matching stored and live evidence. Active pre-migration telemetry is held for an explicit abort rather than silently restarted. |
 | Autoscaling | Minimum one replica. Scale-to-zero needs an always-available activation/request layer and is not implemented. |
 | Workload placement | Generic resource requests/limits are supported; first-class GPU scheduling, affinity, tolerations, and topology controls are not. |
 | Prometheus access | Address and timeout are supported; authenticated and custom-TLS providers are not. |
@@ -322,6 +372,8 @@ The researched implementation sequence is maintained in [`improvement_plan.md`](
 | [Demo guide](docs/demo.md) | How can I demonstrate serving, metrics, rollback, autoscaling, and SLOs? |
 | [API reference](docs/api.md) | What does every CRD field mean? |
 | [SLO runbook](docs/slo.md) | How are the generated alerts calculated and handled? |
+| [Metrics contract](docs/metrics.md) | What does each shim metric measure, and how are decisions isolated? |
+| [Improvement execution status](docs/implementation-status.md) | Which researched changes are implemented and which release gates remain? |
 | [ADR 0001](docs/adr/0001-spike-closed-loop.md) | What did the feasibility spike measure? |
 | [ADR 0002](docs/adr/0002-model-weight-delivery.md) | Why package production model weights separately? |
 | [ADR 0003](docs/adr/0003-metrics-shim.md) | Why is a reverse-proxy sidecar necessary? |
@@ -329,15 +381,18 @@ The researched implementation sequence is maintained in [`improvement_plan.md`](
 | [ADR 0005](docs/adr/0005-autoscaling.md) | How is total capacity calculated and owned? |
 | [ADR 0006](docs/adr/0006-slo-and-dashboards.md) | Why use TTFT and burn-rate alerts? |
 | [ADR 0007](docs/adr/0007-hardening-and-ci.md) | Which invariants are enforced by CI and lint? |
+| [ADR 0008](docs/adr/0008-versioned-workload-revisions.md) | Which fields define a restorable workload revision? |
 
 ## Development and verification
 
 ```bash
 make test              # unit tests plus envtest API-server integration
 make lint              # static analysis
+make docs-mermaid-check # render every README Mermaid diagram with the pinned parser
 make chainsaw-lint     # validate real-cluster suite definitions
 make e2e-up            # local kind cluster, images, and controller
-make e2e-chainsaw      # real-cluster behavior suites
+make e2e-chainsaw      # standard real-cluster behavior suites
+make e2e-observability-resync # destructive optional-API test; dedicated cluster only
 make verify            # all checks that do not require an existing cluster
 ```
 

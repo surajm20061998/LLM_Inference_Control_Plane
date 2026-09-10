@@ -17,10 +17,12 @@ limitations under the License.
 package revision
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -87,6 +89,17 @@ func baseSpec() *inferencev1alpha1.ModelDeploymentSpec {
 			AutoRollback:     ptrTo(true),
 		},
 	}
+}
+
+func versionedSpec() *inferencev1alpha1.ModelDeploymentSpec {
+	spec := baseSpec()
+	spec.Serving.Shim.Enabled = ptrTo(true)
+	spec.Serving.Shim.Image = "shim:v1"
+	spec.Serving.Shim.LogLevel = "info"
+	spec.Serving.Shim.Resources.Requests = corev1.ResourceList{
+		corev1.ResourceCPU: resource.MustParse("50m"),
+	}
+	return spec
 }
 
 // TestHashIsDeterministic is the property the whole package rests on: the same
@@ -242,6 +255,106 @@ func TestHashIgnoresExcludedFields(t *testing.T) {
 	}
 }
 
+func TestVersionedSnapshotUsesWorkloadIdentity(t *testing.T) {
+	t.Parallel()
+
+	base := versionedSpec()
+	baseline, err := NewSnapshot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertSame := func(name string, mutate func(*inferencev1alpha1.ModelDeploymentSpec)) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			other := base.DeepCopy()
+			mutate(other)
+			got, snapshotErr := NewSnapshot(other)
+			if snapshotErr != nil {
+				t.Fatal(snapshotErr)
+			}
+			if got.Revision != baseline.Revision {
+				t.Fatalf("non-workload change moved revision %s -> %s", baseline.Revision, got.Revision)
+			}
+		})
+	}
+	assertDifferent := func(name string, mutate func(*inferencev1alpha1.ModelDeploymentSpec)) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			other := base.DeepCopy()
+			mutate(other)
+			got, snapshotErr := NewSnapshot(other)
+			if snapshotErr != nil {
+				t.Fatal(snapshotErr)
+			}
+			if got.Revision == baseline.Revision {
+				t.Fatalf("workload change left revision at %s", baseline.Revision)
+			}
+		})
+	}
+
+	assertSame("Service port", func(s *inferencev1alpha1.ModelDeploymentSpec) { s.Serving.Port++ })
+	assertSame("replicas", func(s *inferencev1alpha1.ModelDeploymentSpec) { (*s.Replicas)++ })
+	assertSame("analysis policy", func(s *inferencev1alpha1.ModelDeploymentSpec) {
+		s.Rollout.ProgressDeadline.Duration += time.Minute
+	})
+	assertDifferent("startup timeout", func(s *inferencev1alpha1.ModelDeploymentSpec) {
+		s.Serving.StartupTimeout.Duration += time.Second
+	})
+	assertDifferent("engine image", func(s *inferencev1alpha1.ModelDeploymentSpec) { s.Engine.Image = "engine:v2" })
+	assertDifferent("shim image", func(s *inferencev1alpha1.ModelDeploymentSpec) { s.Serving.Shim.Image = "shim:v2" })
+}
+
+func TestDecodeSupportsLegacyAndRejectsUnknownVersions(t *testing.T) {
+	t.Parallel()
+
+	legacyRaw, err := Encode(baseSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := Decode(legacyRaw)
+	if err != nil {
+		t.Fatalf("decoding legacy payload: %v", err)
+	}
+	if !legacy.Legacy() || legacy.Spec.Serving.Port != baseSpec().Serving.Port {
+		t.Fatalf("legacy decode = %#v", legacy)
+	}
+
+	current, err := NewSnapshot(versionedSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Decode(current.Raw)
+	if err != nil {
+		t.Fatalf("decoding current payload: %v", err)
+	}
+	if decoded.Legacy() || decoded.Version != PayloadVersionV2 {
+		t.Fatalf("current decode version = %q", decoded.Version)
+	}
+	if decoded.Spec.Serving.Port != 0 || decoded.Spec.Serving.StartupTimeout == nil {
+		t.Fatalf("v2 serving projection = %#v", decoded.Spec.Serving)
+	}
+
+	unknown, err := json.Marshal(map[string]any{"version": "v999", "workload": map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(unknown); err == nil || !strings.Contains(err.Error(), "unsupported payload version") {
+		t.Fatalf("unknown version error = %v", err)
+	}
+}
+
+func TestNewSnapshotRejectsUnresolvedRuntimeDefaults(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewSnapshot(baseSpec()); err == nil || !strings.Contains(err.Error(), "shim enablement") {
+		t.Fatalf("unresolved snapshot error = %v", err)
+	}
+	if _, err := NewSnapshot(nil); err == nil || !strings.Contains(err.Error(), "nil effective workload") {
+		t.Fatalf("nil snapshot error = %v", err)
+	}
+}
+
 // TestHashFormat pins the shape of the output. The value is used both as a
 // label value and as a DNS-1123 name suffix (naming.ControllerRevision), so a
 // hash that is empty, long, or contains an unexpected character does not
@@ -306,10 +419,8 @@ func TestHashResourceMapOrdering(t *testing.T) {
 	}
 }
 
-// TestEncodeExcludesNonRevisionFields asserts on the stored bytes directly, not
-// just on the hash: Encode's output is what lands in a ControllerRevision, so a
-// leaked field would be persisted in cluster history and could not be taken
-// back without invalidating every recorded revision.
+// TestEncodeExcludesNonRevisionFields freezes the legacy wire shape. Decode
+// must keep accepting these bytes even though current records use v2.
 func TestEncodeExcludesNonRevisionFields(t *testing.T) {
 	data, err := Encode(baseSpec())
 	if err != nil {

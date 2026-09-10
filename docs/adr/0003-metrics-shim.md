@@ -54,6 +54,12 @@ engine metrics — `llamacpp_*`, later `vllm:*` — are scraped as **diagnostics
 humans** and nothing automated is ever gated on them. One source of truth for
 decisions, richer data for debugging.
 
+Every canonical workload series carries the bounded identity labels
+`namespace`, `model_deployment`, `model`, and `variant`. Automated selectors use
+namespace and resource name so two deployments serving the same model cannot
+share decision evidence. They deliberately omit the mutable model label during
+a rollout because the stable primary may still serve the previous model.
+
 The second reason is not observability at all, it is the engine abstraction.
 `llmcp_inference_ttft_seconds` means the same thing under llama.cpp, vLLM or the
 deterministic test stub, because one binary measures it in one place, one way.
@@ -124,8 +130,8 @@ per-pod gauge like queue depth is meaningless rather than merely imprecise.
 
 ### Optional CRDs
 
-`ServiceMonitor` is built as **unstructured** content and applied, never read
-back or watched. A manager asked to *watch* a kind whose CRD is absent fails at
+`ServiceMonitor` is built as **unstructured** content and applied without a
+startup informer. A manager asked to *watch* a kind whose CRD is absent fails at
 `Start()` with `meta.NoKindMatchError` and does not recover when the CRD appears
 later, because an informer's RESTMapper is resolved once. Building the object as
 unstructured makes it structurally impossible to acquire a hard dependency on an
@@ -138,7 +144,10 @@ and caching it for long means a ModelDeployment created in that window never
 gets a ServiceMonitor. A discovery *failure* is neither cached nor reported as an
 absence — it produces `MetricsRegistered=Unknown` and a retry, because an API
 server hiccup must not be reported to a user as "your monitoring is
-uninstalled".
+uninstalled". The reconciler schedules a short retry while an enabled CRD is
+absent and a bounded periodic resync while healthy, so installing the operator
+later or deleting/drifting an owned monitoring child converges without editing
+the ModelDeployment.
 
 ## Consequences
 
@@ -152,10 +161,11 @@ uninstalled".
   sidecar was squeezed.
 - One extra network hop, over loopback inside a single pod.
 - The shim and the controller are two halves of one build: the shim's metric
-  names are the contract the controller's analysis queries. Running mismatched
-  versions produces an empty query result, which analysis is obliged to read as
-  "no data" — so it stalls a canary rather than failing it. `llmcp_shim_info`
-  carries the shim's version so the skew is detectable.
+  names and identity labels are the contract the controller's analysis queries.
+  A rollout performs a complete-window identity handshake before analysis;
+  mismatched legacy shims hold under `MetricScopeReady=False` without spending a
+  quality-verdict budget. `llmcp_shim_info` carries the shim's version so the
+  skew is diagnosable.
 
 **Rejected but reconsidered later:** a `router` mode for the same binary, doing
 true per-request weighted backend selection. Held in reserve for the case where

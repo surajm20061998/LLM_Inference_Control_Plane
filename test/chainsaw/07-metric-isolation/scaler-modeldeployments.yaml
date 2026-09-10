@@ -1,0 +1,113 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: isolation-hot
+spec:
+  replicas: 1
+  model:
+    name: shared-stub-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        path: /weights/model.gguf
+        pullPolicy: Always
+  engine:
+    type: llamacpp
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 1
+    env:
+      - name: LLMCP_FAKE_TTFT_MS
+        value: "1000"
+      - name: LLMCP_FAKE_ITL_MS
+        value: "50"
+      - name: LLMCP_FAKE_TOKENS
+        value: "24"
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+  serving:
+    port: 8080
+    startupTimeout: 60s
+  autoscaling:
+    mode: Builtin
+    minReplicas: 1
+    maxReplicas: 3
+    metric: queue-depth
+    target: "1"
+    tolerance: "100m"
+    pollInterval: 5s
+    window: 15s
+    scaleUpStabilization: 0s
+    scaleDownStabilization: 300s
+    provider:
+      type: Prometheus
+      address: http://prometheus-operated.monitoring.svc:9090
+      timeout: 4s
+  observability:
+    serviceMonitor:
+      enabled: true
+      interval: 5s
+      scrapeTimeout: 4s
+---
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: isolation-idle
+spec:
+  replicas: 1
+  model:
+    name: shared-stub-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        path: /weights/model.gguf
+        pullPolicy: Always
+  engine:
+    type: llamacpp
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 1
+    env:
+      - name: LLMCP_FAKE_TTFT_MS
+        value: "1000"
+      - name: LLMCP_FAKE_ITL_MS
+        value: "50"
+      - name: LLMCP_FAKE_TOKENS
+        value: "24"
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+  serving:
+    port: 8080
+    startupTimeout: 60s
+  autoscaling:
+    mode: Builtin
+    minReplicas: 1
+    maxReplicas: 3
+    metric: queue-depth
+    target: "1"
+    tolerance: "100m"
+    pollInterval: 5s
+    window: 15s
+    scaleUpStabilization: 0s
+    scaleDownStabilization: 300s
+    provider:
+      type: Prometheus
+      address: http://prometheus-operated.monitoring.svc:9090
+      timeout: 4s
+  observability:
+    serviceMonitor:
+      enabled: true
+      interval: 5s
+      scrapeTimeout: 4s

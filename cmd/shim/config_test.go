@@ -25,7 +25,7 @@ import (
 )
 
 func TestParseConfigDefaults(t *testing.T) {
-	cfg, err := parseConfig([]string{modelFlag, "qwen3"}, io.Discard)
+	cfg, err := parseConfig([]string{modelFlag, "qwen3", testNamespaceFlag, testDeploymentFlag}, io.Discard)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
@@ -52,8 +52,13 @@ func TestParseConfigDefaults(t *testing.T) {
 // depending on it; modelFlag is repeated in every valid argument vector because
 // the shim refuses to start without it.
 const (
-	variantPrimary = "primary"
-	modelFlag      = "-model"
+	variantPrimary     = "primary"
+	modelFlag          = "-model"
+	modelArg           = "--model=m"
+	testNamespace      = "team-a"
+	testNamespaceFlag  = "--namespace=team-a"
+	testDeployment     = "chat"
+	testDeploymentFlag = "--model-deployment=chat"
 )
 
 func TestParseConfigRejectsMissingModel(t *testing.T) {
@@ -78,6 +83,7 @@ func TestParseConfigRejectsBadInput(t *testing.T) {
 		"negative concurren": {modelFlag, "m", "-max-concurrency", "-3"},
 	}
 	for name, args := range cases {
+		args = append(args, testNamespaceFlag, testDeploymentFlag)
 		if _, err := parseConfig(args, io.Discard); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
@@ -92,6 +98,8 @@ func TestParseConfigAcceptsOperatorFlags(t *testing.T) {
 		"--upstream=http://127.0.0.1:8000",
 		"--health-path=/health",
 		"--model=qwen3-0.6b",
+		"--namespace=team-a",
+		"--model-deployment=chat",
 		"--variant=canary",
 		"--max-concurrency=4",
 		"--log-level=debug",
@@ -99,7 +107,21 @@ func TestParseConfigAcceptsOperatorFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
-	if cfg.variant != "canary" || cfg.model != "qwen3-0.6b" || cfg.maxConcurrency != 4 {
+	if cfg.namespace != testNamespace || cfg.modelDeployment != testDeployment ||
+		cfg.variant != "canary" || cfg.model != "qwen3-0.6b" || cfg.maxConcurrency != 4 {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+}
+
+func TestParseConfigRequiresResourceIdentity(t *testing.T) {
+	for _, args := range [][]string{
+		{modelArg},
+		{modelArg, testNamespaceFlag},
+		{modelArg, testDeploymentFlag},
+		{modelArg, "--namespace= ", testDeploymentFlag},
+	} {
+		if _, err := parseConfig(args, io.Discard); err == nil {
+			t.Errorf("accepted incomplete identity: %v", args)
+		}
 	}
 }

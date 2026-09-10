@@ -48,11 +48,16 @@ const LlamaCPPDefaultImage = "ghcr.io/ggml-org/llama.cpp:server-b10731"
 const LlamaCPPHealthPath = "/health"
 
 // llamaCPPAPIKeyEnvVar is the environment variable llama-server reads its
-// required API key from. Every llama-server CLI flag has a matching
-// LLAMA_ARG_* variable; the key is passed this way rather than as an argument
-// so the secret never appears in the pod spec, in `kubectl describe`, or in a
-// process listing.
-const llamaCPPAPIKeyEnvVar = "LLAMA_ARG_API_KEY"
+// required API key from in the pinned b10731 build. The key is passed this way
+// rather than as an argument so the secret never appears in the pod spec, in
+// `kubectl describe`, or in a process listing.
+const llamaCPPAPIKeyEnvVar = "LLAMA_API_KEY"
+
+const (
+	llamaCPPHostFlag     = "--host"
+	llamaCPPPortFlag     = "--port"
+	llamaCPPParallelFlag = "--parallel"
+)
 
 // llamaCPPCacheEnvVar redirects llama.cpp's download cache. It is set only for
 // the huggingFace model source; with an image source nothing is downloaded.
@@ -104,6 +109,9 @@ func (llamaCPP) Validate(spec *v1alpha1.ModelDeploymentSpec) error {
 	if spec == nil {
 		return errors.New("llamacpp: nil spec")
 	}
+	if err := validateLlamaCPPReservedSettings(spec); err != nil {
+		return err
+	}
 
 	src := spec.Model.Source
 
@@ -145,6 +153,11 @@ func (p llamaCPP) Build(bc BuildContext) (BuildResult, error) {
 		return BuildResult{}, errors.New("llamacpp: BuildContext.MD is nil")
 	}
 	spec := &bc.MD.Spec
+	// Keep the rendering boundary safe even when Build is called directly or
+	// when a stored historical spec predates controller-side validation.
+	if err := validateLlamaCPPReservedSettings(spec); err != nil {
+		return BuildResult{}, err
+	}
 
 	port := bc.Port
 	if port == 0 {
@@ -197,8 +210,8 @@ func llamaCPPArgs(spec *v1alpha1.ModelDeploymentSpec, bc BuildContext, port int3
 	// pod that logs "server listening" and is never ready. Binding all
 	// interfaces is required, and safe here — the container is only reachable
 	// through the Service.
-	args = append(args, "--host", "0.0.0.0")
-	args = append(args, "--port", strconv.Itoa(int(port)))
+	args = append(args, llamaCPPHostFlag, "0.0.0.0")
+	args = append(args, llamaCPPPortFlag, strconv.Itoa(int(port)))
 
 	// Exactly one of these two branches runs. A pre-staged file is named
 	// directly; otherwise the engine is pointed at the Hub and downloads the
@@ -213,7 +226,11 @@ func llamaCPPArgs(spec *v1alpha1.ModelDeploymentSpec, bc BuildContext, port int3
 	}
 
 	args = append(args, "-c", strconv.Itoa(int(int32OrDefault(spec.Engine.ContextSize, defaultContextSize))))
-	args = append(args, "--parallel", strconv.Itoa(int(int32OrDefault(spec.Engine.MaxConcurrency, defaultMaxConcurrency))))
+	args = append(
+		args,
+		llamaCPPParallelFlag,
+		strconv.Itoa(int(int32OrDefault(spec.Engine.MaxConcurrency, defaultMaxConcurrency))),
+	)
 
 	// Resolved by the controller via ThreadsFor and passed in; never re-derived
 	// here. See threads.go for why this flag is not optional.
@@ -229,10 +246,9 @@ func llamaCPPArgs(spec *v1alpha1.ModelDeploymentSpec, bc BuildContext, port int3
 	// label on every metric, so the served identity is made to match it.
 	args = append(args, "--alias", spec.Model.Name)
 
-	// Verbatim, last. Later flags win in llama-server's parser, so appending
-	// here is what makes ExtraArgs an escape hatch that can override anything
-	// above it rather than a list that silently loses to our defaults. The
-	// caller's order is preserved exactly.
+	// Additional tuning flags retain their authored order. Validate and Build
+	// reject controller-owned settings, so these cannot override the model,
+	// serving identity, capacity, or credentials used elsewhere by the operator.
 	args = append(args, spec.Engine.ExtraArgs...)
 
 	return args

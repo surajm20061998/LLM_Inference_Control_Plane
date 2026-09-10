@@ -17,18 +17,23 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"errors"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/discovery"
@@ -36,6 +41,34 @@ import (
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/observability"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/test/helpers"
 )
+
+type serviceMonitorFailingClient struct {
+	client.Client
+	err         error
+	beforeApply func()
+}
+
+func (c serviceMonitorFailingClient) Apply(ctx context.Context, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+	if kind, ok := obj.(interface{ GetKind() string }); ok && kind.GetKind() == observability.KindServiceMonitor {
+		if c.beforeApply != nil {
+			c.beforeApply()
+		}
+		if c.err != nil {
+			return c.err
+		}
+	}
+	return c.Client.Apply(ctx, obj, opts...)
+}
+
+type invalidatingMonitoringProber struct {
+	*discovery.Static
+	invalidated []schema.GroupVersionKind
+}
+
+func (p *invalidatingMonitoringProber) Invalidate(gvk schema.GroupVersionKind) {
+	p.invalidated = append(p.invalidated, gvk)
+	p.Present[gvk] = false
+}
 
 // proberWith returns a Static prober reporting the prometheus-operator kinds
 // present or absent.
@@ -94,6 +127,92 @@ var _ = Describe("Metric collection", func() {
 
 	When("the cluster serves prometheus-operator CRDs", func() {
 		BeforeEach(func() { r.Discovery = proberWith(true) })
+
+		It("persists a failed ServiceMonitor verdict before returning its apply error", func() {
+			mdtCreate(helpers.NewModelDeployment(name, namespace))
+			applyErr := errors.New("ServiceMonitor apply denied")
+			r.Client = serviceMonitorFailingClient{Client: r.Client, err: applyErr}
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: mdKey})
+			Expect(errors.Is(err, applyErr)).To(BeTrue())
+			cond := mdtExpectCondition(mdtGet(mdKey), inferencev1alpha1.ConditionMetricsRegistered, metav1.ConditionFalse)
+			Expect(cond.Message).To(ContainSubstring("ServiceMonitor apply denied"))
+			mdtGetDeployment(types.NamespacedName{Namespace: namespace, Name: naming.PrimaryDeployment(name)})
+			getPrometheusRule(types.NamespacedName{Namespace: namespace, Name: naming.PrometheusRule(name)})
+		})
+
+		It("schedules a bounded healthy repair and recreates a deleted monitor", func() {
+			md := mdtCreate(helpers.NewModelDeployment(name, namespace))
+			result := mdtReconcile(r, mdKey)
+			Expect(result.RequeueAfter).To(BeNumerically(">=", 270*time.Second))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 330*time.Second))
+			Expect(r.observabilityResync(ctx, md)).To(Equal(result.RequeueAfter))
+			Expect(k8sClient.Delete(ctx, getServiceMonitor(smKey))).To(Succeed())
+			mdtReconcile(r, mdKey)
+			mdtExpectOwnedBy(getServiceMonitor(smKey).GetOwnerReferences(), md)
+		})
+
+		It("invalidates stale discovery after a monitoring API disappears", func() {
+			mdtCreate(helpers.NewModelDeployment(name, namespace))
+			mdtReconcile(r, mdKey)
+			prober := &invalidatingMonitoringProber{Static: proberWith(true)}
+			r.Discovery = prober
+			r.Client = serviceMonitorFailingClient{Client: r.Client, err: &meta.NoKindMatchError{
+				GroupKind:        observability.ServiceMonitorGVK.GroupKind(),
+				SearchedVersions: []string{observability.MonitoringVersion},
+			}}
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: mdKey})
+			Expect(meta.IsNoMatchError(err)).To(BeTrue())
+			Expect(prober.invalidated).To(Equal([]schema.GroupVersionKind{observability.ServiceMonitorGVK}))
+			Expect(mdtReconcile(r, mdKey).RequeueAfter).To(Equal(discovery.AbsentTTL))
+			cond := mdtExpectCondition(mdtGet(mdKey), inferencev1alpha1.ConditionMetricsRegistered, metav1.ConditionFalse)
+			Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonPrometheusOperatorCRDsAbsent))
+		})
+
+		It("does not adopt a foreign replacement between ownership check and apply", func() {
+			md := mdtCreate(helpers.NewModelDeployment(name, namespace))
+			mdtReconcile(r, mdKey)
+			r.Client = serviceMonitorFailingClient{Client: r.Client, beforeApply: func() {
+				Expect(k8sClient.Delete(ctx, getServiceMonitor(smKey))).To(Succeed())
+				foreign := observability.BuildServiceMonitor(observability.ServiceMonitorInput{
+					Name: name, Namespace: namespace, Spec: &md.Spec.Observability, ShimEnabled: true,
+				})
+				foreign.SetOwnerReferences(nil)
+				Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+			}}
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: mdKey})
+			Expect(apierrors.IsConflict(err)).To(BeTrue())
+			Expect(getServiceMonitor(smKey).GetOwnerReferences()).To(BeEmpty())
+		})
+
+		It("repairs owned rule and monitor drift", func() {
+			mdtCreate(helpers.NewModelDeployment(name, namespace))
+			mdtReconcile(r, mdKey)
+			ruleKey := types.NamespacedName{Namespace: namespace, Name: naming.PrometheusRule(name)}
+			for _, child := range []*unstructured.Unstructured{getServiceMonitor(smKey), getPrometheusRule(ruleKey)} {
+				original := child.DeepCopy()
+				child.Object["spec"] = map[string]any{}
+				Expect(k8sClient.Update(ctx, child)).To(Succeed())
+				mdtReconcile(r, mdKey)
+				restored := child.DeepCopy()
+				Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(child), restored)).To(Succeed())
+				Expect(restored.Object["spec"]).To(Equal(original.Object["spec"]))
+			}
+		})
+
+		It("refuses to adopt or delete an unowned monitor", func() {
+			md := mdtCreate(helpers.NewModelDeployment(name, namespace))
+			foreign := observability.BuildServiceMonitor(observability.ServiceMonitorInput{
+				Name: name, Namespace: namespace, Spec: &md.Spec.Observability, ShimEnabled: true,
+			})
+			foreign.SetOwnerReferences(nil)
+			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: mdKey})
+			Expect(err).To(MatchError(ContainSubstring("not owned by this ModelDeployment")))
+			Expect(getServiceMonitor(smKey).GetOwnerReferences()).To(BeEmpty())
+			Expect(r.deleteObservabilityChild(ctx, md, observability.ServiceMonitorGVK, smKey.Name)).To(
+				MatchError(ContainSubstring("not owned by this ModelDeployment")))
+			getServiceMonitor(smKey)
+		})
 
 		It("creates a ServiceMonitor owned by the ModelDeployment", func() {
 			md := mdtCreate(helpers.NewModelDeployment(name, namespace))
@@ -293,6 +412,24 @@ var _ = Describe("Metric collection", func() {
 	When("the prometheus-operator CRDs are absent", func() {
 		BeforeEach(func() { r.Discovery = proberWith(false) })
 
+		It("rechecks absent kinds and registers them after discovery changes", func() {
+			mdtCreate(helpers.NewModelDeployment(name, namespace))
+			result := mdtReconcile(r, mdKey)
+			Expect(result.RequeueAfter).To(Equal(discovery.AbsentTTL))
+			r.Discovery = proberWith(true)
+			result = mdtReconcile(r, mdKey)
+			Expect(result.RequeueAfter).To(BeNumerically(">", discovery.AbsentTTL))
+			getServiceMonitor(smKey)
+			getPrometheusRule(types.NamespacedName{Namespace: namespace, Name: naming.PrometheusRule(name)})
+		})
+
+		It("keeps the absent rule timer even when ServiceMonitor is disabled", func() {
+			md := helpers.NewModelDeployment(name, namespace)
+			md.Spec.Observability.ServiceMonitor = &inferencev1alpha1.ServiceMonitorSpec{Enabled: ptr.To(false)}
+			mdtCreate(md)
+			Expect(mdtReconcile(r, mdKey).RequeueAfter).To(Equal(discovery.AbsentTTL))
+		})
+
 		It("serves normally and says why metrics are missing", func() {
 			// A cluster without Prometheus is a legitimate configuration.
 			// Failing the reconcile over it would stop the operator managing a
@@ -364,6 +501,16 @@ var _ = Describe("Metric collection", func() {
 	})
 
 	When("the user turns the ServiceMonitor off", func() {
+		It("stops the timer once both monitoring children are disabled and cleaned up", func() {
+			r.Discovery = proberWith(true)
+			mdtCreate(helpers.NewModelDeployment(name, namespace))
+			mdtReconcile(r, mdKey)
+			md := mdtGet(mdKey)
+			md.Spec.Observability.ServiceMonitor = &inferencev1alpha1.ServiceMonitorSpec{Enabled: ptr.To(false)}
+			md.Spec.Observability.PrometheusRule = &inferencev1alpha1.PrometheusRuleSpec{Enabled: ptr.To(false)}
+			Expect(k8sClient.Update(ctx, md)).To(Succeed())
+			Expect(mdtReconcile(r, mdKey).RequeueAfter).To(BeZero())
+		})
 		It("creates none and says so", func() {
 			r.Discovery = proberWith(true)
 

@@ -1,4 +1,5 @@
-# The canary suites, which need a real Prometheus.
+# Prometheus-backed rollout/isolation suites plus a separate disposable-cluster
+# job for optional monitoring API discovery and drift repair.
 #
 # Separate from the push-triggered e2e job on purpose. Standing up
 # kube-prometheus-stack, driving load for several minutes and waiting for an
@@ -7,7 +8,7 @@
 #
 # It runs nightly and on demand, which is the right cadence for a suite whose
 # job is to catch integration drift rather than to gate a change.
-name: E2E — canary with Prometheus
+name: E2E — Prometheus and observability resync
 
 on:
   schedule:
@@ -23,7 +24,7 @@ jobs:
       contents: read
     name: Canary promote and rollback
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 70
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -64,6 +65,8 @@ jobs:
           set -euo pipefail
           make e2e-chainsaw SUITE=03-canary-promote
           make e2e-chainsaw SUITE=04-canary-rollback
+          make e2e-chainsaw SUITE=07-metric-isolation
+          make e2e-chainsaw SUITE=08-canary-ladder
 
       - name: Verify the anti-buffering exit criterion
         run: |
@@ -115,4 +118,47 @@ jobs:
         run: |
           kubectl -n llmcp-system logs deploy/llmcp-controller-manager --tail=300 || true
           kubectl get modeldeployments -A -o yaml || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
+
+  observability-resync:
+    permissions:
+      contents: read
+    name: Optional monitoring API resync
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install kind
+        run: |
+          set -euo pipefail
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Create a disposable monitoring-free cluster
+        run: make kind-up CLUSTER_NAME=llmcp-observability-resync
+
+      - name: Build, push and deploy
+        run: make dev-deploy
+
+      - name: Exercise late install, drift repair and API removal
+        run: make e2e-observability-resync
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          kubectl -n llmcp-system logs deploy/llmcp-controller-manager --tail=300 || true
+          kubectl get modeldeployments -A -o yaml || true
+          kubectl get crds servicemonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com -o yaml || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true

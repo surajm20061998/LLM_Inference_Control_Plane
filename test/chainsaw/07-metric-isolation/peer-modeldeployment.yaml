@@ -1,0 +1,66 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: isolation-peer
+spec:
+  replicas: 2
+  model:
+    name: shared-stub-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        path: /weights/model.gguf
+        pullPolicy: Always
+  engine:
+    type: llamacpp
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 4
+    env:
+      - name: LLMCP_FAKE_TTFT_MS
+        value: "60"
+      - name: LLMCP_FAKE_TOKENS
+        value: "24"
+      - name: LLMCP_FAKE_ERROR_RATE
+        value: "0"
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+  serving:
+    port: 8080
+    startupTimeout: 60s
+  rollout:
+    type: Canary
+    progressDeadline: 300s
+    autoRollback: true
+    canary:
+      stepWeights: [50]
+      trafficRouting:
+        mode: Replica
+      analysis:
+        interval: 5s
+        window: 30s
+        initialDelay: 10s
+        failureThreshold: 1
+        consecutiveErrorLimit: 4
+        inconclusiveLimit: 8
+        onInconclusive: Wait
+        minRequestRate: "100m"
+        provider:
+          type: Prometheus
+          address: http://prometheus-operated.monitoring.svc:9090
+        metrics:
+          - name: candidate-error-rate
+            builtin: error-rate
+            thresholdRange:
+              max: "100m"
+  observability:
+    serviceMonitor:
+      enabled: true
+      interval: 5s
+      scrapeTimeout: 4s

@@ -95,10 +95,10 @@ type PrometheusRuleSpec struct {
 // reasons the service cannot act on.
 //
 // Time to first token is length-independent: it is how long the user waits
-// before anything happens. Time per output token is the other half, also
-// length-independent. That is exactly why OpenTelemetry's gen_ai semantic
-// conventions define the two separately rather than shipping one latency
-// metric, and it is why this operator's SLIs are TTFT and availability.
+// before anything happens. The shim also records time between observable
+// content-bearing stream events, but one event is not necessarily one
+// tokenizer token, so that measurement is a diagnostic rather than an SLI.
+// This operator's generated SLIs are TTFT and availability.
 type SLOSpec struct {
 	// TTFTThreshold is the latency a request must beat to count as good.
 	//

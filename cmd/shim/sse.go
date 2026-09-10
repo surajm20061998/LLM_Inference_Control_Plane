@@ -47,6 +47,7 @@ const maxSSELine = 1 << 20 // 1 MiB
 // tries to attribute per-choice: the client asked for one request and got one
 // stream, and TTFT is a property of the stream.
 type streamChunk struct {
+	Usage   *completionUsage `json:"usage"`
 	Choices []struct {
 		Delta struct {
 			Content string `json:"content"`
@@ -57,6 +58,12 @@ type streamChunk struct {
 			// the reasoning block, which for this project's own default model
 			// is most of the response.
 			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 
 		// Text is the legacy /v1/completions shape. Read so that the same
@@ -71,7 +78,23 @@ func (c streamChunk) hasToken() bool {
 		return false
 	}
 	ch := c.Choices[0]
+	for _, call := range ch.Delta.ToolCalls {
+		if call.Function.Name != "" || call.Function.Arguments != "" {
+			return true
+		}
+	}
 	return ch.Delta.Content != "" || ch.Delta.ReasoningContent != "" || ch.Text != ""
+}
+
+// A pointer distinguishes an explicit zero completion count from absent usage.
+type completionUsage struct {
+	CompletionTokens *int64 `json:"completion_tokens"`
+}
+
+func (s *requestState) observeUsage(u *completionUsage) {
+	if u != nil && u.CompletionTokens != nil && *u.CompletionTokens >= 0 {
+		s.reportedTokens, s.hasUsage = *u.CompletionTokens, true
+	}
 }
 
 // streamObserver wraps an upstream SSE body and times the first generated
@@ -115,7 +138,10 @@ type streamObserver struct {
 
 	// overlong marks that the current line exceeded maxSSELine and is being
 	// discarded up to the next newline.
-	overlong bool
+	overlong  bool
+	data      bytes.Buffer
+	dropEvent bool
+	finished  bool
 }
 
 // newStreamObserver wraps body, recording observations into state.
@@ -132,6 +158,24 @@ func (o *streamObserver) Read(p []byte) (int, error) {
 	n, err := o.upstream.Read(p)
 	if n > 0 {
 		o.scan(p[:n])
+	}
+	if err == io.EOF && !o.finished {
+		o.finished = true
+		// SSE dispatches the final pending event when the connection closes even
+		// when an upstream omitted the conventional trailing blank line. Process
+		// it for telemetry without changing the bytes returned to the client.
+		if o.overlong {
+			o.dropEvent = true
+		}
+		if !o.overlong && o.buf.Len() > 0 {
+			o.handleLine(o.buf.Bytes())
+		}
+		o.buf.Reset()
+		if !o.dropEvent && o.data.Len() > 0 {
+			o.handleEvent(o.data.Bytes())
+		}
+		o.data.Reset()
+		o.dropEvent = false
 	}
 	if err != nil && err != io.EOF {
 		o.state.readErr = err
@@ -159,6 +203,12 @@ func (o *streamObserver) scan(chunk []byte) {
 			// next one.
 			o.overlong = false
 			o.buf.Reset()
+			o.dropEvent = true
+			continue
+		}
+		if o.buf.Len()+len(line) > maxSSELine {
+			o.buf.Reset()
+			o.dropEvent = true
 			continue
 		}
 
@@ -189,6 +239,14 @@ func (o *streamObserver) appendPartial(chunk []byte) {
 func (o *streamObserver) handleLine(line []byte) {
 	// A trailing CR is legal in SSE and cpp-httplib emits one.
 	line = bytes.TrimSuffix(line, []byte("\r"))
+	if len(line) == 0 {
+		if !o.dropEvent {
+			o.handleEvent(o.data.Bytes())
+		}
+		o.data.Reset()
+		o.dropEvent = false
+		return
+	}
 
 	if !bytes.HasPrefix(line, sseDataPrefix) {
 		// Comments (": ping"), other SSE fields (event:, id:, retry:) and the
@@ -196,7 +254,23 @@ func (o *streamObserver) handleLine(line []byte) {
 		return
 	}
 
-	payload := bytes.TrimSpace(line[len(sseDataPrefix):])
+	payload := bytes.TrimPrefix(line[len(sseDataPrefix):], []byte(" "))
+	if o.dropEvent {
+		return
+	}
+	if o.data.Len()+len(payload)+1 > maxSSELine {
+		o.dropEvent = true
+		o.data.Reset()
+		return
+	}
+	if o.data.Len() > 0 {
+		o.data.WriteByte('\n')
+	}
+	o.data.Write(payload)
+}
+
+func (o *streamObserver) handleEvent(payload []byte) {
+	payload = bytes.TrimSpace(payload)
 	if len(payload) == 0 {
 		return
 	}
@@ -212,13 +286,53 @@ func (o *streamObserver) handleLine(line []byte) {
 		// simply carries no token we can attribute.
 		return
 	}
+	o.state.observeUsage(chunk.Usage)
 	if !chunk.hasToken() {
 		return
 	}
 
+	now := o.now()
 	if !o.state.sawFirstToken {
 		o.state.sawFirstToken = true
-		o.state.ttft = o.now().Sub(o.state.start)
+		o.state.ttft = now.Sub(o.state.start)
+	} else if o.state.interChunk != nil {
+		o.state.interChunk(max(0, now.Sub(o.state.lastContent).Seconds()))
 	}
+	o.state.lastContent = now
 	o.state.tokens++
 }
+
+// usageObserver copies at most one MiB for non-streaming usage inspection.
+// Reads are returned immediately and unchanged; oversized bodies simply have
+// no usage measurement. No prompt or completion text becomes a metric label.
+type usageObserver struct {
+	upstream io.ReadCloser
+	state    *requestState
+	buf      bytes.Buffer
+	overlong bool
+}
+
+func (o *usageObserver) Read(p []byte) (int, error) {
+	n, err := o.upstream.Read(p)
+	if !o.overlong {
+		if o.buf.Len()+n > maxSSELine {
+			o.overlong = true
+			o.buf.Reset()
+		} else {
+			o.buf.Write(p[:n])
+		}
+	}
+	if err == io.EOF && !o.overlong {
+		var response struct {
+			Usage *completionUsage `json:"usage"`
+		}
+		if json.Unmarshal(o.buf.Bytes(), &response) == nil {
+			o.state.observeUsage(response.Usage)
+		}
+	} else if err != nil && err != io.EOF {
+		o.state.readErr = err
+	}
+	return n, err
+}
+
+func (o *usageObserver) Close() error { return o.upstream.Close() }

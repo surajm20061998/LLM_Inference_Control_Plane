@@ -59,9 +59,11 @@ type config struct {
 	// therefore configured rather than assumed.
 	healthPath string
 
-	// model and variant label every metric this shim emits.
-	model   string
-	variant string
+	// Resource identity and model/variant label every canonical metric.
+	namespace       string
+	modelDeployment string
+	model           string
+	variant         string
 
 	// maxConcurrency is how many requests the engine can work on at once. It is
 	// the engine's --parallel, passed in so that queue depth can be derived:
@@ -97,6 +99,10 @@ func parseConfig(args []string, errOut io.Writer) (config, error) {
 			"engine readiness path, proxied at "+naming.ShimHealthPath)
 		model = fs.String("model", "",
 			"value of the `model` metric label (spec.model.name)")
+		namespace = fs.String("namespace", "",
+			"required owning ModelDeployment namespace")
+		modelDeployment = fs.String("model-deployment", "",
+			"required owning ModelDeployment name")
 		variant = fs.String("variant", "primary",
 			"value of the `variant` metric label: primary or canary")
 		maxConcurrency = fs.Int("max-concurrency", 1,
@@ -126,6 +132,12 @@ func parseConfig(args []string, errOut io.Writer) (config, error) {
 		// that looks entirely plausible. Refusing to start is the loud failure.
 		return config{}, errors.New("-model is required: it is the `model` label on every emitted metric")
 	}
+	if strings.TrimSpace(*namespace) == "" {
+		return config{}, errors.New("-namespace is required: metrics must identify the owning resource namespace")
+	}
+	if strings.TrimSpace(*modelDeployment) == "" {
+		return config{}, errors.New("-model-deployment is required: metrics must identify the owning resource name")
+	}
 
 	if !strings.HasPrefix(*healthPath, "/") {
 		return config{}, fmt.Errorf("-health-path must start with %q, got %q", "/", *healthPath)
@@ -136,15 +148,17 @@ func parseConfig(args []string, errOut io.Writer) (config, error) {
 	}
 
 	return config{
-		listen:         *listen,
-		metricsListen:  *metricsListen,
-		upstream:       u,
-		healthPath:     *healthPath,
-		model:          *model,
-		variant:        *variant,
-		maxConcurrency: *maxConcurrency,
-		logLevel:       *logLevel,
-		shutdownGrace:  *grace,
+		listen:          *listen,
+		metricsListen:   *metricsListen,
+		upstream:        u,
+		healthPath:      *healthPath,
+		model:           *model,
+		namespace:       *namespace,
+		modelDeployment: *modelDeployment,
+		variant:         *variant,
+		maxConcurrency:  *maxConcurrency,
+		logLevel:        *logLevel,
+		shutdownGrace:   *grace,
 	}, nil
 }
 
@@ -156,6 +170,8 @@ func (c config) logValue() []any {
 		"upstream", c.upstream.String(),
 		"healthPath", c.healthPath,
 		"model", c.model,
+		"namespace", c.namespace,
+		"modelDeployment", c.modelDeployment,
 		"variant", c.variant,
 		"maxConcurrency", c.maxConcurrency,
 	}

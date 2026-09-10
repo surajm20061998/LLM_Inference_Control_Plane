@@ -38,6 +38,46 @@
         "refresh": 1
       },
       {
+        "name": "namespace",
+        "label": "Namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(llmcp_shim_info, namespace)",
+          "refId": "namespace"
+        },
+        "definition": "label_values(llmcp_shim_info, namespace)",
+        "includeAll": false,
+        "allValue": null,
+        "multi": false,
+        "current": {},
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "model_deployment",
+        "label": "ModelDeployment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(llmcp_shim_info{namespace=\"$namespace\"}, model_deployment)",
+          "refId": "model_deployment"
+        },
+        "definition": "label_values(llmcp_shim_info{namespace=\"$namespace\"}, model_deployment)",
+        "includeAll": false,
+        "allValue": null,
+        "multi": false,
+        "current": {},
+        "refresh": 2,
+        "sort": 1
+      },
+      {
         "name": "model",
         "label": "Model",
         "type": "query",
@@ -46,22 +86,14 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(llmcp_shim_info, model)",
+          "query": "label_values(llmcp_shim_info{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}, model)",
           "refId": "model"
         },
-        "definition": "label_values(llmcp_shim_info, model)",
-        "includeAll": true,
-        "allValue": ".*",
-        "multi": true,
-        "current": {
-          "selected": true,
-          "text": [
-            "All"
-          ],
-          "value": [
-            "$__all"
-          ]
-        },
+        "definition": "label_values(llmcp_shim_info{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}, model)",
+        "includeAll": false,
+        "allValue": null,
+        "multi": false,
+        "current": {},
         "refresh": 2,
         "sort": 1
       }
@@ -119,7 +151,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(llmcp:ttft_sli:ratio_rate1h{model=~\"$model\"}) * 100",
+          "expr": "avg(llmcp:ttft_sli:ratio_rate1h{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}) * 100",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -191,7 +223,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(llmcp:availability_sli:ratio_rate1h{model=~\"$model\"}) * 100",
+          "expr": "avg(llmcp:availability_sli:ratio_rate1h{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}) * 100",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -263,7 +295,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate1h{model=~\"$model\"})) / 0.01",
+          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate1h{namespace=\"$namespace\",model_deployment=\"$model_deployment\"})) / (1 - avg(llmcp:slo_ttft:objective{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}))",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -335,7 +367,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(1 - avg(llmcp:availability_sli:ratio_rate1h{model=~\"$model\"})) / 0.005",
+          "expr": "(1 - avg(llmcp:availability_sli:ratio_rate1h{namespace=\"$namespace\",model_deployment=\"$model_deployment\"})) / (1 - avg(llmcp:slo_availability:objective{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}))",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -407,7 +439,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(llmcp_inference_requests_total{model=~\"$model\"}[$__rate_interval]))",
+          "expr": "sum(rate(llmcp_inference_requests_total{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval]))",
           "legendFormat": "",
           "range": false,
           "instant": true,
@@ -475,7 +507,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate5m{model=~\"$model\"})) / 0.01",
+          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate5m{namespace=\"$namespace\",model_deployment=\"$model_deployment\"})) / (1 - avg(llmcp:slo_ttft:objective{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}))",
           "legendFormat": "ttft 5m",
           "range": true,
           "instant": false,
@@ -487,7 +519,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate1h{model=~\"$model\"})) / 0.01",
+          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate1h{namespace=\"$namespace\",model_deployment=\"$model_deployment\"})) / (1 - avg(llmcp:slo_ttft:objective{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}))",
           "legendFormat": "ttft 1h",
           "range": true,
           "instant": false,
@@ -499,7 +531,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate30m{model=~\"$model\"})) / 0.01",
+          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate30m{namespace=\"$namespace\",model_deployment=\"$model_deployment\"})) / (1 - avg(llmcp:slo_ttft:objective{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}))",
           "legendFormat": "ttft 30m",
           "range": true,
           "instant": false,
@@ -511,7 +543,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate6h{model=~\"$model\"})) / 0.01",
+          "expr": "(1 - avg(llmcp:ttft_sli:ratio_rate6h{namespace=\"$namespace\",model_deployment=\"$model_deployment\"})) / (1 - avg(llmcp:slo_ttft:objective{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}))",
           "legendFormat": "ttft 6h",
           "range": true,
           "instant": false,
@@ -600,7 +632,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(llmcp:ttft_sli:ratio_rate5m{model=~\"$model\"}) * 100",
+          "expr": "avg(llmcp:ttft_sli:ratio_rate5m{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}) * 100",
           "legendFormat": "ttft 5m",
           "range": true,
           "instant": false,
@@ -612,7 +644,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(llmcp:availability_sli:ratio_rate5m{model=~\"$model\"}) * 100",
+          "expr": "avg(llmcp:availability_sli:ratio_rate5m{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}) * 100",
           "legendFormat": "availability 5m",
           "range": true,
           "instant": false,
@@ -705,7 +737,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "instant": false,
@@ -717,7 +749,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "instant": false,
@@ -729,7 +761,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(llmcp_inference_ttft_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "range": true,
           "instant": false,
@@ -787,8 +819,8 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "Time per output token",
-      "description": "The other half of the latency story, and also length-independent: the mean interval between tokens after the first. TTFT and TPOT together separate 'slow to start' from 'slow to generate', which is exactly why OpenTelemetry's gen_ai semantic conventions define them as two metrics rather than one.",
+      "title": "Inter-content-chunk latency",
+      "description": "Observed time between successive content-bearing SSE events. Together with TTFT it separates 'slow to start' from 'slow while streaming'. It is not time per tokenizer token because one event can contain zero, one, or many tokens.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -806,7 +838,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(llmcp_inference_tpot_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(llmcp_inference_inter_chunk_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "instant": false,
@@ -818,7 +850,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_tpot_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_inter_chunk_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "instant": false,
@@ -830,7 +862,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(llmcp_inference_tpot_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(llmcp_inference_inter_chunk_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "range": true,
           "instant": false,
@@ -908,7 +940,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_request_duration_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llmcp_inference_request_duration_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "instant": false,
@@ -920,7 +952,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(llmcp_inference_request_duration_seconds_bucket{model=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(llmcp_inference_request_duration_seconds_bucket{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "range": true,
           "instant": false,
@@ -979,7 +1011,7 @@
       "id": 13,
       "type": "timeseries",
       "title": "Throughput",
-      "description": "Tokens per second is the number that reflects work actually done; requests per second reflects work accepted. During a long-generation workload the two diverge sharply, and only the first tracks the load on the engine.",
+      "description": "Reported completion tokens per second reflects work declared by successful responses carrying valid usage; requests per minute reflects completed calls. Missing usage is never estimated, so the token line can understate total work unless clients and the engine request/report usage consistently.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -997,8 +1029,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(llmcp_inference_output_tokens_total{model=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "output tokens/s",
+          "expr": "sum(rate(llmcp_inference_reported_output_tokens_total{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval]))",
+          "legendFormat": "reported output tokens/s",
           "range": true,
           "instant": false,
           "refId": "A"
@@ -1009,7 +1041,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(llmcp_inference_requests_total{model=~\"$model\"}[$__rate_interval])) * 60",
+          "expr": "sum(rate(llmcp_inference_requests_total{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval])) * 60",
           "legendFormat": "requests/min",
           "range": true,
           "instant": false,
@@ -1086,7 +1118,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (code) (rate(llmcp_inference_requests_total{model=~\"$model\",code=~\"5..\"}[$__rate_interval]))",
+          "expr": "sum by (code) (rate(llmcp_inference_requests_total{namespace=\"$namespace\",model_deployment=\"$model_deployment\",code=~\"5..\"}[$__rate_interval]))",
           "legendFormat": "{{code}}",
           "range": true,
           "instant": false,
@@ -1098,7 +1130,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (reason) (rate(llmcp_shim_upstream_errors_total{model=~\"$model\"}[$__rate_interval]))",
+          "expr": "sum by (reason) (rate(llmcp_shim_upstream_errors_total{namespace=\"$namespace\",model_deployment=\"$model_deployment\"}[$__rate_interval]))",
           "legendFormat": "upstream {{reason}}",
           "range": true,
           "instant": false,

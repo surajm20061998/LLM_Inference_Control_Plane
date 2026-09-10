@@ -62,6 +62,11 @@ func newCanaryHarness(steps ...analysis.Step) *canaryHarness {
 	ns := mdtNewNamespace()
 	name := "canary-" + mdtSuffix()
 
+	// Every automatic analysis first proves that both variants expose the
+	// resource-scoped schema for a complete window. This standing answer keeps
+	// scenario scripts focused on their actual verdicts while exercising that
+	// compatibility gate in every rollout.
+	steps = append([]analysis.Step{analysis.Pass(100).For(llmcpmetrics.ShimInfo)}, steps...)
 	provider := analysis.NewScripted(steps...)
 	clk := testingclock.NewFakePassiveClock(time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC))
 
@@ -131,6 +136,9 @@ func (h *canaryHarness) markCanaryAvailable() {
 	GinkgoHelper()
 	dep := mdtGetDeployment(h.canaryKey)
 	Expect(helpers.MarkDeploymentAvailable(ctx, k8sClient, h.canaryKey, *dep.Spec.Replicas)).To(Succeed())
+	// Persist the instant this generation and the whole rung become ready.
+	// Advancing the clock before this reconcile would incorrectly backdate readiness.
+	h.reconcile()
 }
 
 // analysisRound steps the clock past the next scheduled round and reconciles.
@@ -170,6 +178,46 @@ func ttft(v float64) analysis.Step {
 }
 
 var _ = Describe("Canary rollout", func() {
+	It("holds old shims outside verdict budgets until scoped metrics are ready", func() {
+		h := newCanaryHarness(trafficOK(), ttft(0.4))
+		// Remove the harness's normal schema answer to emulate a user-pinned
+		// shim from before namespace/model_deployment labels were introduced.
+		legacy := analysis.NewScripted(trafficOK(), ttft(0.4))
+		legacy.Repeat = true
+		h.provider, h.r.Provider = legacy, legacy
+
+		h.establishBaseline()
+		h.switchToCanary()
+		h.reconcile()
+		h.markCanaryAvailable()
+		h.analysisRound()
+
+		cs := h.status()
+		Expect(cs.MetricScopeReady).To(BeFalse())
+		Expect(cs.FailedChecks).To(BeZero())
+		Expect(cs.ConsecutiveErrors).To(BeZero())
+		Expect(cs.ConsecutiveInconclusive).To(BeZero())
+		Expect(cs.Checks).To(BeEmpty())
+		Expect(cs.Message).To(ContainSubstring("upgrade pinned old shim images"))
+		cond := mdtExpectCondition(mdtGet(h.mdKey),
+			inferencev1alpha1.ConditionMetricScopeReady, metav1.ConditionFalse)
+		Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonMetricsScopePending))
+		Expect(legacy.Queries).NotTo(ContainElement(ContainSubstring(llmcpmetrics.TTFTSeconds)))
+
+		By("continuing immediately after a complete scoped window appears")
+		compatible := analysis.NewScripted(
+			analysis.Pass(100).For(llmcpmetrics.ShimInfo), trafficOK(), ttft(0.4))
+		compatible.Repeat = true
+		h.provider, h.r.Provider = compatible, compatible
+		h.analysisRound()
+
+		cs = h.status()
+		Expect(cs.MetricScopeReady).To(BeTrue())
+		Expect(cs.Step).To(Equal(int32(1)))
+		mdtExpectCondition(mdtGet(h.mdKey),
+			inferencev1alpha1.ConditionMetricScopeReady, metav1.ConditionTrue)
+	})
+
 	It("climbs the weight ladder and promotes when every check passes", func() {
 		h := newCanaryHarness(trafficOK(), ttft(0.4))
 		h.provider.Repeat = true
@@ -472,7 +520,7 @@ var _ = Describe("Canary rollout", func() {
 		Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonWeightQuantized))
 	})
 
-	It("declines to canary a single replica instead of stalling", func() {
+	It("holds the stable primary when a single replica cannot be split", func() {
 		// A canary Deployment with zero replicas never becomes available, and
 		// the rollout would sit at "waiting for canary replicas" forever with
 		// no hint that it never can.
@@ -484,19 +532,17 @@ var _ = Describe("Canary rollout", func() {
 
 		Expect(h.canaryExists()).To(BeFalse())
 
-		// The explanation lives on the condition rather than in status.canary:
-		// there IS no canary, so a canary status describing one would be
-		// misleading. What matters is that the refusal is stated somewhere a
-		// user will look, instead of presenting as a rollout that never moves.
 		cond := mdtExpectCondition(mdtGet(h.mdKey),
 			inferencev1alpha1.ConditionCanaryHealthy, metav1.ConditionUnknown)
 		Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonInsufficientReplicas))
 		Expect(cond.Message).To(ContainSubstring("at least 2 replicas"))
 
-		By("still rolling the new revision out on the primary")
+		By("keeping the known-good revision on the primary")
 		md := mdtGet(h.mdKey)
 		Expect(mdtGetDeployment(h.primaryKey).Labels[naming.LabelRevision]).
-			To(Equal(md.Status.StableRevision))
+			To(Equal(md.Status.LastGoodRevision))
+		Expect(md.Status.Canary.Revision).NotTo(Equal(md.Status.LastGoodRevision))
+		Expect(h.provider.Queries).To(BeEmpty())
 	})
 
 	It("sums replica counts across both variants for the /scale contract", func() {

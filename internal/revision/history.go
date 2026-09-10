@@ -17,9 +17,9 @@ limitations under the License.
 package revision
 
 import (
+	"bytes"
 	"cmp"
 	"context"
-	"encoding/json"
 	"fmt"
 	"slices"
 
@@ -66,10 +66,10 @@ type Recorder struct {
 // routinely lags its own writes, and would conclude "new revision" on every
 // reconcile until the cache caught up.
 //
-// revision is the identifier the caller computed with Hash for md.Spec; it
-// names the object (via naming.ControllerRevision) and is stamped on it as
-// naming.LabelRevision. The stored payload comes from Encode, so the recorded
-// bytes are by construction the bytes the hash was taken over.
+// revision names the object (via naming.ControllerRevision) and is stamped on
+// it as naming.LabelRevision. Current callers pass NewSnapshot.Raw as payload;
+// omitting payload writes the original unversioned encoding for compatibility
+// fixtures. An explicit payload is rejected unless its bytes hash to revision.
 //
 // The .Revision sequence number is assigned as max(existing) + 1, starting at
 // 1. An already-recorded revision keeps the number it was first given: it is
@@ -80,6 +80,7 @@ func (r *Recorder) Record(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
 	revision string,
+	payload ...[]byte,
 ) (cr *appsv1.ControllerRevision, created bool, err error) {
 	if md == nil {
 		return nil, false, fmt.Errorf("revision: cannot record a nil ModelDeployment")
@@ -88,20 +89,40 @@ func (r *Recorder) Record(
 		return nil, false, fmt.Errorf("revision: cannot record an empty revision for %s/%s",
 			md.Namespace, md.Name)
 	}
+	if len(payload) > 1 {
+		return nil, false, fmt.Errorf("revision: expected at most one payload for %s/%s", md.Namespace, md.Name)
+	}
+	var data []byte
+	if len(payload) == 1 {
+		data = append([]byte(nil), payload[0]...)
+		if len(data) == 0 {
+			return nil, false, fmt.Errorf("revision: cannot record an empty payload for %s/%s", md.Namespace, md.Name)
+		}
+		if actual := hashBytes(data); actual != revision {
+			return nil, false, fmt.Errorf(
+				"revision: payload identity %s does not match requested revision %s for %s/%s",
+				actual, revision, md.Namespace, md.Name)
+		}
+	} else {
+		data, err = Encode(&md.Spec)
+		if err != nil {
+			return nil, false, fmt.Errorf("revision: encoding spec of %s/%s: %w", md.Namespace, md.Name, err)
+		}
+	}
 
 	// Fast path: already recorded. Returning the existing object unchanged is
 	// what makes a steady-state reconcile free of writes.
 	existing, err := r.Get(ctx, md, revision)
 	if err == nil {
+		if !bytes.Equal(existing.Data.Raw, data) {
+			return nil, false, fmt.Errorf(
+				"revision: existing %s/%s has different payload bytes for identity %s",
+				existing.Namespace, existing.Name, revision)
+		}
 		return existing, false, nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return nil, false, err
-	}
-
-	data, err := Encode(&md.Spec)
-	if err != nil {
-		return nil, false, fmt.Errorf("revision: encoding spec of %s/%s: %w", md.Namespace, md.Name, err)
 	}
 
 	next, err := r.nextRevisionNumber(ctx, md)
@@ -140,7 +161,15 @@ func (r *Recorder) Record(
 			// caller that keys an event off a stale cache read will emit that
 			// event once per reconcile instead of once per revision.
 			adopted, getErr := r.Get(ctx, md, revision)
-			return adopted, false, getErr
+			if getErr != nil {
+				return nil, false, getErr
+			}
+			if !bytes.Equal(adopted.Data.Raw, data) {
+				return nil, false, fmt.Errorf(
+					"revision: raced %s/%s has different payload bytes for identity %s",
+					adopted.Namespace, adopted.Name, revision)
+			}
+			return adopted, false, nil
 		}
 		return nil, false, fmt.Errorf("revision: creating %s/%s: %w", cr.Namespace, cr.Name, err)
 	}
@@ -209,11 +238,10 @@ func (r *Recorder) List(
 
 // SpecFrom reconstructs the recorded spec subset from a ControllerRevision.
 //
-// IMPORTANT: only the revision-defining fields are populated — Model, Engine,
-// Serving.Port and Serving.Shim. Everything excluded from the revision is returned ZERO:
-// Replicas is nil, Rollout is the empty struct, Serving.StartupTimeout is nil.
-// That is not a gap to be filled in later, it is the point: those fields are
-// not part of the revision, so history has no opinion about them.
+// IMPORTANT: only revision-defining fields are populated. V2 returns Model,
+// Engine, Serving.StartupTimeout and Serving.Shim; legacy records return Model,
+// Engine, Serving.Port and Serving.Shim. Replicas and rollout policy are always
+// zero because history has no opinion about them.
 //
 // A caller rolling back must therefore MERGE this into the live spec — copy the
 // returned fields over — and must never assign it wholesale. Replacing the spec
@@ -228,19 +256,11 @@ func SpecFrom(cr *appsv1.ControllerRevision) (*inferencev1alpha1.ModelDeployment
 		return nil, fmt.Errorf("revision: ControllerRevision %s/%s has an empty payload", cr.Namespace, cr.Name)
 	}
 
-	var in revisionInput
-	if err := json.Unmarshal(cr.Data.Raw, &in); err != nil {
+	decoded, err := Decode(cr.Data.Raw)
+	if err != nil {
 		return nil, fmt.Errorf("revision: decoding ControllerRevision %s/%s: %w", cr.Namespace, cr.Name, err)
 	}
-
-	return &inferencev1alpha1.ModelDeploymentSpec{
-		Model:  in.Model,
-		Engine: in.Engine,
-		Serving: inferencev1alpha1.ServingSpec{
-			Port: in.Serving.Port,
-			Shim: in.Serving.Shim,
-		},
-	}, nil
+	return decoded.Spec.DeepCopy(), nil
 }
 
 // Prune deletes the oldest revisions beyond limit, never deleting the

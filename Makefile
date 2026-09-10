@@ -204,6 +204,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+NPX ?= npx
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
@@ -485,8 +486,13 @@ verify-ttft: ## Sprint 3 exit criterion: assert ttft_p95 < 0.5 x duration_p95 in
 CHAINSAW_VERSION ?= v0.2.15
 CHAINSAW ?= $(LOCALBIN)/chainsaw
 
-# Which suite to run. Empty runs all of them.
+# Which suite to run. Empty runs the non-destructive standard set below.
 SUITE ?=
+
+# Cluster-scoped CRD mutation in 09-observability-resync is intentionally not
+# part of the default set. That suite has its own opt-in target and verifies it
+# is running against a disposable, monitoring-free Kind cluster.
+CHAINSAW_STANDARD_SUITES ?= 01-basic 02-rolling-update 03-canary-promote 04-canary-rollback 05-scale-subresource 06-external-hpa 07-metric-isolation 08-canary-ladder
 
 .PHONY: chainsaw
 chainsaw: $(CHAINSAW) ## Download chainsaw locally if necessary.
@@ -514,24 +520,34 @@ chainsaw-lint: chainsaw ## Validate the Chainsaw suites without a cluster.
 	done
 
 .PHONY: e2e-chainsaw
-e2e-chainsaw: chainsaw ## Run the Chainsaw suites against the current cluster.
+e2e-chainsaw: chainsaw ## Run one suite, or every non-destructive suite, against the current cluster.
 	@if [ -n "$(SUITE)" ]; then \
 		"$(CHAINSAW)" test "test/chainsaw/$(SUITE)" --config test/chainsaw/config.yaml; \
 	else \
-		"$(CHAINSAW)" test test/chainsaw --config test/chainsaw/config.yaml; \
+		for suite in $(CHAINSAW_STANDARD_SUITES); do \
+			echo "Running Chainsaw suite $$suite"; \
+			"$(CHAINSAW)" test "test/chainsaw/$$suite" --config test/chainsaw/config.yaml; \
+		done; \
 	fi
+
+.PHONY: e2e-observability-resync
+e2e-observability-resync: chainsaw ## Run the cluster-scoped resync suite on a disposable *observability-resync* Kind cluster.
+	@LLMCP_OBSERVABILITY_RESYNC_E2E=1 \
+		"$(CHAINSAW)" test test/chainsaw/09-observability-resync --config test/chainsaw/config.yaml
 
 .PHONY: e2e-up
 e2e-up: kind-up dev-images dev-deploy ## Bring up a cluster with the operator and the stub images.
-	@echo "Cluster ready. Run: make e2e-chainsaw"
+	@echo "Cluster ready. A full standard run also needs: make loadgen-image monitoring-install"
+	@echo "Then run: make e2e-chainsaw"
 
 .PHONY: verify
-verify: manifests generate fmt vet lint test api-docs-check chainsaw-lint ## Everything that runs without a cluster.
+verify: manifests generate fmt vet lint test api-docs-check docs-mermaid-check chainsaw-lint ## Everything that runs without a cluster.
 
 ##@ Documentation
 
 CRD_REF_DOCS_VERSION ?= v0.3.0
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
+MERMAID_CLI_VERSION ?= 11.16.0
 
 .PHONY: crd-ref-docs
 crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary.
@@ -563,6 +579,21 @@ api-docs-check: api-docs ## Fail if docs/api.md is out of date.
 	else \
 		echo "docs/api.md is up to date."; \
 	fi
+
+.PHONY: docs-mermaid-check
+docs-mermaid-check: ## Parse and render every Mermaid diagram in README.md.
+	@command -v "$(NPX)" >/dev/null 2>&1 || { \
+		echo "npx is required to validate Mermaid diagrams."; \
+		exit 1; \
+	}
+	@set -e; \
+	blocks="$$(awk '/^```mermaid[[:space:]]*$$/ { count++ } END { print count + 0 }' README.md)"; \
+	[ "$$blocks" -gt 0 ] || { echo "README.md contains no Mermaid diagrams."; exit 1; }; \
+	tmp="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	"$(NPX)" --yes --package="@mermaid-js/mermaid-cli@$(MERMAID_CLI_VERSION)" \
+		mmdc --quiet --input README.md --output "$$tmp/README.md"; \
+	echo "README.md: $$blocks Mermaid diagrams valid (mermaid-cli $(MERMAID_CLI_VERSION))"
 
 .PHONY: load
 load: ## Run the in-cluster streaming load generator against MD=<name>.

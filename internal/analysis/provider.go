@@ -95,6 +95,11 @@ func (f ProviderFunc) Query(ctx context.Context, query string) (Sample, error) {
 
 // QueryContext is the substitution environment for a metric query.
 type QueryContext struct {
+	// Namespace and ModelDeployment identify the owning Kubernetes resource.
+	// Built-ins require both so legacy, unscoped series cannot match.
+	Namespace       string
+	ModelDeployment string
+
 	// Model is spec.model.name — the `model` label on every emitted series.
 	Model string
 

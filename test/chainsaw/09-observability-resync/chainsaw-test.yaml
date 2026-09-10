@@ -1,0 +1,180 @@
+# Optional monitoring appears, drifts, recovers, and disappears without any
+# edit to the ModelDeployment after creation.
+#
+# SAFETY: this suite creates and deletes the cluster-scoped, canonical
+# monitoring.coreos.com CRDs. It deliberately refuses to run unless both an
+# explicit opt-in is set and the current context names a dedicated Kind
+# cluster. Never include it in a shared-cluster run:
+#
+#   kind create cluster --name llmcp-observability-resync
+#   make e2e-observability-resync
+#
+# The full kube-prometheus stack must NOT be installed in that cluster.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: observability-resync
+spec:
+  timeouts:
+    assert: 7m
+    exec: 2m
+  steps:
+    - name: require-a-disposable-monitoring-free-kind-cluster
+      try:
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              context=$(kubectl config current-context)
+              if [[ "${LLMCP_OBSERVABILITY_RESYNC_E2E:-}" != "1" ]]; then
+                echo 'Refusing cluster-scoped CRD mutation: set LLMCP_OBSERVABILITY_RESYNC_E2E=1' >&2
+                exit 1
+              fi
+              if [[ "${context}" != kind-*observability-resync* ]]; then
+                echo "Refusing context ${context}: use a dedicated Kind context containing observability-resync" >&2
+                exit 1
+              fi
+              for crd in servicemonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com; do
+                if kubectl get crd "${crd}" >/dev/null 2>&1; then
+                  echo "Refusing to replace pre-existing ${crd}" >&2
+                  exit 1
+                fi
+              done
+
+    - name: become-steady-without-optional-apis
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: resync-demo
+              status:
+                phase: Available
+                readyReplicas: 1
+                (conditions[?type == 'Ready'] | [0].status): "True"
+                (conditions[?type == 'MetricsRegistered'] | [0].status): "False"
+                (conditions[?type == 'MetricsRegistered'] | [0].reason): PrometheusOperatorCRDsAbsent
+
+    - name: install-the-optional-apis
+      try:
+        - apply:
+            file: monitoring-crds.yaml
+        # No ModelDeployment patch follows. The negative-discovery timer is the
+        # only event that can make the controller notice these CRDs.
+        - assert:
+            timeout: 2m
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: resync-demo
+              status:
+                (conditions[?type == 'MetricsRegistered'] | [0].status): "True"
+                (conditions[?type == 'MetricsRegistered'] | [0].reason): MetricsRegistered
+        - assert:
+            resource:
+              apiVersion: monitoring.coreos.com/v1
+              kind: ServiceMonitor
+              metadata:
+                name: resync-demo
+              spec:
+                (endpoints[?port == 'metrics'] | [0].interval): 5s
+                (endpoints[?port == 'metrics'] | [0].scrapeTimeout): 3s
+        - assert:
+            resource:
+              apiVersion: monitoring.coreos.com/v1
+              kind: PrometheusRule
+              metadata:
+                name: resync-demo-slo
+
+    - name: damage-only-controller-owned-children
+      try:
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              parent_uid=$(kubectl -n "$NAMESPACE" get modeldeployment resync-demo \
+                -o jsonpath='{.metadata.uid}')
+              sm_owner=$(kubectl -n "$NAMESPACE" get servicemonitor resync-demo \
+                -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')
+              rule_owner=$(kubectl -n "$NAMESPACE" get prometheusrule resync-demo-slo \
+                -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')
+              test "${sm_owner}" = "${parent_uid}"
+              test "${rule_owner}" = "${parent_uid}"
+
+              # Mutate one owned child and delete the other in the same resync
+              # interval. Neither kind is watched, so only the healthy periodic
+              # timer can repair them.
+              kubectl -n "$NAMESPACE" patch servicemonitor resync-demo --type=merge \
+                -p '{"spec":{"endpoints":[{"port":"metrics","path":"/metrics","interval":"1h","scrapeTimeout":"3s"}]}}'
+              kubectl -n "$NAMESPACE" delete prometheusrule resync-demo-slo --wait=true
+
+    - name: periodic-resync-repairs-owned-drift
+      try:
+        - assert:
+            timeout: 7m
+            resource:
+              apiVersion: monitoring.coreos.com/v1
+              kind: ServiceMonitor
+              metadata:
+                name: resync-demo
+              spec:
+                (endpoints[?port == 'metrics'] | [0].interval): 5s
+                (endpoints[?port == 'metrics'] | [0].scrapeTimeout): 3s
+                (endpoints[?port == 'engine'] | length(@)): 1
+        - assert:
+            resource:
+              apiVersion: monitoring.coreos.com/v1
+              kind: PrometheusRule
+              metadata:
+                name: resync-demo-slo
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              parent_uid=$(kubectl -n "$NAMESPACE" get modeldeployment resync-demo \
+                -o jsonpath='{.metadata.uid}')
+              for resource in servicemonitor/resync-demo prometheusrule/resync-demo-slo; do
+                owner=$(kubectl -n "$NAMESPACE" get "${resource}" \
+                  -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].uid}')
+                test "${owner}" = "${parent_uid}"
+              done
+
+    - name: optional-api-removal-is-reported
+      try:
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              # Delete only CRDs this suite proved did not pre-exist and whose
+              # ownership marker still matches. The context guard is repeated
+              # at the destructive boundary rather than trusted from step one.
+              context=$(kubectl config current-context)
+              [[ "${LLMCP_OBSERVABILITY_RESYNC_E2E:-}" == "1" ]]
+              [[ "${context}" == kind-*observability-resync* ]]
+              for crd in servicemonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com; do
+                owner=$(kubectl get crd "${crd}" -o jsonpath='{.metadata.labels.llmcp\.io/e2e-owner}')
+                test "${owner}" = observability-resync
+              done
+              kubectl delete crd servicemonitors.monitoring.coreos.com \
+                prometheusrules.monitoring.coreos.com --wait=true
+        - assert:
+            timeout: 7m
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: resync-demo
+              status:
+                # MetricsRegistered describes registration, not successful
+                # Prometheus scraping.
+                (conditions[?type == 'MetricsRegistered'] | [0].status): "False"
+                (conditions[?type == 'MetricsRegistered'] | [0].reason): PrometheusOperatorCRDsAbsent
+      catch:
+        - events: {}
+        - describe:
+            apiVersion: inference.llmcp.io/v1alpha1
+            kind: ModelDeployment

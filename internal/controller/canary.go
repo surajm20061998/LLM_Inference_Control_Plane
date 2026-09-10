@@ -252,29 +252,62 @@ func (r *ModelDeploymentReconciler) planCanary(
 	now := r.now()
 
 	in := canary.Input{
-		Now:             now,
-		Plan:            plan,
-		State:           state,
-		TargetRevision:  target,
-		StableRevision:  md.Status.LastGoodRevision,
-		TotalReplicas:   total,
-		CanaryAvailable: canaryDep != nil && canaryDep.Status.ReadyReplicas > 0,
-		Approved:        annotationTrue(md, naming.AnnoPromote),
-		Aborted:         annotationTrue(md, naming.AnnoAbort),
+		Now:            now,
+		Plan:           plan,
+		State:          state,
+		TargetRevision: target,
+		StableRevision: md.Status.LastGoodRevision,
+		TotalReplicas:  total,
+		Approved:       annotationTrue(md, naming.AnnoPromote),
+		Aborted:        annotationTrue(md, naming.AnnoAbort),
 	}
+	if canaryDep != nil && canaryDep.Spec.Replicas != nil {
+		in.Deployment = canary.DeploymentObservation{
+			UID: string(canaryDep.UID), Revision: canaryDep.Spec.Template.Labels[naming.LabelRevision],
+			Generation: canaryDep.Generation, ObservedGeneration: canaryDep.Status.ObservedGeneration,
+			Replicas: *canaryDep.Spec.Replicas, UpdatedReplicas: canaryDep.Status.UpdatedReplicas,
+			ReadyReplicas: canaryDep.Status.ReadyReplicas, AvailableReplicas: canaryDep.Status.AvailableReplicas,
+		}
+	}
+	in = canary.Observe(in)
 
 	// Analysis is run ONLY when the state machine says a round is due. The
 	// alternative — querying on every reconcile — would put Prometheus in the
 	// path of every watch event, several times a second under an active
 	// rollout, and would make the analysis interval a property of how noisy the
 	// cluster happens to be rather than of the spec.
-	if canary.DueForAnalysis(now, plan, state) {
-		round := r.analyse(ctx, md, plan)
-		in.Round = &round
-		log.V(1).Info("analysis round", "verdict", round.Verdict, "checks", len(round.Checks))
+	scopePending := false
+	scopeMessage := ""
+	if !in.Aborted && state.Revision == target && canary.DueForAnalysis(now, plan, in.State) {
+		if !in.State.MetricScopeReady {
+			// Next with no round is a pure preview of the current replica split.
+			// The schema handshake is intentionally outside Aggregate: absence
+			// of migration data must hold, not spend an error/inconclusive budget.
+			preview := canary.Next(in)
+			ready, message := r.metricsScopeReady(ctx, r.providerFor(md), md, plan.Window,
+				preview.Primary, preview.Canary)
+			if !ready {
+				scopePending, scopeMessage = true, message
+			} else {
+				in.State.MetricScopeReady = true
+			}
+		}
+		if !scopePending {
+			round := r.analyse(ctx, md, plan)
+			in.Round = &round
+			log.V(1).Info("Analysis round", "verdict", round.Verdict, "checks", len(round.Checks))
+		}
 	}
 
 	out := canary.Next(in)
+	if scopePending {
+		out.Reason = inferencev1alpha1.ReasonMetricsScopePending
+		out.Message = scopeMessage
+		out.RequeueAfter = soonest(out.RequeueAfter, plan.Interval)
+	}
+	out.ReadyReplicas = in.Deployment.ReadyReplicas
+	out.AvailableReplicas = in.Deployment.AvailableReplicas
+	r.observeCanaryTraffic(ctx, md, plan, now, &out)
 
 	res := rollout{
 		Output:          out,
@@ -314,7 +347,7 @@ func (r *ModelDeploymentReconciler) planCanary(
 		// while the primary keeps serving the stable one.
 		res.PrimaryRevision = firstNonEmpty(md.Status.LastGoodRevision, target)
 		res.CanaryRevision = out.State.Revision
-		res.Active = res.CanaryReplicas > 0
+		res.Active = out.State.Revision != ""
 	}
 
 	return res
@@ -349,10 +382,13 @@ func (r *ModelDeploymentReconciler) analyse(
 
 	started := r.now()
 	checks := analyzer.Run(ctx, analysis.Request{
-		Model:          md.Spec.Model.Name,
-		Window:         analysis.PromDuration(spec.ResolvedWindow().Duration),
-		MinRequestRate: spec.ResolvedMinRequestRate(),
-		Metrics:        metrics,
+		Namespace:       md.Namespace,
+		ModelDeployment: md.Name,
+		Model:           md.Spec.Model.Name,
+		Window:          analysis.PromDuration(spec.ResolvedWindow().Duration),
+		MinRequestRate:  spec.ResolvedMinRequestRate(),
+		MinUsageSamples: spec.ResolvedMinUsageSamples(),
+		Metrics:         metrics,
 	})
 
 	round := canary.Aggregate(checks)
@@ -406,6 +442,7 @@ func canaryPlan(md *inferencev1alpha1.ModelDeployment) canary.Plan {
 		Weights:               c.StepLadder(),
 		Interval:              a.ResolvedInterval().Duration,
 		InitialDelay:          a.ResolvedInitialDelay().Duration,
+		Window:                a.ResolvedWindow().Duration,
 		FailureThreshold:      a.ResolvedFailureThreshold(),
 		ConsecutiveErrorLimit: a.ResolvedConsecutiveErrorLimit(),
 		InconclusiveLimit:     a.ResolvedInconclusiveLimit(),
@@ -418,10 +455,27 @@ func canaryPlan(md *inferencev1alpha1.ModelDeployment) canary.Plan {
 		ProgressDeadline: time.Duration(progressDeadlineSeconds(md)) * time.Second,
 	}
 
-	if c.Scale != nil && c.Scale.Replicas != nil {
-		plan.CanaryReplicaOverride = c.Scale.Replicas
-	}
 	return plan
+}
+
+// validateCanaryRouting is intentionally controller validation first. Existing
+// stored alpha resources remain editable while operators remove invalid fixed
+// capacity settings before a future admission validation rule is introduced.
+func validateCanaryRouting(spec *inferencev1alpha1.ModelDeploymentSpec) error {
+	if !spec.Rollout.IsCanary() || spec.Rollout.Canary.Scale == nil {
+		return nil
+	}
+	c := spec.Rollout.Canary
+	if c.TrafficRouting.Mode != "" && c.TrafficRouting.Mode != inferencev1alpha1.TrafficRoutingReplica {
+		return nil
+	}
+	if c.Scale.Replicas != nil {
+		return fmt.Errorf("replica traffic routing requires proportional capacity: remove spec.rollout.canary.scale.replicas")
+	}
+	if c.Scale.MatchTrafficWeight != nil && !*c.Scale.MatchTrafficWeight {
+		return fmt.Errorf("replica traffic routing requires spec.rollout.canary.scale.matchTrafficWeight=true or an omitted scale")
+	}
+	return nil
 }
 
 // canaryStateFrom rebuilds the state machine's position from status.
@@ -439,11 +493,13 @@ func canaryStateFrom(md *inferencev1alpha1.ModelDeployment) canary.State {
 	}
 
 	st := canary.State{
-		Phase:          canaryPhaseFrom(md.Status.Phase),
-		Revision:       cs.Revision,
-		StableRevision: cs.StableRevision,
-		FailedRevision: cs.FailedRevision,
-		Step:           cs.Step,
+		Phase:            canaryPhaseFrom(md.Status.Phase),
+		Revision:         cs.Revision,
+		StableRevision:   cs.StableRevision,
+		FailedRevision:   cs.FailedRevision,
+		MetricScopeReady: cs.MetricScopeReady,
+		Step:             cs.Step,
+		ReadinessTarget:  cs.ReadinessTarget,
 	}
 	st.SetCounters(cs.FailedChecks, cs.ConsecutiveErrors, cs.ConsecutiveInconclusive)
 
@@ -497,6 +553,16 @@ func canaryStatusFrom(out canary.Output, round *canary.Round, prev *inferencev1a
 		ConsecutiveErrors:       st.ConsecutiveErrors(),
 		ConsecutiveInconclusive: st.ConsecutiveInconclusive(),
 		Message:                 out.Message,
+		ReadinessTarget:         st.ReadinessTarget,
+		ReadyReplicas:           out.ReadyReplicas,
+		AvailableReplicas:       out.AvailableReplicas,
+		ObservedWeight:          out.Observation.Weight,
+		ObservationReason:       out.Observation.Reason,
+		MetricScopeReady:        st.MetricScopeReady,
+	}
+	if !out.Observation.At.IsZero() {
+		cs.ObservedAt = &metav1.Time{Time: out.Observation.At}
+		cs.ObservationWindow = &metav1.Duration{Duration: out.Observation.Window}
 	}
 
 	if !st.StartedAt.IsZero() {
@@ -510,6 +576,8 @@ func canaryStatusFrom(out canary.Output, round *canary.Round, prev *inferencev1a
 	}
 
 	switch {
+	case st.LastAnalysis.IsZero():
+		// Readiness/rung changes invalidate prior evidence.
 	case round != nil:
 		cs.Checks = round.Checks
 	case prev != nil:

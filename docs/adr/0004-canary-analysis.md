@@ -29,11 +29,14 @@ spends its own budget:
 | `Inconclusive` | Query OK but unusable: no samples, NaN, ±Inf, or below `minRequestRate` | `consecutiveInconclusive` → `inconclusiveLimit` ⇒ `onInconclusive` |
 | `Pass` | In range | resets Error and Inconclusive, **not** `failedChecks` |
 
-**A monitoring outage must never cause a rollback.** Prometheus going down
-yields `Error`, and the error budget resets on the first healthy round. A single
-"strikes" counter cannot express this: it cannot distinguish "the release is
-bad" from "Prometheus is down" from "nobody is sending traffic", and those three
-call for a rollback, a retry and a human respectively.
+**A monitoring outage is not evidence that a release is bad.** Prometheus going
+down yields `Error`; it does not spend `failedChecks`, and the consecutive-error
+counter resets on the first healthy round. The controller initially holds and
+retries, then aborts the rollout back to the recorded stable revision at the
+configured error limit rather than leaving an unmeasurable candidate active
+indefinitely. A single "strikes" counter cannot distinguish "the release is
+bad" from "Prometheus is down" from "nobody is sending traffic", and those
+states require separate policy.
 
 Two subtleties follow, both counter-intuitive and both deliberate.
 
@@ -119,7 +122,8 @@ while calling it a 20% exposure. The state machine detects that case up front
 and declines to canary with `ReasonInsufficientReplicas`, because a canary
 Deployment with zero replicas never becomes available and the rollout would
 otherwise sit at "waiting for canary replicas" forever with no hint that it never
-can.
+can. It keeps the stable revision serving, does not start the progress deadline,
+and begins a fresh attempt if capacity later increases.
 
 ## Other decisions worth recording
 
@@ -127,9 +131,11 @@ can.
 its `ControllerRevision`.** Rendering both variants from `md.Spec` would produce
 two identical pod templates and an analysis that compares a revision against
 itself. The stored payload is **merged** into the live spec, never assigned
-wholesale: a revision records only model, engine, serving port and shim, so
-assigning it would null out `replicas` — undoing whatever an autoscaler had
-decided — and turn a rollback into an unintended scale-down.
+wholesale: a v2 revision records model, effective engine configuration, startup
+timeout and shim, while replicas and rollout policy stay live. Assigning it
+wholesale would null out `replicas` — undoing whatever an autoscaler had decided
+— and turn a rollback into an unintended scale-down. The versioned wire format
+and legacy decoder are specified in [ADR 0008](0008-versioned-workload-revisions.md).
 
 **A rollback records `status.canary.failedRevision` and sticks.** The spec still
 names the rejected revision, so target and stable still differ; without the

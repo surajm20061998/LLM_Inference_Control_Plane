@@ -38,7 +38,7 @@ jobs:
       # else caches them: setup-go caches the module and build caches, which
       # makes the rebuild cheaper but does not skip it. The worst instance is
       # chainsaw, a ~229 MB binary compiled on every push purely to schema-check
-      # six YAML files in about a second. Every tool version literal lives in
+      # the suite definitions in about a second. Every tool version literal lives in
       # the Makefile, so it is the right cache key.
       - name: Cache tool binaries
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

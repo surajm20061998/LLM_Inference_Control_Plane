@@ -32,8 +32,8 @@ limitations under the License.
 // CRD is absent fails at Start() with meta.NoKindMatchError, and — the part
 // that bites — it does not recover when the CRD is installed later, because the
 // mapper's discovery is not re-run for an established informer. That is why
-// this operator never watches ServiceMonitors at all; it applies them and reads
-// nothing back.
+// this operator never watches ServiceMonitors at all; it reads and applies
+// them during reconciliation, with a periodic timer to repair drift.
 //
 // For plain client calls the dynamic RESTMapper does reload on a miss, so the
 // remaining problem is only one of REPORTING: without a probe, the first
@@ -217,8 +217,8 @@ func (p *Prober) store(gvk schema.GroupVersionKind, present bool) {
 	p.cache[gvk] = entry{present: present, expiresAt: p.clock.Now().Add(ttl)}
 }
 
-// isGroupDiscoveryFailure reports whether err is discovery's "this group could
-// not be resolved" error for gv.
+// isGroupDiscoveryFailure reports a definitive absence of gv within an
+// aggregated discovery error. Authorization and transport failures remain errors.
 //
 // The API server returns a 404 for an unknown group/version, but the aggregated
 // discovery path wraps that in ErrGroupDiscoveryFailed instead — so checking
@@ -228,9 +228,9 @@ func isGroupDiscoveryFailure(err error, gv string) bool {
 	if !errors.As(err, &groupErr) {
 		return false
 	}
-	for failed := range groupErr.Groups {
+	for failed, cause := range groupErr.Groups {
 		if failed.String() == gv {
-			return true
+			return apierrors.IsNotFound(cause)
 		}
 	}
 	return false

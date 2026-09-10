@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: isolation-hot-load
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: localhost:5001/llmcp-loadgen:dev
+          imagePullPolicy: Always
+          args:
+            - --url=http://isolation-hot:8080
+            - --model=shared-stub-model
+            - --duration=10m
+            - --concurrency=16
+            - --tokens=24
+            - --keepalive=false
+          resources:
+            requests:
+              cpu: 100m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

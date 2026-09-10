@@ -23,9 +23,10 @@ limitations under the License.
 // revision that was known good, which requires both knowing which revision that
 // was (a stable identifier) and being able to reconstruct it (a stored payload).
 //
-// The identifier and the payload are produced from ONE definition — see
-// revisionInput — so that the bytes that were hashed and the bytes that were
-// stored can never drift apart.
+// The identifier and payload are produced from the same canonical bytes. New
+// records use an explicit versioned envelope; the original unversioned shape
+// remains below solely so existing ControllerRevisions can be decoded by their
+// stored identity.
 package revision
 
 import (
@@ -33,6 +34,7 @@ import (
 	"fmt"
 	"hash/fnv"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/rand"
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
@@ -60,14 +62,13 @@ import (
 //     flight must not restart that rollout — which is exactly what would happen
 //     if the deadline were part of the revision identity.
 //
-// Serving contributes only Port: it is the port the container listens on and so
-// is part of the pod template. ServingSpec.StartupTimeout is currently probe
-// tuning that the controller applies to the pod template as well, but it is
-// left out on purpose — see the Serving comment below.
+// The legacy format included Serving.Port and omitted StartupTimeout. That
+// classification was incorrect: Port changes the stable Service, while
+// StartupTimeout changes each Pod's probe. workloadV2 fixes the boundary
+// without reinterpreting these old bytes.
 //
-// Changing this struct changes every existing revision hash in every cluster,
-// which orphans recorded history and forces a one-time rollout of every
-// ModelDeployment. Treat it as effectively permanent.
+// This legacy wire type is frozen. Changing it would make old history
+// undecodable; new identity changes belong in a new versioned workload type.
 type revisionInput struct {
 	// Model is included whole: name, source image, path and pull policy all
 	// determine what the pod mounts and serves.
@@ -100,8 +101,9 @@ type revisionInput struct {
 
 // revisionServing is the revision-defining subset of ServingSpec.
 type revisionServing struct {
-	// Port is the port the engine's Service — and therefore its container —
-	// listens on.
+	// Port was historically treated as workload identity. It is retained only
+	// to decode the original wire format; v2 correctly classifies it as a
+	// Service-only field.
 	Port int32 `json:"port"`
 
 	// Shim is included whole because every field of it lands in the pod
@@ -114,6 +116,160 @@ type revisionServing struct {
 	// have no rollback target, and — worse — a canary triggered by "turn metrics
 	// on" would compare two variants the controller believes are identical.
 	Shim inferencev1alpha1.ShimSpec `json:"shim"`
+}
+
+const (
+	// PayloadVersionV2 is the first explicitly versioned revision format. The
+	// original payload had no version field and remains decodable as legacy v1.
+	PayloadVersionV2 = "v2"
+)
+
+// workloadV2 is the effective, pod-template-affecting configuration recorded
+// by the current controller. The caller resolves API and operator defaults
+// before constructing it, so a later controller can render the same workload
+// even when its compiled-in defaults have changed.
+//
+// Serving.Port is intentionally absent: it changes the stable Service, not a
+// serving Pod. StartupTimeout is present because it changes the startup probe.
+type workloadV2 struct {
+	Model   inferencev1alpha1.ModelSpec  `json:"model"`
+	Engine  inferencev1alpha1.EngineSpec `json:"engine"`
+	Serving workloadServingV2            `json:"serving"`
+}
+
+type workloadServingV2 struct {
+	StartupTimeout *metav1.Duration           `json:"startupTimeout"`
+	Shim           inferencev1alpha1.ShimSpec `json:"shim"`
+}
+
+// versionedPayload is the durable ControllerRevision wire format. Version is
+// part of the hashed bytes, preventing a future decoder from confusing two
+// schemas that happen to contain similar fields.
+type versionedPayload struct {
+	Version  string     `json:"version"`
+	Workload workloadV2 `json:"workload"`
+}
+
+// Snapshot couples the immutable bytes stored in ControllerRevision with the
+// identifier derived from those exact bytes.
+type Snapshot struct {
+	Revision string
+	Raw      []byte
+}
+
+// Decoded describes a stored revision without losing which migration rules
+// apply to it.
+type Decoded struct {
+	Spec    inferencev1alpha1.ModelDeploymentSpec
+	Version string
+}
+
+// Legacy reports whether this revision predates the versioned envelope.
+func (d Decoded) Legacy() bool { return d.Version == "" }
+
+// NewSnapshot encodes an already-resolved workload using the current payload
+// version and hashes the exact stored bytes.
+func NewSnapshot(spec *inferencev1alpha1.ModelDeploymentSpec) (Snapshot, error) {
+	if spec == nil {
+		return Snapshot{}, fmt.Errorf("revision: cannot snapshot a nil effective workload")
+	}
+	if err := validateEffectiveSpec(spec); err != nil {
+		return Snapshot{}, err
+	}
+	payload := versionedPayload{
+		Version: PayloadVersionV2,
+		Workload: workloadV2{
+			Model:  spec.Model,
+			Engine: spec.Engine,
+			Serving: workloadServingV2{
+				StartupTimeout: spec.Serving.StartupTimeout,
+				Shim:           spec.Serving.Shim,
+			},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("revision: encoding %s payload: %w", PayloadVersionV2, err)
+	}
+	return Snapshot{Revision: hashBytes(raw), Raw: raw}, nil
+}
+
+func validateEffectiveSpec(spec *inferencev1alpha1.ModelDeploymentSpec) error {
+	switch {
+	case spec.Engine.Type == "":
+		return fmt.Errorf("revision: effective engine type is empty")
+	case spec.Engine.Image == "":
+		return fmt.Errorf("revision: effective engine image is empty")
+	case spec.Engine.ImagePullPolicy == "":
+		return fmt.Errorf("revision: effective engine image pull policy is empty")
+	case spec.Engine.ContextSize == nil:
+		return fmt.Errorf("revision: effective engine context size is unresolved")
+	case spec.Engine.MaxConcurrency == nil:
+		return fmt.Errorf("revision: effective engine concurrency is unresolved")
+	case spec.Engine.Threads == nil:
+		return fmt.Errorf("revision: effective engine thread count is unresolved")
+	case spec.Serving.StartupTimeout == nil:
+		return fmt.Errorf("revision: effective startup timeout is unresolved")
+	case spec.Serving.Shim.Enabled == nil:
+		return fmt.Errorf("revision: effective shim enablement is unresolved")
+	}
+	if image := spec.Model.Source.Image; image != nil {
+		if image.Path == "" || image.PullPolicy == "" {
+			return fmt.Errorf("revision: effective model image path or pull policy is unresolved")
+		}
+	}
+	if spec.Serving.ShimEnabled() {
+		shim := spec.Serving.Shim
+		if shim.Image == "" || shim.LogLevel == "" ||
+			(len(shim.Resources.Requests) == 0 && len(shim.Resources.Limits) == 0) {
+			return fmt.Errorf("revision: effective shim image, log level, or resources are unresolved")
+		}
+	}
+	return nil
+}
+
+// Decode reads both the current envelope and the original unversioned
+// revisionInput. Unknown versions fail closed instead of being interpreted as
+// the latest schema.
+func Decode(raw []byte) (Decoded, error) {
+	if len(raw) == 0 {
+		return Decoded{}, fmt.Errorf("revision: empty payload")
+	}
+	var header struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return Decoded{}, fmt.Errorf("revision: decoding payload header: %w", err)
+	}
+	if header.Version == "" {
+		var legacy revisionInput
+		if err := json.Unmarshal(raw, &legacy); err != nil {
+			return Decoded{}, fmt.Errorf("revision: decoding legacy payload: %w", err)
+		}
+		return Decoded{Spec: inferencev1alpha1.ModelDeploymentSpec{
+			Model:  legacy.Model,
+			Engine: legacy.Engine,
+			Serving: inferencev1alpha1.ServingSpec{
+				Port: legacy.Serving.Port,
+				Shim: legacy.Serving.Shim,
+			},
+		}}, nil
+	}
+	if header.Version != PayloadVersionV2 {
+		return Decoded{}, fmt.Errorf("revision: unsupported payload version %q", header.Version)
+	}
+	var payload versionedPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return Decoded{}, fmt.Errorf("revision: decoding %s payload: %w", PayloadVersionV2, err)
+	}
+	return Decoded{Version: payload.Version, Spec: inferencev1alpha1.ModelDeploymentSpec{
+		Model:  payload.Workload.Model,
+		Engine: payload.Workload.Engine,
+		Serving: inferencev1alpha1.ServingSpec{
+			StartupTimeout: payload.Workload.Serving.StartupTimeout,
+			Shim:           payload.Workload.Serving.Shim,
+		},
+	}}, nil
 }
 
 // revisionPayload projects a ModelDeploymentSpec onto the fields that define a
@@ -135,23 +291,19 @@ func revisionPayload(spec *inferencev1alpha1.ModelDeploymentSpec) revisionInput 
 	}
 }
 
-// Encode returns the canonical JSON encoding of the revision-defining subset of
-// spec.
+// Encode returns the original unversioned encoding. It is retained for legacy
+// fixtures and compatibility tooling; current controller code uses
+// NewSnapshot.
 //
-// This is the single source of truth for "what a revision is": Hash hashes
-// exactly these bytes, and Recorder.Record stores exactly these bytes in the
-// ControllerRevision's Data.Raw. Keeping one function means the recorded
-// payload can never describe a different revision than the hash that names it —
-// if the two were computed independently, a change to one would silently
-// produce history that cannot be verified against its own identifier.
-//
-// SpecFrom is the inverse.
+// Hash hashes exactly these bytes. Recorder.Record without an explicit payload
+// also stores them, allowing upgrade tests to construct history written by the
+// pre-v2 controller.
 func Encode(spec *inferencev1alpha1.ModelDeploymentSpec) ([]byte, error) {
 	return json.Marshal(revisionPayload(spec))
 }
 
-// Hash returns the revision identifier for the pod-template-affecting subset
-// of spec.
+// Hash returns a legacy revision identifier. Current controller code uses the
+// identifier returned by NewSnapshot.
 //
 // The result is stable across processes and across restarts: it is FNV-1a/32
 // over the canonical JSON from Encode, then encoded with
@@ -179,9 +331,12 @@ func Hash(spec *inferencev1alpha1.ModelDeploymentSpec) string {
 		data = []byte("llmcp: revision encode error: " + err.Error())
 	}
 
+	return hashBytes(data)
+}
+
+func hashBytes(data []byte) string {
 	h := fnv.New32a()
 	// hash.Hash's Write never returns an error.
 	_, _ = h.Write(data)
-
 	return rand.SafeEncodeString(fmt.Sprint(h.Sum32()))
 }

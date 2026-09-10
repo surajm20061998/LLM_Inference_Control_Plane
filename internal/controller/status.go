@@ -153,8 +153,12 @@ func computeStatus(
 	setModelReady(md, &status, available, progressing, md.Generation)
 
 	status.Canary = canaryStatusFrom(obs.Rollout.Output, obs.Rollout.Round, prev.Canary)
+	if status.Canary != nil && md.Spec.Rollout.Canary != nil {
+		status.Canary.Steps = int32(len(md.Spec.Rollout.Canary.StepWeights))
+	}
 	status.Autoscaling = obs.Scaling.Autoscaling
 	canaryActive := setCanaryHealthy(&status, obs, md.Generation)
+	setMetricScopeReady(&status, obs, md.Generation)
 	setTrafficRoutingReady(&status, obs, md.Generation)
 	setAutoscalingReady(&status, obs.Scaling, md.Generation)
 
@@ -184,6 +188,39 @@ func computeStatus(
 	status.Phase = derivePhase(available, progressing, stalled, status.LastGoodRevision, obs.Rollout)
 
 	return status
+}
+
+// setMetricScopeReady exposes the compatibility handshake independently of a
+// canary quality verdict. A pinned old shim is an actionable migration block,
+// not evidence that the candidate itself is unhealthy.
+func setMetricScopeReady(
+	status *inferencev1alpha1.ModelDeploymentStatus,
+	obs observed,
+	generation int64,
+) {
+	out := obs.Rollout.Output
+	cond := metav1.Condition{
+		Type:               inferencev1alpha1.ConditionMetricScopeReady,
+		ObservedGeneration: generation,
+		Status:             metav1.ConditionUnknown,
+		Reason:             inferencev1alpha1.ReasonCanaryNotRunning,
+		Message:            "No canary metric-scope handshake is in progress",
+	}
+	if out.Canary > 0 && out.State.Revision != "" {
+		if out.State.MetricScopeReady {
+			cond.Status = metav1.ConditionTrue
+			cond.Reason = inferencev1alpha1.ReasonMetricsScopeReady
+			cond.Message = "A complete resource-scoped metric window is available"
+		} else {
+			cond.Status = metav1.ConditionFalse
+			cond.Reason = inferencev1alpha1.ReasonMetricsScopePending
+			cond.Message = "Waiting for namespace/model_deployment metrics from the current candidate"
+			if out.Reason == inferencev1alpha1.ReasonMetricsScopePending && out.Message != "" {
+				cond.Message = out.Message
+			}
+		}
+	}
+	setCondition(status, cond)
 }
 
 // setCanaryHealthy reports the most recent analysis verdict, and returns
@@ -228,10 +265,15 @@ func setCanaryHealthy(
 		switch out.Reason {
 		case inferencev1alpha1.ReasonCanaryChecksFailed:
 			cond.Status = metav1.ConditionFalse
-		case inferencev1alpha1.ReasonAnalysisError, inferencev1alpha1.ReasonAnalysisInconclusive:
+		case inferencev1alpha1.ReasonAnalysisError, inferencev1alpha1.ReasonAnalysisInconclusive,
+			inferencev1alpha1.ReasonInsufficientReplicas, inferencev1alpha1.ReasonMetricsScopePending:
 			cond.Status = metav1.ConditionUnknown
 		default:
-			cond.Status = metav1.ConditionTrue
+			if out.State.Phase == canary.PhaseWaiting {
+				cond.Status = metav1.ConditionUnknown
+			} else {
+				cond.Status = metav1.ConditionTrue
+			}
 		}
 
 	case canary.ActionPromote:
@@ -267,6 +309,10 @@ func setTrafficRoutingReady(
 	}
 
 	switch {
+	case out.Reason == inferencev1alpha1.ReasonInsufficientReplicas:
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = out.Reason
+		cond.Message = out.Message
 	case status.Canary == nil || out.Canary == 0:
 		cond.Reason = inferencev1alpha1.ReasonCanaryNotRunning
 		cond.Message = "All traffic is served by the primary variant"
@@ -282,7 +328,7 @@ func setTrafficRoutingReady(
 			out.DesiredWeight, out.Primary+out.Canary, out.RealizedWeight)
 
 	default:
-		cond.Message = fmt.Sprintf("%d%% of traffic is served by the canary variant", out.RealizedWeight)
+		cond.Message = fmt.Sprintf("Configured canary replica share is %d%%; %d of %d desired candidate replicas are ready", out.RealizedWeight, out.ReadyReplicas, out.Canary)
 	}
 
 	setCondition(status, cond)

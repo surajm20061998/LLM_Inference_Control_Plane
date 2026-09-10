@@ -28,6 +28,9 @@ spec:
       - llmcp-system
   endpoints:
     - port: https
+      # The trusted controller emits the namespace of the managed resource.
+      # Keep it instead of replacing it with the manager's scrape namespace.
+      honorLabels: true
       path: /metrics
       scheme: https
       interval: 15s

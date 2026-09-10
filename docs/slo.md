@@ -24,10 +24,12 @@ on it burns budget for reasons the service cannot act on, and — worse — stay
 green through incidents it should have caught.
 
 Time to first token is length-independent: it is how long the user waits before
-anything happens. Time per output token is the other half, also
-length-independent. That is exactly why OpenTelemetry's `gen_ai` semantic
-conventions define the two as separate metrics rather than shipping one latency
-number, and it is why this operator's SLI is TTFT.
+anything happens. The shim also records the observed interval between successive
+content-bearing SSE events. That interval helps separate "slow to start" from
+"slow while streaming", but it is a chunk-timing diagnostic rather than time
+per tokenizer token because one event can carry zero, one, or many tokens. This
+operator therefore keeps TTFT as its latency SLI and treats inter-chunk latency
+as supporting evidence.
 
 Duration is still measured and still graphed — it is the right number for
 capacity planning. It is simply not an objective.
@@ -153,9 +155,10 @@ First tokens are arriving too slowly, too often.
    that is consistently above the autoscaling target while replicas sit at
    `maxReplicas` means the ceiling is the constraint.
 3. **Is it thread oversubscription?** llama.cpp reads the *host's* `/proc` and
-   is cgroup-unaware. If `spec.engine.resources.limits.cpu` is unset the
-   operator cannot derive `-t`, and several replicas on one node will contend
-   badly enough that percentiles become noise.
+   is cgroup-unaware. The operator derives `-t` from an explicit thread count,
+   then a CPU limit, then a CPU request, and finally a one-thread fallback.
+   Check that the declared resources describe the capacity the pod can really
+   use; several replicas configured above that capacity make percentiles noise.
 4. **Is it a cold start?** Newly-started pods have a cold KV cache. A burst of
    restarts shows up as a TTFT spike that recovers on its own.
 

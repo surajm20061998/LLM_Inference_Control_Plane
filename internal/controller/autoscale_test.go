@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/analysis"
+	llmcpmetrics "github.com/surajm20061998/LLM_Inference_Control_Plane/internal/metrics"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/test/helpers"
 )
@@ -82,6 +84,11 @@ func (d *loadDial) Query(_ context.Context, query string) (analysis.Sample, erro
 	d.queries = append(d.queries, query)
 	if d.err != nil {
 		return analysis.Sample{}, d.err
+	}
+	if strings.Contains(query, llmcpmetrics.ShimInfo) {
+		// Schema readiness is a count of compatible ready shims, independent
+		// of the demand value this dial controls.
+		return analysis.Sample{Value: 100, Count: 1}, nil
 	}
 	return analysis.Sample{Value: d.value, Count: 1}, nil
 }
@@ -357,12 +364,30 @@ var _ = Describe("The built-in autoscaler", func() {
 		Expect(cond.Message).To(ContainSubstring("provider"))
 	})
 
+	It("holds when no replicas are ready even if the demand query returns a value", func() {
+		h := newScaleHarness()
+		h.dial.set(100)
+		h.create(helpers.WithReplicas(4), withAutoscaling())
+
+		Expect(h.replicas()).To(Equal(int32(4)),
+			"a value without a ready serving denominator must not drive a scale decision")
+		cond := mdtExpectCondition(mdtGet(h.mdKey),
+			inferencev1alpha1.ConditionAutoscalingReady, metav1.ConditionFalse)
+		Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonAutoscalingNoMetrics))
+		Expect(cond.Message).To(ContainSubstring("no pods are ready"))
+		Expect(h.dial.lastQuery()).To(ContainSubstring(llmcpmetrics.QueueDepth),
+			"zero ready replicas skip the per-shim schema count but still exercise the decision guard")
+	})
+
 	It("treats an empty query result as no measurement, not as zero load", func() {
 		h := newScaleHarness()
 		h.create(helpers.WithReplicas(4), withAutoscaling())
 		h.settleReady()
 
-		h.r.Provider = analysis.ProviderFunc(func(context.Context, string) (analysis.Sample, error) {
+		h.r.Provider = analysis.ProviderFunc(func(_ context.Context, query string) (analysis.Sample, error) {
+			if strings.Contains(query, llmcpmetrics.ShimInfo) {
+				return analysis.Sample{Value: 100, Count: 1}, nil
+			}
 			return analysis.Sample{Count: 0}, nil
 		})
 		mdtReconcile(h.r, h.mdKey)
@@ -372,6 +397,76 @@ var _ = Describe("The built-in autoscaler", func() {
 		cond := mdtExpectCondition(mdtGet(h.mdKey),
 			inferencev1alpha1.ConditionAutoscalingReady, metav1.ConditionFalse)
 		Expect(cond.Message).To(ContainSubstring("absence"))
+	})
+
+	It("freezes instead of scaling from a scoped candidate when the ready primary is still legacy", func() {
+		h := newScaleHarness()
+		h.create(helpers.WithReplicas(4), withAutoscaling())
+
+		// Establish a known-good four-pod primary before starting the canary.
+		// The dial's schema answer represents four compatible shims and its
+		// demand answer is exactly the target: 8 queued / 4 ready = 2.
+		h.dial.set(8)
+		h.settleReady()
+		mdtReconcile(h.r, h.mdKey)
+		Expect(mdtGet(h.mdKey).Status.LastGoodRevision).NotTo(BeEmpty())
+
+		md := mdtGet(h.mdKey)
+		helpers.WithCanary(func(c *inferencev1alpha1.CanarySpec) {
+			c.StepWeights = []int32{50}
+		})(md)
+		helpers.WithContextSize(8192)(md)
+		Expect(k8sClient.Update(ctx, md)).To(Succeed())
+		mdtReconcile(h.r, h.mdKey)
+
+		canaryKey := types.NamespacedName{
+			Namespace: h.namespace,
+			Name:      naming.CanaryDeployment(h.name),
+		}
+		Expect(helpers.MarkDeploymentAvailable(ctx, k8sClient, h.primaryKey, 2)).To(Succeed())
+		Expect(helpers.MarkDeploymentAvailable(ctx, k8sClient, canaryKey, 2)).To(Succeed())
+
+		// This is the mixed-version migration hazard: the candidate has the new
+		// namespace/model_deployment labels, the still-serving primary does not.
+		// The fleet demand query would return only the candidate's value and must
+		// therefore never be consumed.
+		demandQueries := 0
+		h.r.Provider = analysis.ProviderFunc(func(_ context.Context, query string) (analysis.Sample, error) {
+			for _, want := range []string{`namespace="` + h.namespace + `"`, `model_deployment="` + h.name + `"`} {
+				Expect(query).To(ContainSubstring(want))
+			}
+			if strings.Contains(query, llmcpmetrics.ShimInfo) {
+				if strings.Contains(query, `variant="primary"`) {
+					return analysis.Sample{Value: 0, Count: 1}, nil
+				}
+				return analysis.Sample{Value: 2, Count: 1}, nil
+			}
+			demandQueries++
+			return analysis.Sample{Value: 100, Count: 1}, nil
+		})
+
+		before := mdtGet(h.mdKey).Status.Canary
+		Expect(before).NotTo(BeNil())
+		failed, providerErrors, inconclusive := before.FailedChecks,
+			before.ConsecutiveErrors, before.ConsecutiveInconclusive
+		mdtReconcile(h.r, h.mdKey)
+
+		Expect(demandQueries).To(BeZero(),
+			"a partial scoped aggregate must not reach the autoscaling algorithm")
+		Expect(h.replicas()).To(Equal(int32(4)),
+			"schema migration is an autoscaling freeze, never a scale-to-min signal")
+		cond := mdtExpectCondition(mdtGet(h.mdKey),
+			inferencev1alpha1.ConditionAutoscalingReady, metav1.ConditionFalse)
+		Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonAutoscalingNoMetrics))
+		Expect(cond.Message).To(ContainSubstring("2 primary shims"))
+		Expect(cond.Message).To(ContainSubstring("resource-scoped metric schema"))
+
+		after := mdtGet(h.mdKey).Status.Canary
+		Expect(after).NotTo(BeNil())
+		Expect(after.FailedChecks).To(Equal(failed))
+		Expect(after.ConsecutiveErrors).To(Equal(providerErrors))
+		Expect(after.ConsecutiveInconclusive).To(Equal(inconclusive),
+			"an autoscaling compatibility hold must not spend canary verdict budgets")
 	})
 
 	It("respects minReplicas and maxReplicas", func() {

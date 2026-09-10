@@ -44,13 +44,19 @@ const Prefix = "llmcp"
 
 // Inference metrics, emitted by the shim.
 //
-// The set is deliberately small. Each series here answers a question something
-// downstream actually asks: the RED trio (rate, errors, duration) plus the two
-// signals that are specific to token generation and cannot be derived from
-// them.
+// Every inference metric carries namespace, model_deployment, model and
+// variant. Additional labels are documented below. Request arrivals, completed
+// requests, observed stream chunks and engine-reported tokens are separate
+// measurements and must not be substituted for one another.
 const (
+	// RequestsStartedTotal counts admission of POST chat, completion and
+	// embedding requests, before the upstream responds. Labels: namespace,
+	// model_deployment, model, variant, operation. It measures exposure without
+	// favoring a faster variant whose requests complete earlier.
+	RequestsStartedTotal = Prefix + "_inference_requests_started_total"
+
 	// RequestsTotal counts completed inference requests.
-	// Labels: model, variant, operation, code.
+	// Additional labels: operation, code.
 	//
 	// The `code` label is the HTTP status as a string. It is the numerator and
 	// denominator of every error-rate expression, which is why it is a label on
@@ -60,40 +66,46 @@ const (
 	RequestsTotal = Prefix + "_inference_requests_total"
 
 	// RequestDurationSeconds is a histogram of end-to-end request duration.
-	// Labels: model, variant, operation.
+	// Additional labels: operation.
 	//
 	// Useful, but NOT the right primary SLI for an LLM: duration scales with
 	// how many tokens the client asked for, so a p95 over mixed traffic
-	// measures the request mix as much as the server. TTFT and TPOT below are
-	// length-independent and are what the SLOs are written against.
+	// measures the request mix as much as the server. TTFT instead measures the
+	// arrival of the first content-bearing streaming event.
 	RequestDurationSeconds = Prefix + "_inference_request_duration_seconds"
 
-	// TTFTSeconds is a histogram of time to first token.
-	// Labels: model, variant.
+	// TTFTSeconds is a histogram of time to first content-bearing SSE event.
 	//
 	// Recorded ONLY for streaming requests, and only from the first SSE frame
 	// that carries generated text. Both restrictions are correctness
 	// requirements rather than refinements — see the shim's stream reader.
 	TTFTSeconds = Prefix + "_inference_ttft_seconds"
 
-	// TPOTSeconds is a histogram of mean time per output token after the first.
-	// Labels: model, variant.
-	//
-	// (duration - ttft) / (tokens - 1). Recorded only when at least two tokens
-	// were generated, because with one token there is no inter-token interval
-	// to average and dividing by zero would poison the histogram with +Inf.
+	// TPOTSeconds is deprecated: (duration - ttft) / (content chunks - 1).
+	// It includes the response tail after the last content event and does not
+	// measure tokenizer-token timing. Use InterChunkSeconds for observed gaps.
 	TPOTSeconds = Prefix + "_inference_tpot_seconds"
 
-	// OutputTokensTotal counts generated tokens. Labels: model, variant.
+	// OutputTokensTotal is deprecated: it counts content-bearing SSE chunks,
+	// not tokenizer tokens. Use OutputChunksTotal or ReportedOutputTokensTotal.
 	OutputTokensTotal = Prefix + "_inference_output_tokens_total"
 
+	// OutputChunksTotal counts first-choice SSE events carrying text, reasoning
+	// text, or tool-call function names/arguments. It does not count tokens.
+	OutputChunksTotal = Prefix + "_inference_output_chunks_total"
+	// InterChunkSeconds measures elapsed time between observable content events.
+	InterChunkSeconds = Prefix + "_inference_inter_chunk_seconds"
+	// ReportedOutputTokensTotal sums explicit completion_tokens usage from
+	// successfully completed responses. Missing usage is never estimated.
+	ReportedOutputTokensTotal = Prefix + "_inference_reported_output_tokens_total"
+	// UsageRequestsTotal counts successful responses supplying valid usage.
+	UsageRequestsTotal = Prefix + "_inference_usage_requests_total"
+
 	// RequestsInFlight is the number of requests currently being proxied.
-	// Labels: model, variant.
 	RequestsInFlight = Prefix + "_inference_requests_in_flight"
 
 	// QueueDepth is the number of in-flight requests the engine cannot be
 	// working on yet: max(0, in_flight - maxConcurrency).
-	// Labels: model, variant.
 	//
 	// This is the autoscaling signal, and the reason it is not CPU utilisation
 	// is the whole thesis of the project. An inference server saturates its
@@ -104,11 +116,11 @@ const (
 
 	// UpstreamErrorsTotal counts failures reaching or reading from the engine,
 	// as distinct from error responses the engine itself returned.
-	// Labels: model, variant, reason.
+	// Additional labels: reason.
 	UpstreamErrorsTotal = Prefix + "_shim_upstream_errors_total"
 
 	// ShimInfo is the conventional always-1 gauge carrying build and target
-	// metadata as labels. Labels: model, variant, upstream, version.
+	// metadata as labels. Additional labels: upstream, version.
 	ShimInfo = Prefix + "_shim_info"
 )
 
@@ -201,6 +213,11 @@ const (
 	// series.
 	LabelNamespace = "namespace"
 	LabelName      = "name"
+
+	// LabelModelDeployment is the owning resource name on canonical shim
+	// metrics. Together with LabelNamespace it isolates workloads that serve
+	// the same model. Operator metrics retain LabelName for compatibility.
+	LabelModelDeployment = "model_deployment"
 
 	// LabelVerdict is an analysis round's outcome.
 	LabelVerdict = "verdict"

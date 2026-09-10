@@ -18,8 +18,6 @@ package canary
 
 import (
 	"testing"
-
-	"k8s.io/utils/ptr"
 )
 
 // TestSplitInvariants exhausts the whole realistic input space.
@@ -166,54 +164,5 @@ func TestIsQuantizedTolerance(t *testing.T) {
 	}
 	if !IsQuantized(50, 10) {
 		t.Error("quantisation in the other direction must be reported too")
-	}
-}
-
-func TestCanaryReplicasHonoursOverride(t *testing.T) {
-	t.Parallel()
-
-	// A fixed canary size matters more for inference than for a stateless
-	// service: a model server has a long warm-up, so a canary resized at every
-	// step spends the first analysis window of each one loading a model.
-	primary, canary := CanaryReplicas(10, 20, ptr.To(int32(3)))
-	if primary != 7 || canary != 3 {
-		t.Fatalf("CanaryReplicas(10, 20, 3) = (%d, %d), want (7, 3)", primary, canary)
-	}
-
-	// The weight is ignored entirely when an override is set.
-	p2, c2 := CanaryReplicas(10, 80, ptr.To(int32(3)))
-	if p2 != 7 || c2 != 3 {
-		t.Fatalf("an override must not vary with the weight, got (%d, %d)", p2, c2)
-	}
-}
-
-func TestCanaryReplicasOverrideCannotStarveThePrimary(t *testing.T) {
-	t.Parallel()
-
-	// An override larger than the total would otherwise delete the fallback the
-	// whole rollback path depends on.
-	primary, canary := CanaryReplicas(3, 20, ptr.To(int32(9)))
-	if primary != 1 || canary != 2 {
-		t.Fatalf("CanaryReplicas(3, 20, 9) = (%d, %d), want (1, 2)", primary, canary)
-	}
-
-	p, c := CanaryReplicas(1, 20, ptr.To(int32(5)))
-	if p+c != 1 {
-		t.Fatalf("CanaryReplicas(1, 20, 5) = (%d, %d); the split must still sum to the total", p, c)
-	}
-}
-
-func TestCanaryReplicasNilOverrideMatchesSplit(t *testing.T) {
-	t.Parallel()
-
-	for total := int32(1); total <= 12; total++ {
-		for weight := int32(0); weight <= 100; weight += 5 {
-			wantP, wantC := Split(total, weight)
-			gotP, gotC := CanaryReplicas(total, weight, nil)
-			if gotP != wantP || gotC != wantC {
-				t.Fatalf("total=%d weight=%d: CanaryReplicas = (%d,%d), Split = (%d,%d)",
-					total, weight, gotP, gotC, wantP, wantC)
-			}
-		}
 	}
 }

@@ -869,9 +869,9 @@ spec:
 
                               Errors are counted separately from failures and are reset by any
                               successful check, because a Prometheus that is unreachable says nothing
-                              whatsoever about the canary. Rolling back on it would mean a monitoring
-                              outage causes a production rollback — the exact inversion of what the
-                              monitoring is for.
+                              whatsoever about the canary. Provider errors therefore do not spend the
+                              measured-failure budget: the controller holds first, then aborts back to
+                              stable only when this separate consecutive limit is reached.
                             format: int32
                             minimum: 1
                             type: integer
@@ -930,6 +930,7 @@ spec:
                                   - success-rate
                                   - queue-depth
                                   - output-token-rate
+                                  - output-chunk-rate
                                   type: string
                                 compareToPrimary:
                                   default: false
@@ -955,8 +956,10 @@ spec:
                                   description: |-
                                     Query is raw PromQL, for checks the built-ins do not cover.
 
-                                    Two template variables are substituted before execution: {{.Variant}} and
-                                    {{.Model}} for the label values, and {{.Window}} for the analysis window.
+                                    Identity variables {{.Namespace}}, {{.ModelDeployment}}, {{.Model}} and
+                                    {{.Variant}} are substituted as escaped contents for double-quoted label
+                                    matchers; {{.Window}} supplies the analysis lookback. Custom queries are
+                                    not isolated automatically and must select the resource identity.
                                     A query returning more than one series is an Error, not a silent
                                     first-match — picking arbitrarily from an ambiguous result is how a gate
                                     ends up measuring the wrong pod.
@@ -1014,6 +1017,15 @@ spec:
                               floats: write "500m" for half a request per second, or "2" for two.
                             pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                             x-kubernetes-int-or-string: true
+                          minUsageSamples:
+                            default: 20
+                            description: |-
+                              MinUsageSamples is the minimum number of successful responses with
+                              explicit completion-token usage in each variant's measurement window
+                              before output-token-rate can be evaluated. Missing usage is not inferred.
+                            format: int32
+                            minimum: 1
+                            type: integer
                           onInconclusive:
                             default: Wait
                             description: OnInconclusive is what to do once InconclusiveLimit
@@ -1084,14 +1096,9 @@ spec:
                         type: boolean
                       scale:
                         description: |-
-                          Scale decouples the canary's replica count from its traffic weight.
-
-                          Borrowed from Argo Rollouts' canaryScale, and it earns its place for
-                          inference specifically: a model server has a long, expensive warm-up, so
-                          a canary that is scaled up in lockstep with its weight spends the first
-                          analysis window of every step loading a model rather than serving. Fixing
-                          the replica count up front means the canary is warm before it is
-                          measured.
+                          Scale is reserved for routing that can weight traffic independently of
+                          capacity. Replica mode rejects replicas and matchTrafficWeight=false:
+                          every rung must size the candidate proportionally to its requested weight.
                         properties:
                           matchTrafficWeight:
                             description: |-
@@ -1402,6 +1409,11 @@ spec:
                   Canary reports the state of an in-flight or just-finished canary. It is
                   nil when no canary has ever run.
                 properties:
+                  availableReplicas:
+                    description: AvailableReplicas is the observed available candidate
+                      count.
+                    format: int32
+                    type: integer
                   availableSince:
                     description: |-
                       AvailableSince is when the canary's pods first became ready.
@@ -1506,6 +1518,85 @@ spec:
                     description: Message is a human-readable summary of the current
                       state.
                     type: string
+                  metricScopeReady:
+                    description: |-
+                      MetricScopeReady reports whether the controller has observed a complete
+                      analysis window from shims carrying this ModelDeployment's namespace and
+                      name labels. Automatic analysis holds while this is false so metrics from
+                      another resource, or from a pinned legacy shim, cannot drive the rollout.
+                    type: boolean
+                  observationReason:
+                    description: |-
+                      ObservationReason explains whether the measurement is available. An
+                      unknown observation does not spend any rollout failure or error budget.
+                    type: string
+                  observationWindow:
+                    description: ObservationWindow is the lookback used for the request-start
+                      rates.
+                    type: string
+                  observedAt:
+                    description: |-
+                      ObservedAt is the shared Prometheus evaluation timestamp of the last
+                      observation attempt, including attempts that yielded an unknown weight.
+                    format: date-time
+                    type: string
+                  observedWeight:
+                    description: |-
+                      ObservedWeight is the rounded percentage of inference requests started at
+                      canary shims over ObservationWindow. It is absent when evidence is missing,
+                      stale or below the traffic floor. It never drives rollout decisions.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  readinessTarget:
+                    description: |-
+                      ReadinessTarget binds AvailableSince to the current rung, capacity and
+                      candidate Deployment. A change requires fresh warm-up and evidence.
+                    properties:
+                      canaryReplicas:
+                        description: CanaryReplicas is the complete candidate capacity
+                          required to be ready.
+                        format: int32
+                        type: integer
+                      deploymentUID:
+                        description: DeploymentUID distinguishes a deleted and recreated
+                          Deployment.
+                        type: string
+                      generation:
+                        description: Generation is the candidate Deployment generation
+                          being observed.
+                        format: int64
+                        type: integer
+                      step:
+                        description: Step is the rung index associated with this readiness
+                          observation.
+                        format: int32
+                        type: integer
+                      totalReplicas:
+                        description: TotalReplicas is the fleet capacity used to compute
+                          this rung.
+                        format: int32
+                        type: integer
+                      weight:
+                        description: Weight is the requested configured share for
+                          this rung.
+                        format: int32
+                        type: integer
+                    required:
+                    - canaryReplicas
+                    - deploymentUID
+                    - generation
+                    - step
+                    - totalReplicas
+                    - weight
+                    type: object
+                  readyReplicas:
+                    description: |-
+                      ReadyReplicas is the observed ready candidate count, distinct from the
+                      desired count in ReadinessTarget. Old-generation pods do not satisfy the gate.
+                    format: int32
+                    type: integer
                   revision:
                     description: Revision is the revision hash under evaluation.
                     type: string

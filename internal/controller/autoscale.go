@@ -121,7 +121,30 @@ func (r *ModelDeploymentReconciler) reconcileAutoscaling(
 		}, nil
 	}
 
-	obs := r.sampleAutoscalingMetric(ctx, md)
+	provider := r.autoscalingProviderFor(md)
+	readyPrimary := readyReplicasFor(primaryDep)
+	readyCanary := readyReplicasFor(canaryDep)
+	scopeReady, scopeMessage := r.metricsScopeReady(ctx, provider, md, spec.ResolvedWindow(),
+		readyPrimary, readyCanary)
+
+	var obs autoscale.Observation
+	if !scopeReady {
+		// A resource-scoped selector prevents cross-tenant contamination, but it
+		// does not by itself prove that the result represents the WHOLE fleet.
+		// During the shim migration an upgraded candidate can expose scoped
+		// series while a still-serving legacy primary exposes only the old
+		// unscoped schema. Sampling here would produce a perfectly valid-looking
+		// partial aggregate and resize the entire fleet from one variant's load.
+		//
+		// This gate uses shim_info rather than the demand metric because every
+		// shim exposes it independent of traffic. Requiring every ready replica
+		// at both ends of the full autoscaling window makes absence a freeze, not
+		// a measurement of zero. The canary state and its verdict budgets are not
+		// touched by this path.
+		obs = autoscale.Observation{Reason: "resource-scoped metric schema is not ready: " + scopeMessage}
+	} else {
+		obs = r.sampleAutoscalingMetricFrom(ctx, md, provider)
+	}
 
 	in := autoscale.Input{
 		Now:           r.now(),
@@ -187,20 +210,23 @@ func (r *ModelDeploymentReconciler) reconcileAutoscaling(
 	return verdict, nil
 }
 
-// sampleAutoscalingMetric reads the fleet-wide signal.
+// sampleAutoscalingMetricFrom reads the fleet-wide signal from the provider
+// that already passed the schema gate. Keeping the provider instance identical
+// is important for injected providers and avoids constructing two HTTP clients
+// in one pass for the normal Prometheus path.
 //
 // Every failure mode collapses into `Valid: false` with a reason, and none of
 // them produces a number. That is the whole discipline: an autoscaler that
 // treats "I could not measure" as "the measurement is zero" scales a fleet to
 // its floor during a monitoring outage, which turns a Prometheus incident into
 // a serving incident.
-func (r *ModelDeploymentReconciler) sampleAutoscalingMetric(
+func (r *ModelDeploymentReconciler) sampleAutoscalingMetricFrom(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
+	provider analysis.Provider,
 ) autoscale.Observation {
 	spec := md.Spec.Autoscaling
 
-	provider := r.autoscalingProviderFor(md)
 	if provider == nil {
 		return autoscale.Observation{
 			Reason: "no metric provider is configured: set spec.autoscaling.provider.address",
@@ -208,8 +234,10 @@ func (r *ModelDeploymentReconciler) sampleAutoscalingMetric(
 	}
 
 	query, err := analysis.AutoscalingQuery(spec.ResolvedMetric(), analysis.QueryContext{
-		Model:  md.Spec.Model.Name,
-		Window: analysis.PromDuration(spec.ResolvedWindow()),
+		Namespace:       md.Namespace,
+		ModelDeployment: md.Name,
+		Model:           md.Spec.Model.Name,
+		Window:          analysis.PromDuration(spec.ResolvedWindow()),
 	})
 	if err != nil {
 		return autoscale.Observation{Reason: "building the query: " + err.Error()}
@@ -414,13 +442,18 @@ func autoscalingReason(reason string) string {
 // it. Counting only the primary during a canary would under-report the serving
 // capacity by exactly the canary's share.
 func readyAcrossVariants(primary, canary *appsv1.Deployment) int32 {
-	var total int32
-	for _, dep := range []*appsv1.Deployment{primary, canary} {
-		if dep != nil {
-			total += dep.Status.ReadyReplicas
-		}
+	return readyReplicasFor(primary) + readyReplicasFor(canary)
+}
+
+// readyReplicasFor is also the schema gate's expected series count. Desired
+// replicas are deliberately not used: a pod that is still loading a model is
+// not part of the serving denominator, while every ready pod must be visible
+// before a fleet-wide autoscaling metric is safe to consume.
+func readyReplicasFor(dep *appsv1.Deployment) int32 {
+	if dep == nil {
+		return 0
 	}
-	return total
+	return dep.Status.ReadyReplicas
 }
 
 // formatMetric renders an observed value for status.

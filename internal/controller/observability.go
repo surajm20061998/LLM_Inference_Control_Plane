@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -28,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
+	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/discovery"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/observability"
 )
@@ -41,9 +44,10 @@ import (
 // traffic normally — they just need saying out loud, because every rollout
 // decision made about such a resource is made blind.
 type metricsVerdict struct {
-	Status  metav1.ConditionStatus
-	Reason  string
-	Message string
+	Status       metav1.ConditionStatus
+	Reason       string
+	Message      string
+	RequeueAfter time.Duration
 }
 
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
@@ -70,7 +74,8 @@ type metricsVerdict struct {
 func (r *ModelDeploymentReconciler) reconcileObservability(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
-) (metricsVerdict, error) {
+) (verdict metricsVerdict, reconcileErr error) {
+	defer func() { verdict.RequeueAfter = r.observabilityResync(ctx, md) }()
 	// Reconciled FIRST, and on EVERY path below.
 	//
 	// The SLO rules are not a sub-object of the ServiceMonitor. They are
@@ -159,10 +164,7 @@ func (r *ModelDeploymentReconciler) reconcileObservability(
 		ShimEnabled: md.Spec.Serving.ShimEnabled(),
 	})
 
-	if applyErr := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(sm),
-		client.FieldOwner(naming.FieldManager),
-		client.ForceOwnership,
-	); err != nil {
+	if applyErr := r.applyObservabilityChild(ctx, md, sm); applyErr != nil {
 		return metricsVerdict{
 			Status:  metav1.ConditionFalse,
 			Reason:  inferencev1alpha1.ReasonReconciling,
@@ -251,10 +253,7 @@ func (r *ModelDeploymentReconciler) reconcilePrometheusRule(
 		Spec:      &md.Spec.Observability,
 	})
 
-	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(rule),
-		client.FieldOwner(naming.FieldManager),
-		client.ForceOwnership,
-	); err != nil {
+	if err := r.applyObservabilityChild(ctx, md, rule); err != nil {
 		return "", metav1.ConditionFalse, fmt.Errorf("applying PrometheusRule: %w", err)
 	}
 
@@ -314,11 +313,94 @@ func (r *ModelDeploymentReconciler) deleteObservabilityChild(
 	obj.SetNamespace(md.Namespace)
 	obj.SetName(name)
 
-	err := r.Delete(ctx, obj)
+	err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+	if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(obj, md) {
+		return fmt.Errorf("refusing to delete %s %s: object is not owned by this ModelDeployment", gvk.Kind, name)
+	}
+	uid := obj.GetUID()
+	err = r.Delete(ctx, obj, client.Preconditions{UID: &uid})
 	switch {
 	case err == nil, apierrors.IsNotFound(err), meta.IsNoMatchError(err):
 		return nil
 	default:
 		return fmt.Errorf("deleting disabled %s %s: %w", gvk.Kind, name, err)
+	}
+}
+
+// Optional kinds are deliberately not watched: an absent CRD must not prevent
+// manager startup. The timer also repairs drift when no rollout is active.
+func (r *ModelDeploymentReconciler) observabilityResync(ctx context.Context, md *inferencev1alpha1.ModelDeployment) time.Duration {
+	enabled := []struct {
+		on  bool
+		gvk schema.GroupVersionKind
+	}{
+		{md.Spec.Observability.ServiceMonitorEnabled(), observability.ServiceMonitorGVK},
+		{md.Spec.Observability.PrometheusRuleEnabled(), observability.PrometheusRuleGVK},
+	}
+	anyEnabled := false
+	for _, kind := range enabled {
+		if !kind.on {
+			continue
+		}
+		anyEnabled = true
+		if r.Discovery == nil {
+			return discovery.AbsentTTL
+		}
+		present, err := r.Discovery.Has(ctx, kind.gvk)
+		if err != nil || !present {
+			return discovery.AbsentTTL
+		}
+	}
+	if !anyEnabled {
+		return 0
+	}
+	// Stable jitter spreads a fleet's repair work without changing each
+	// reconcile's deadline unpredictably. Healthy resync is 4m30s–5m30s.
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(string(md.UID) + "/" + md.Namespace + "/" + md.Name))
+	return 270*time.Second + time.Duration(h.Sum32()%61)*time.Second
+}
+
+// applyObservabilityChild repairs only our children. Create first on absence,
+// then use a resource-version precondition for apply: a concurrent replacement
+// must fail instead of being adopted by ForceOwnership.
+func (r *ModelDeploymentReconciler) applyObservabilityChild(ctx context.Context, md *inferencev1alpha1.ModelDeployment, desired *unstructured.Unstructured) error {
+	gvk := desired.GroupVersionKind()
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(gvk)
+	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
+	if apierrors.IsNotFound(err) {
+		existing = desired.DeepCopy()
+		err = r.Create(ctx, existing, client.FieldOwner(naming.FieldManager))
+	}
+	if err != nil {
+		r.invalidateMissingObservabilityKind(gvk, err)
+		return err
+	}
+	if !metav1.IsControlledBy(existing, md) {
+		return fmt.Errorf("refusing to apply %s %s: object is not owned by this ModelDeployment", gvk.Kind, desired.GetName())
+	}
+	desired.SetResourceVersion(existing.GetResourceVersion())
+	err = r.Apply(ctx, client.ApplyConfigurationFromUnstructured(desired),
+		client.FieldOwner(naming.FieldManager), client.ForceOwnership)
+	r.invalidateMissingObservabilityKind(gvk, err)
+	return err
+}
+
+func (r *ModelDeploymentReconciler) invalidateMissingObservabilityKind(gvk schema.GroupVersionKind, err error) {
+	if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
+		return
+	}
+	if invalidator, ok := r.Discovery.(interface{ Invalidate(schema.GroupVersionKind) }); ok {
+		invalidator.Invalidate(gvk)
+	}
+	if mapper, ok := r.RESTMapper().(meta.ResettableRESTMapper); ok {
+		mapper.Reset()
 	}
 }

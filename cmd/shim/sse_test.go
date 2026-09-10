@@ -228,12 +228,46 @@ func TestStreamObserverMultipleFramesInOneRead(t *testing.T) {
 	}
 }
 
+func TestStreamObserverDispatchesFinalEventAtEOF(t *testing.T) {
+	const stream = "data: {\"choices\":[{\"delta\":{\"content\":\"last\"}}]}\n\n" +
+		"data: [DONE]"
+	state := &requestState{start: time.Unix(0, 0)}
+	o := newStreamObserver(io.NopCloser(strings.NewReader(stream)), state, time.Now)
+	forwarded, err := io.ReadAll(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(forwarded) != stream {
+		t.Fatal("stream bytes changed")
+	}
+	if state.tokens != 1 || !state.sawDone {
+		t.Fatalf("final unterminated event was not dispatched: %+v", state)
+	}
+}
+
+func TestStreamObserverAccountsForFinalDataFrameAtEOF(t *testing.T) {
+	const stream = `data: {"choices":[{"delta":{"content":"last"}}],` +
+		`"usage":{"completion_tokens":1}}`
+	state := &requestState{start: time.Unix(0, 0)}
+	o := newStreamObserver(io.NopCloser(strings.NewReader(stream)), state, time.Now)
+	forwarded, err := io.ReadAll(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(forwarded) != stream {
+		t.Fatal("stream bytes changed")
+	}
+	if state.tokens != 1 || !state.hasUsage || state.reportedTokens != 1 {
+		t.Fatalf("final unterminated data event was not accounted: %+v", state)
+	}
+}
+
 func TestIsEventStream(t *testing.T) {
 	cases := map[string]bool{
 		"text/event-stream":                true,
 		"text/event-stream; charset=utf-8": true,
 		"TEXT/EVENT-STREAM":                true,
-		"application/json":                 false,
+		contentTypeJSON:                    false,
 		"":                                 false,
 		// Malformed parameters still fall back to a prefix match rather than
 		// classifying an obvious SSE body as non-streaming.
@@ -243,5 +277,77 @@ func TestIsEventStream(t *testing.T) {
 		if got := isEventStream(header); got != want {
 			t.Errorf("isEventStream(%q) = %v, want %v", header, got, want)
 		}
+	}
+}
+
+func TestStreamObserverSeparatesChunksUsageAndIntervals(t *testing.T) {
+	// One event has several words and a Unicode codepoint split across reads;
+	// a second event has multiple SSE data lines, followed by tool output.
+	const stream = "data: {\"choices\":[{\"delta\":{\"content\":\"several words 🌍\"}}]}\n\n" +
+		"data: {\"choices\":[\n" + "data: {\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"completion_tokens\":17}}\n\n" +
+		"data: [DONE]\n\n"
+	var intervals []float64
+	state := &requestState{start: time.Unix(0, 0), interChunk: func(value float64) {
+		intervals = append(intervals, value)
+	}}
+	clock := fakeClock(state.start, 100*time.Millisecond)
+	_ = clock()
+	o := newStreamObserver(io.NopCloser(strings.NewReader(stream)), state, clock)
+	var forwarded strings.Builder
+	buf := make([]byte, 1)
+	for {
+		n, err := o.Read(buf)
+		forwarded.Write(buf[:n])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if forwarded.String() != stream {
+		t.Fatal("stream bytes changed")
+	}
+	if state.tokens != 3 || !state.hasUsage || state.reportedTokens != 17 || !state.sawDone {
+		t.Fatalf("incorrect chunk/usage accounting: %+v", state)
+	}
+	if len(intervals) != 2 || intervals[0] != 0.1 || intervals[1] != 0.1 {
+		t.Fatalf("inter-chunk intervals = %v", intervals)
+	}
+}
+
+func TestUsageRequiresExplicitNonnegativeInteger(t *testing.T) {
+	for _, usage := range []string{
+		"null",
+		"{}",
+		`{"completion_tokens":null}`,
+		`{"completion_tokens":-1}`,
+		`{"completion_tokens":1.5}`,
+		`{"completion_tokens":"17"}`,
+	} {
+		state := &requestState{}
+		stream := "data: {\"usage\":" + usage + "}\n\ndata: [DONE]\n\n"
+		o := newStreamObserver(io.NopCloser(strings.NewReader(stream)), state, time.Now)
+		drain(t, o, 5)
+		if state.hasUsage {
+			t.Fatalf("accepted invalid usage %s", usage)
+		}
+	}
+}
+
+func TestOversizedCompleteEventCannotEscapeBufferLimit(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"" +
+		strings.Repeat("x", maxSSELine) + "\"}}]}\n\n" + llamaCPPStream
+	state := &requestState{}
+	o := newStreamObserver(io.NopCloser(strings.NewReader(stream)), state, time.Now)
+	// A complete giant line arriving in one read must also obey the cap.
+	drain(t, o, len(stream))
+	if state.tokens != 2 {
+		t.Fatalf("counted oversized event: %d", state.tokens)
+	}
+	if o.data.Len() > maxSSELine || o.buf.Len() > maxSSELine {
+		t.Fatal("unbounded event buffer")
 	}
 }

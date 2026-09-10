@@ -87,7 +87,7 @@ var (
 	}, resourceLabelsWith(llmcpmetrics.LabelVerdict))
 
 	// AnalysisCheckDuration is how long one analysis round took.
-	AnalysisCheckDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+	AnalysisCheckDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: llmcpmetrics.AnalysisCheckDurationSeconds,
 		Help: "Wall time of one canary analysis round, including every metric query.",
 		// Sub-millisecond to ten seconds. The lower end is where a scripted
@@ -95,7 +95,7 @@ var (
 		// struggling, which is worth being able to see before it becomes a
 		// timeout.
 		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-	})
+	}, resourceLabels)
 
 	// AutoscaleDesiredReplicas is the autoscaler's most recent decision.
 	AutoscaleDesiredReplicas = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -184,7 +184,7 @@ func RecordAnalysisRound(k ResourceKey, verdict string, took time.Duration) {
 	l := k.labels()
 	l[llmcpmetrics.LabelVerdict] = verdict
 	AnalysisVerdicts.With(l).Inc()
-	AnalysisCheckDuration.Observe(took.Seconds())
+	AnalysisCheckDuration.With(k.labels()).Observe(took.Seconds())
 }
 
 // RecordAutoscaleDecision publishes the autoscaler's desired replica count.

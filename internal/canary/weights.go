@@ -32,10 +32,9 @@ package canary
 //
 // Traffic is split by pod count, so the achievable weights are the multiples of
 // 1/total. At 3 replicas the nearest expressible value to 20% is 33%. Rounding
-// is deliberately UP — a canary that receives more traffic than requested is
-// measured on more evidence, whereas one that receives less can pass on almost
-// none — and the realised figure is published as status.canary.currentWeight
-// beside the requested one.
+// is deliberately UP, which may expose more capacity than requested. This is
+// quantization, not a safety guarantee. The configured figure is published as
+// status.canary.currentWeight beside the requested one; neither measures traffic.
 //
 // # The invariants
 //
@@ -69,8 +68,8 @@ func Split(total, weight int32) (primary, canary int32) {
 		return 0, total
 	}
 
-	// Round up: see the note above on why more exposure is the safer error.
-	canary = (total*weight + 99) / 100
+	// Use int64 so a large valid int32 replica count cannot overflow.
+	canary = int32((int64(total)*int64(weight) + 99) / 100)
 
 	canary = max(canary, 1)
 
@@ -85,8 +84,8 @@ func Split(total, weight int32) (primary, canary int32) {
 	return total - canary, canary
 }
 
-// RealizedWeight is the traffic share a split actually achieves, rounded to the
-// nearest whole percent.
+// RealizedWeight is the configured replica share, rounded to the nearest whole
+// percent. It is not the observed request distribution.
 //
 // Reported as status.canary.currentWeight next to the requested
 // desiredWeight. Publishing only the request would let an operator believe the
@@ -112,31 +111,4 @@ func IsQuantized(desired, realized int32) bool {
 		d = -d
 	}
 	return d > 1
-}
-
-// CanaryReplicas resolves how many pods the canary should run, honouring an
-// explicit override.
-//
-// A fixed canary size decoupled from the traffic weight matters more for
-// inference than for a stateless web service: a model server has a long,
-// expensive warm-up, so a canary resized at every step spends the first
-// analysis window of each one loading a model rather than serving requests —
-// and the latency it reports during that window is the warm-up, not the
-// revision under test.
-//
-// The override is still clamped to leave the primary at least one pod. A spec
-// asking for more canary replicas than the total would otherwise silently
-// delete the fallback the rollback depends on.
-func CanaryReplicas(total, weight int32, override *int32) (primary, canary int32) {
-	if override == nil {
-		return Split(total, weight)
-	}
-
-	canary = *override
-	canary = max(canary, 0)
-
-	if canary >= total {
-		canary = max(total-1, 0)
-	}
-	return total - canary, canary
 }

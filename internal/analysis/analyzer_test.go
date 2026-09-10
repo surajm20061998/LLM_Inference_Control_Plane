@@ -18,6 +18,7 @@ package analysis
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 
@@ -27,12 +28,95 @@ import (
 	llmcpmetrics "github.com/surajm20061998/LLM_Inference_Control_Plane/internal/metrics"
 )
 
+func TestReportedTokenGateRequiresUsageEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		canary, primary Step
+		floor           int32
+		want            inferencev1alpha1.Verdict
+	}{
+		{"absent", Empty(), Pass(20), 0, inferencev1alpha1.VerdictInconclusive},
+		{"zero", Pass(0), Pass(20), 0, inferencev1alpha1.VerdictInconclusive},
+		{"below default", Pass(19.9), Pass(20), 0, inferencev1alpha1.VerdictInconclusive},
+		{"NaN", Pass(math.NaN()), Pass(20), 0, inferencev1alpha1.VerdictInconclusive},
+		{"infinite", Pass(math.Inf(1)), Pass(20), 0, inferencev1alpha1.VerdictInconclusive},
+		{"multiple", Multi(2), Pass(20), 0, inferencev1alpha1.VerdictInconclusive},
+		{"missing primary", Pass(20), Empty(), 0, inferencev1alpha1.VerdictInconclusive},
+		{"provider unavailable", Fail(ErrProviderDown), Pass(20), 0, inferencev1alpha1.VerdictError},
+		{"default floor met", Pass(20), Pass(20), 0, inferencev1alpha1.VerdictPass},
+		{"custom floor met", Pass(5), Pass(5), 5, inferencev1alpha1.VerdictPass},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := builtin(inferencev1alpha1.MetricOutputTokenRate)
+			m.CompareToPrimary = ptr.To(true)
+			m.ThresholdRange.Max = q("2")
+			req := request(m)
+			req.MinRequestRate, req.MinUsageSamples = 0, tc.floor
+			p := NewScripted(tc.canary, tc.primary, Pass(1))
+			checks := (&Analyzer{Provider: p}).Run(context.Background(), req)
+			if checks[0].Verdict != tc.want {
+				t.Fatalf("got %+v, want %s", checks[0], tc.want)
+			}
+			for _, query := range p.Queries {
+				if tc.want != inferencev1alpha1.VerdictPass && strings.Contains(query, llmcpmetrics.ReportedOutputTokensTotal) {
+					t.Fatal("throughput evaluated without usage evidence")
+				}
+				if !strings.Contains(query, `namespace="team-a",model_deployment="chat"`) {
+					t.Fatalf("unscoped query: %s", query)
+				}
+			}
+		})
+	}
+}
+
+func TestTrafficGateRejectsInvalidEvidence(t *testing.T) {
+	for _, step := range []Step{Pass(math.NaN()), Pass(math.Inf(1)), Pass(-1), Multi(2)} {
+		p := NewScripted(step, Pass(0))
+		checks := (&Analyzer{Provider: p}).Run(context.Background(), request(metricWithMax("1")))
+		if checks[0].Verdict != inferencev1alpha1.VerdictInconclusive || len(p.Queries) != 1 {
+			t.Fatalf("invalid traffic admitted: %+v", checks)
+		}
+	}
+}
+
+func TestReportedTokenGateOnlyRequiresComparedVariants(t *testing.T) {
+	m := builtin(inferencev1alpha1.MetricOutputTokenRate)
+	m.CompareToPrimary = ptr.To(false)
+	m.ThresholdRange.Max = q("10")
+	req := request(m)
+	req.MinRequestRate = 0
+	p := NewScripted(Pass(20), Pass(5))
+	checks := (&Analyzer{Provider: p}).Run(context.Background(), req)
+	if checks[0].Verdict != inferencev1alpha1.VerdictPass || len(p.Queries) != 2 {
+		t.Fatalf("unexpected absolute token check: %+v, queries=%v", checks, p.Queries)
+	}
+	for _, query := range p.Queries {
+		if strings.Contains(query, `variant="primary"`) {
+			t.Fatalf("absolute check required primary evidence: %s", query)
+		}
+	}
+}
+
+func TestOutputChunkRateDoesNotRequireReportedUsage(t *testing.T) {
+	m := builtin(inferencev1alpha1.MetricOutputChunkRate)
+	m.ThresholdRange.Max = q("10")
+	req := request(m)
+	req.MinRequestRate = 0
+	p := NewScripted(Pass(5))
+	checks := (&Analyzer{Provider: p}).Run(context.Background(), req)
+	if checks[0].Verdict != inferencev1alpha1.VerdictPass || len(p.Queries) != 1 || !strings.Contains(p.Queries[0], llmcpmetrics.OutputChunksTotal) {
+		t.Fatalf("chunk rate incorrectly depends on token usage: %+v, queries=%v", checks, p.Queries)
+	}
+}
+
 func request(metrics ...inferencev1alpha1.AnalysisMetric) Request {
 	return Request{
-		Model:          testModel,
-		Window:         testWindow,
-		MinRequestRate: 0.5,
-		Metrics:        metrics,
+		Namespace:       testNamespace,
+		ModelDeployment: testModelDeployment,
+		Model:           testModel,
+		Window:          testWindow,
+		MinRequestRate:  0.5,
+		Metrics:         metrics,
 	}
 }
 
@@ -147,7 +231,8 @@ func TestTrafficGateIsSkippedWhenDisabled(t *testing.T) {
 		t.Fatalf("verdict = %q, want Pass", checks[0].Verdict)
 	}
 	for _, query := range p.Queries {
-		if query == RequestRateQuery(canaryCtx) {
+		trafficQuery, _ := RequestRateQuery(canaryCtx)
+		if query == trafficQuery {
 			t.Error("the traffic gate query ran although minRequestRate is 0")
 		}
 	}

@@ -18,6 +18,7 @@ package observability
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -29,6 +30,66 @@ import (
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 	llmcpmetrics "github.com/surajm20061998/LLM_Inference_Control_Plane/internal/metrics"
 )
+
+func TestRulesIsolateResourcesServingTheSameModel(t *testing.T) {
+	t.Parallel()
+	validLabel := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+	for _, identity := range [][2]string{{"team-a", "chat"}, {"team-a", "support"}, {"team-b", "chat"}} {
+		in := ruleInput(func(in *PrometheusRuleInput) { in.Namespace, in.Name = identity[0], identity[1] })
+		for _, rule := range allRules(t, BuildPrometheusRule(in)) {
+			labels := rule[fieldLabels].(map[string]any)
+			if labels[llmcpmetrics.LabelNamespace] != in.Namespace || labels[llmcpmetrics.LabelModelDeployment] != in.Name {
+				t.Fatalf("rule has wrong resource identity: %v", rule)
+			}
+			for label := range labels {
+				if !validLabel.MatchString(label) {
+					t.Errorf("invalid Prometheus label %q", label)
+				}
+			}
+			expr := rule[fieldExpr].(string)
+			if !strings.HasPrefix(expr, "vector(") && !strings.Contains(expr, resourceSelector(in)) {
+				t.Errorf("rule is not scoped to %s/%s: %s", in.Namespace, in.Name, expr)
+			}
+		}
+	}
+}
+
+func TestRulesIncludeStableEvidenceAcrossModelNameChanges(t *testing.T) {
+	t.Parallel()
+	in := ruleInput()
+	for _, rule := range allRules(t, BuildPrometheusRule(in)) {
+		expr := rule[fieldExpr].(string)
+		if strings.HasPrefix(expr, "vector(") {
+			continue
+		}
+		if strings.Contains(expr, llmcpmetrics.LabelModel+"=") {
+			t.Errorf("rule filters by mutable model identity and can hide the stable variant during an update: %s", expr)
+		}
+	}
+}
+
+func TestObjectiveRecordingRulesFollowResourceConfiguration(t *testing.T) {
+	t.Parallel()
+	in := ruleInput(func(in *PrometheusRuleInput) {
+		in.Spec.SLO = &inferencev1alpha1.SLOSpec{TTFTObjective: quantity("97e-2"), AvailabilityObjective: quantity("999e-3")}
+	})
+	want := map[string]string{
+		recordTTFTObjective:         "vector(0.97)",
+		recordAvailabilityObjective: "vector(0.999)",
+	}
+	for _, rule := range allRules(t, BuildPrometheusRule(in)) {
+		name, _ := rule[fieldRecord].(string)
+		if expected, ok := want[name]; ok {
+			if rule[fieldExpr] != expected {
+				t.Errorf("%s = %v, want %s", name, rule[fieldExpr], expected)
+			}
+			delete(want, name)
+		}
+	}
+	if len(want) != 0 {
+		t.Errorf("missing objective rules: %v", want)
+	}
+}
 
 // testOwnerUID is the fixture ModelDeployment's UID. A real value matters:
 // an owner reference with an empty or stale UID makes garbage collection either
@@ -430,7 +491,7 @@ func TestEveryRatioClampsItsDenominatorInRules(t *testing.T) {
 
 	for _, r := range allRules(t, u) {
 		name, ok := r[fieldRecord].(string)
-		if !ok {
+		if !ok || (!strings.HasPrefix(name, recordTTFTSLI) && !strings.HasPrefix(name, recordAvailSLI)) {
 			continue
 		}
 		expr := r[fieldExpr].(string)
@@ -462,7 +523,7 @@ func TestEverySLIReadsPerfectWithNoTraffic(t *testing.T) {
 	checked := 0
 	for _, r := range allRules(t, u) {
 		name, ok := r[fieldRecord].(string)
-		if !ok {
+		if !ok || (!strings.HasPrefix(name, recordTTFTSLI) && !strings.HasPrefix(name, recordAvailSLI)) {
 			continue
 		}
 		expr := r[fieldExpr].(string)

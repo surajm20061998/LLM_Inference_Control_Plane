@@ -27,14 +27,19 @@ import (
 // Fixture values shared across this package's tests. They are constants so that
 // a golden query string and the context it was rendered from cannot drift.
 const (
-	testModel  = "qwen3"
-	testWindow = "60s"
+	testNamespace       = "team-a"
+	testModelDeployment = "chat"
+	testModel           = "qwen3"
+	testWindow          = "60s"
 	// trivialQuery renders to something valid without depending on any metric
 	// name, for cases whose subject is the evaluation rather than the query.
 	trivialQuery = "vector(1)"
 )
 
-var canaryCtx = QueryContext{Model: testModel, Variant: "canary", Window: testWindow}
+var canaryCtx = QueryContext{
+	Namespace: testNamespace, ModelDeployment: testModelDeployment,
+	Model: testModel, Variant: "canary", Window: testWindow,
+}
 
 func builtin(b inferencev1alpha1.BuiltinMetric) inferencev1alpha1.AnalysisMetric {
 	return inferencev1alpha1.AnalysisMetric{Name: string(b), Builtin: &b}
@@ -52,23 +57,25 @@ func TestBuiltinQueriesAreGolden(t *testing.T) {
 
 	cases := map[inferencev1alpha1.BuiltinMetric]string{
 		inferencev1alpha1.MetricTTFTP95: `histogram_quantile(0.95, sum by (le) ` +
-			`(rate(llmcp_inference_ttft_seconds_bucket{model="qwen3",variant="canary"}[60s])))`,
+			`(rate(llmcp_inference_ttft_seconds_bucket{namespace="team-a",model_deployment="chat",variant="canary"}[60s])))`,
 
 		inferencev1alpha1.MetricTTFTP99: `histogram_quantile(0.99, sum by (le) ` +
-			`(rate(llmcp_inference_ttft_seconds_bucket{model="qwen3",variant="canary"}[60s])))`,
+			`(rate(llmcp_inference_ttft_seconds_bucket{namespace="team-a",model_deployment="chat",variant="canary"}[60s])))`,
 
 		inferencev1alpha1.MetricRequestDurationP95: `histogram_quantile(0.95, sum by (le) ` +
-			`(rate(llmcp_inference_request_duration_seconds_bucket{model="qwen3",variant="canary"}[60s])))`,
+			`(rate(llmcp_inference_request_duration_seconds_bucket{namespace="team-a",model_deployment="chat",variant="canary"}[60s])))`,
 
 		inferencev1alpha1.MetricErrorRate: `sum(rate(llmcp_inference_requests_total` +
-			`{model="qwen3",variant="canary",code=~"5.."}[60s])) / ` +
-			`clamp_min(sum(rate(llmcp_inference_requests_total{model="qwen3",variant="canary"}[60s])), 1e-9)`,
+			`{namespace="team-a",model_deployment="chat",variant="canary",code=~"5.."}[60s])) / ` +
+			`clamp_min(sum(rate(llmcp_inference_requests_total{namespace="team-a",model_deployment="chat",variant="canary"}[60s])), 1e-9)`,
 
 		inferencev1alpha1.MetricQueueDepth: `avg(avg_over_time(llmcp_inference_queue_depth` +
-			`{model="qwen3",variant="canary"}[60s]))`,
+			`{namespace="team-a",model_deployment="chat",variant="canary"}[60s]))`,
 
-		inferencev1alpha1.MetricOutputTokenRate: `sum(rate(llmcp_inference_output_tokens_total` +
-			`{model="qwen3",variant="canary"}[60s]))`,
+		inferencev1alpha1.MetricOutputTokenRate: `sum(rate(llmcp_inference_reported_output_tokens_total` +
+			`{namespace="team-a",model_deployment="chat",variant="canary"}[60s]))`,
+		inferencev1alpha1.MetricOutputChunkRate: `sum(rate(llmcp_inference_output_chunks_total` +
+			`{namespace="team-a",model_deployment="chat",variant="canary"}[60s]))`,
 	}
 
 	for b, want := range cases {
@@ -141,8 +148,8 @@ func TestEverySelectorPinsBothLabels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", b, err)
 		}
-		if !strings.Contains(got, `model="qwen3"`) {
-			t.Errorf("%s does not pin the model label: %s", b, got)
+		if !strings.Contains(got, `namespace="team-a",model_deployment="chat"`) || strings.Contains(got, `model=`) {
+			t.Errorf("%s must pin resource identity, not the changing model label: %s", b, got)
 		}
 		if !strings.Contains(got, `variant="canary"`) {
 			t.Errorf("%s does not pin the variant label: %s", b, got)
@@ -174,13 +181,13 @@ func TestRawQuerySubstitution(t *testing.T) {
 
 	m := inferencev1alpha1.AnalysisMetric{
 		Name:  "custom",
-		Query: `sum(rate(my_metric{model="{{.Model}}",variant="{{ .Variant }}"}[{{.Window}}]))`,
+		Query: `sum(rate(my_metric{namespace="{{.Namespace}}",model_deployment="{{ .ModelDeployment }}",model="{{.Model}}",variant="{{ .Variant }}"}[{{.Window}}]))`,
 	}
 	got, err := Query(m, canaryCtx)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	want := `sum(rate(my_metric{model="qwen3",variant="canary"}[60s]))`
+	want := `sum(rate(my_metric{namespace="team-a",model_deployment="chat",model="qwen3",variant="canary"}[60s]))`
 	if got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
@@ -226,9 +233,85 @@ func TestRatioQueryClampsThePrimary(t *testing.T) {
 func TestRequestRateQuery(t *testing.T) {
 	t.Parallel()
 
-	want := `sum(rate(llmcp_inference_requests_total{model="qwen3",variant="canary"}[60s]))`
-	if got := RequestRateQuery(canaryCtx); got != want {
+	want := `sum(rate(llmcp_inference_requests_total{namespace="team-a",model_deployment="chat",variant="canary"}[60s]))`
+	if got, err := RequestRateQuery(canaryCtx); err != nil || got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestQueriesRejectMissingResourceIdentity(t *testing.T) {
+	for _, qc := range []QueryContext{
+		{Model: testModel, Window: testWindow},
+		{Namespace: testNamespace, Model: testModel, Window: testWindow},
+		{ModelDeployment: testModelDeployment, Model: testModel, Window: testWindow},
+	} {
+		if _, err := Query(builtin(inferencev1alpha1.MetricErrorRate), qc); err == nil {
+			t.Error("built-in accepted missing identity, which would match legacy series")
+		}
+		if _, err := AutoscalingQuery(inferencev1alpha1.AutoscalingQueueDepth, qc); err == nil {
+			t.Error("autoscaling accepted missing identity")
+		}
+		if _, err := RequestRateQuery(qc); err == nil {
+			t.Error("traffic gate accepted missing identity")
+		}
+	}
+}
+
+func TestQueryEscapesLabelValues(t *testing.T) {
+	qc := QueryContext{
+		Namespace: testNamespace, ModelDeployment: testModelDeployment,
+		Model: "a\"\\\nb", Variant: "canary", Window: testWindow,
+	}
+	want := `namespace="team-a",model_deployment="chat",variant="canary"`
+	if got := selector(qc); got != want {
+		t.Fatalf("selector = %q, want %q", got, want)
+	}
+	query := `metric{namespace="{{ .Namespace }}",model_deployment="{{.ModelDeployment}}",model="{{ .Model }}",variant="{{.Variant}}"}`
+	if got := substitute(query, qc); got != `metric{namespace="team-a",model_deployment="chat",model="a\"\\\nb",variant="canary"}` {
+		t.Fatalf("custom query = %q", got)
+	}
+}
+
+func TestModelChangePreservesResourceQueryScope(t *testing.T) {
+	stable, candidate := canaryCtx, canaryCtx
+	stable.Model, candidate.Model = "old-model", "new-model"
+	for _, render := range []func(QueryContext) (string, error){
+		func(qc QueryContext) (string, error) { return Query(builtin(inferencev1alpha1.MetricTTFTP95), qc) },
+		RequestRateQuery,
+		UsageSamplesQuery,
+		func(qc QueryContext) (string, error) {
+			return AutoscalingQuery(inferencev1alpha1.AutoscalingQueueDepth, qc)
+		},
+	} {
+		before, err := render(stable)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after, err := render(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if before != after || strings.Contains(after, `model=`) {
+			t.Fatalf("model update hid the stable variant: %s -> %s", before, after)
+		}
+	}
+}
+
+func TestResourceIdentitySeparatesRepeatedModels(t *testing.T) {
+	queries := make(map[string]bool)
+	for _, identity := range [][2]string{
+		{testNamespace, testModelDeployment}, {testNamespace, "support"}, {"team-b", testModelDeployment},
+	} {
+		qc := canaryCtx
+		qc.Namespace, qc.ModelDeployment = identity[0], identity[1]
+		query, err := Query(builtin(inferencev1alpha1.MetricQueueDepth), qc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if queries[query] {
+			t.Fatal("different resources rendered the same query")
+		}
+		queries[query] = true
 	}
 }
 
@@ -259,13 +342,15 @@ func TestAutoscalingQueryIsFleetWide(t *testing.T) {
 	// canary against its primary is the point. This one must NOT: an autoscaler
 	// decides how much capacity exists, and measuring one variant would size
 	// the fleet from a fraction of its load that changes at every canary step.
-	fleet := QueryContext{Model: testModel, Window: testWindow}
+	fleet := QueryContext{
+		Namespace: testNamespace, ModelDeployment: testModelDeployment, Model: testModel, Window: testWindow,
+	}
 
 	cases := map[inferencev1alpha1.AutoscalingMetric]string{
 		inferencev1alpha1.AutoscalingQueueDepth: `sum(avg_over_time(llmcp_inference_queue_depth` +
-			`{model="qwen3"}[60s]))`,
+			`{namespace="team-a",model_deployment="chat"}[60s]))`,
 		inferencev1alpha1.AutoscalingConcurrency: `sum(avg_over_time(llmcp_inference_requests_in_flight` +
-			`{model="qwen3"}[60s]))`,
+			`{namespace="team-a",model_deployment="chat"}[60s]))`,
 	}
 
 	for metric, want := range cases {
@@ -292,7 +377,9 @@ func TestAutoscalingQueryAveragesBeforeSumming(t *testing.T) {
 	// between arrivals and a fixed number of decode slots — so it has to be
 	// smoothed per pod before the fleet total is taken.
 	got, err := AutoscalingQuery(inferencev1alpha1.AutoscalingQueueDepth,
-		QueryContext{Model: testModel, Window: testWindow})
+		QueryContext{
+			Namespace: testNamespace, ModelDeployment: testModelDeployment, Model: testModel, Window: testWindow,
+		})
 	if err != nil {
 		t.Fatalf("AutoscalingQuery: %v", err)
 	}

@@ -27,8 +27,8 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `name` _string_ | Name identifies the check in status and events. It is the list map key,<br />so it must be unique within the spec. |  | MaxLength: 63 <br />MinLength: 1 <br />Required: \{\} <br /> |
-| `builtin` _[BuiltinMetric](#builtinmetric)_ | Builtin selects a query this operator writes. |  | Enum: [ttft-p95 ttft-p99 request-duration-p95 error-rate success-rate queue-depth output-token-rate] <br />Optional: \{\} <br /> |
-| `query` _string_ | Query is raw PromQL, for checks the built-ins do not cover.<br />Two template variables are substituted before execution: \{\{.Variant\}\} and<br />\{\{.Model\}\} for the label values, and \{\{.Window\}\} for the analysis window.<br />A query returning more than one series is an Error, not a silent<br />first-match — picking arbitrarily from an ambiguous result is how a gate<br />ends up measuring the wrong pod. |  | Optional: \{\} <br /> |
+| `builtin` _[BuiltinMetric](#builtinmetric)_ | Builtin selects a query this operator writes. |  | Enum: [ttft-p95 ttft-p99 request-duration-p95 error-rate success-rate queue-depth output-token-rate output-chunk-rate] <br />Optional: \{\} <br /> |
+| `query` _string_ | Query is raw PromQL, for checks the built-ins do not cover.<br />Identity variables \{\{.Namespace\}\}, \{\{.ModelDeployment\}\}, \{\{.Model\}\} and<br />\{\{.Variant\}\} are substituted as escaped contents for double-quoted label<br />matchers; \{\{.Window\}\} supplies the analysis lookback. Custom queries are<br />not isolated automatically and must select the resource identity.<br />A query returning more than one series is an Error, not a silent<br />first-match — picking arbitrarily from an ambiguous result is how a gate<br />ends up measuring the wrong pod. |  | Optional: \{\} <br /> |
 | `thresholdRange` _[ThresholdRange](#thresholdrange)_ | ThresholdRange is the band the value must fall inside to Pass. |  | Required: \{\} <br /> |
 | `compareToPrimary` _boolean_ | CompareToPrimary evaluates the RATIO of the canary's value to the<br />primary's rather than the canary's absolute value.<br />Usually the better gate for latency. An absolute TTFT threshold has to be<br />re-tuned for every model, every node type and every prompt length, and<br />one that is stale fires on a busy afternoon rather than on a bad release.<br />A ratio asks the only question that matters — is the new version worse<br />than the one it is replacing? — and answers it under whatever conditions<br />happen to be true right now. | false | Optional: \{\} <br /> |
 
@@ -95,10 +95,11 @@ _Appears in:_
 | `window` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#duration-v1-meta)_ | Window is the PromQL lookback each metric is evaluated over.<br />It must be comfortably larger than the scrape interval, or a rate() over<br />it is computed from two samples — a difference between two points, with<br />no way to tell a trend from a blip. | 60s | Optional: \{\} <br /> |
 | `initialDelay` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#duration-v1-meta)_ | InitialDelay is how long to wait after the canary becomes available<br />before the first check.<br />Not politeness — correctness. A freshly started inference pod has a cold<br />KV cache and, on the very first requests, is still faulting the model's<br />pages in. Its first few seconds of TTFT are genuinely terrible and<br />genuinely unrepresentative, and measuring them would fail every canary<br />that was ever going to be fine. | 60s | Optional: \{\} <br /> |
 | `failureThreshold` _integer_ | FailureThreshold is how many FAILED checks trigger a rollback.<br />The counter is NOT reset by an intervening pass, matching Flagger. A<br />canary that fails, passes, fails, passes, fails is not healthy — it is<br />intermittently broken, which for a latency SLI is the more common shape<br />of a real regression than a clean step change. | 3 | Minimum: 1 <br />Optional: \{\} <br /> |
-| `consecutiveErrorLimit` _integer_ | ConsecutiveErrorLimit is how many consecutive provider ERRORS abort the<br />rollout.<br />Errors are counted separately from failures and are reset by any<br />successful check, because a Prometheus that is unreachable says nothing<br />whatsoever about the canary. Rolling back on it would mean a monitoring<br />outage causes a production rollback — the exact inversion of what the<br />monitoring is for. | 5 | Minimum: 1 <br />Optional: \{\} <br /> |
+| `consecutiveErrorLimit` _integer_ | ConsecutiveErrorLimit is how many consecutive provider ERRORS abort the<br />rollout.<br />Errors are counted separately from failures and are reset by any<br />successful check, because a Prometheus that is unreachable says nothing<br />whatsoever about the canary. Provider errors therefore do not spend the<br />measured-failure budget: the controller holds first, then aborts back to<br />stable only when this separate consecutive limit is reached. | 5 | Minimum: 1 <br />Optional: \{\} <br /> |
 | `inconclusiveLimit` _integer_ | InconclusiveLimit is how many consecutive INCONCLUSIVE rounds trigger<br />OnInconclusive. | 5 | Minimum: 1 <br />Optional: \{\} <br /> |
 | `onInconclusive` _[InconclusiveAction](#inconclusiveaction)_ | OnInconclusive is what to do once InconclusiveLimit is reached. | Wait | Enum: [Wait Rollback Promote] <br />Optional: \{\} <br /> |
 | `minRequestRate` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#quantity-resource-api)_ | MinRequestRate is the request rate, per second and per variant, below<br />which a check is Inconclusive rather than Pass.<br />This is a first-class field rather than a PromQL idiom buried in a query<br />template, because without it the entire demo is a lie: with no traffic,<br />error rate is 0 and every latency percentile is absent, so a canary<br />"passes" every check and is promoted having served nothing. Anyone who<br />has run a homegrown canary controller has shipped this bug at least once.<br />Expressed as a Quantity because the Kubernetes API convention forbids<br />floats: write "500m" for half a request per second, or "2" for two. | 500m | Optional: \{\} <br /> |
+| `minUsageSamples` _integer_ | MinUsageSamples is the minimum number of successful responses with<br />explicit completion-token usage in each variant's measurement window<br />before output-token-rate can be evaluated. Missing usage is not inferred. | 20 | Minimum: 1 <br />Optional: \{\} <br /> |
 | `provider` _[AnalysisProviderSpec](#analysisproviderspec)_ | Provider points at the metric backend. |  | Optional: \{\} <br /> |
 | `metrics` _[AnalysisMetric](#analysismetric) array_ | Metrics are the checks evaluated each round. When empty, a sensible<br />default set is used — see DefaultMetrics. |  | MaxItems: 10 <br />Optional: \{\} <br /> |
 
@@ -229,7 +230,7 @@ AnalysisSpec, so the common cases cannot be got wrong. The Query escape hatch
 remains for the cases that are not common.
 
 _Validation:_
-- Enum: [ttft-p95 ttft-p99 request-duration-p95 error-rate success-rate queue-depth output-token-rate]
+- Enum: [ttft-p95 ttft-p99 request-duration-p95 error-rate success-rate queue-depth output-token-rate output-chunk-rate]
 
 _Appears in:_
 - [AnalysisMetric](#analysismetric)
@@ -242,14 +243,39 @@ _Appears in:_
 | `error-rate` | MetricErrorRate is the share of requests answered 5xx, as a fraction<br />in [0,1].<br /> |
 | `success-rate` | MetricSuccessRate is 1 - error rate.<br /> |
 | `queue-depth` | MetricQueueDepth is the mean number of requests waiting for a slot.<br /> |
-| `output-token-rate` | MetricOutputTokenRate is generated tokens per second — the throughput<br />signal that reflects work done, rather than requests accepted.<br /> |
+| `output-token-rate` | MetricOutputTokenRate is explicit completion-token usage per second from<br />successful completed responses. MinUsageSamples gates the measurement;<br />missing usage is never estimated from stream chunks.<br /> |
+| `output-chunk-rate` | MetricOutputChunkRate counts observable content-bearing SSE events per<br />second. A chunk can contain multiple tokenizer tokens.<br /> |
+
+
+#### CanaryReadinessTarget
+
+
+
+CanaryReadinessTarget identifies the rung and Deployment incarnation whose
+readiness starts the evidence clock. All fields are persisted across restarts.
+
+
+
+_Appears in:_
+- [CanaryStatus](#canarystatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `step` _integer_ | Step is the rung index associated with this readiness observation. |  |  |
+| `weight` _integer_ | Weight is the requested configured share for this rung. |  |  |
+| `totalReplicas` _integer_ | TotalReplicas is the fleet capacity used to compute this rung. |  |  |
+| `canaryReplicas` _integer_ | CanaryReplicas is the complete candidate capacity required to be ready. |  |  |
+| `generation` _integer_ | Generation is the candidate Deployment generation being observed. |  |  |
+| `deploymentUID` _string_ | DeploymentUID distinguishes a deleted and recreated Deployment. |  |  |
 
 
 #### CanaryScaleSpec
 
 
 
-CanaryScaleSpec decouples canary replicas from canary traffic weight.
+CanaryScaleSpec configures candidate capacity. Replica routing supports only
+an omitted value or matchTrafficWeight=true. Fixed capacity requires a future
+routing mode that weights requests independently of pod counts.
 
 Exactly one member may be set.
 
@@ -289,7 +315,7 @@ _Appears in:_
 | `maxWeight` _integer_ | MaxWeight is the traffic share at which the canary is promoted rather<br />than stepped further. Ignored when StepWeights is set.<br />It is deliberately below 100 by default. Once a canary is carrying half<br />the traffic and every check has passed, additional steps buy very little<br />information and cost real time; promotion at that point is a decision,<br />not a gamble. | 50 | Maximum: 100 <br />Minimum: 1 <br />Optional: \{\} <br /> |
 | `analysis` _[AnalysisSpec](#analysisspec)_ | Analysis configures the metric checks that gate each step. |  | Optional: \{\} <br /> |
 | `trafficRouting` _[TrafficRoutingSpec](#trafficroutingspec)_ | TrafficRouting selects how traffic is divided between the variants. |  | Optional: \{\} <br /> |
-| `scale` _[CanaryScaleSpec](#canaryscalespec)_ | Scale decouples the canary's replica count from its traffic weight.<br />Borrowed from Argo Rollouts' canaryScale, and it earns its place for<br />inference specifically: a model server has a long, expensive warm-up, so<br />a canary that is scaled up in lockstep with its weight spends the first<br />analysis window of every step loading a model rather than serving. Fixing<br />the replica count up front means the canary is warm before it is<br />measured. |  | Optional: \{\} <br /> |
+| `scale` _[CanaryScaleSpec](#canaryscalespec)_ | Scale is reserved for routing that can weight traffic independently of<br />capacity. Replica mode rejects replicas and matchTrafficWeight=false:<br />every rung must size the candidate proportionally to its requested weight. |  | Optional: \{\} <br /> |
 | `requireApproval` _boolean_ | RequireApproval pauses before the final promotion until an operator sets<br />the llmcp.io/promote annotation to "true".<br />The gate is on PROMOTION, not on each step. A human asked to approve<br />every 20% increment stops reading and starts clicking, which is worse<br />than no gate at all; asked once, at the point of no return, they actually<br />look. | false | Optional: \{\} <br /> |
 
 
@@ -311,6 +337,11 @@ _Appears in:_
 | `failedRevision` _string_ | FailedRevision is the revision the most recent rollback rejected.<br />Without it the controller would immediately re-canary the same revision<br />it just rolled back from: the spec still names it, so the target and the<br />stable revision still differ, and the state machine would dutifully start<br />again — producing an infinite loop of identical failing rollouts, each<br />one costing a full analysis window and a Deployment churn.<br />Recording the rejection makes a rollback STICK until a human changes the<br />spec, which is exactly the semantics people expect from one. |  | Optional: \{\} <br /> |
 | `desiredWeight` _integer_ | DesiredWeight is the traffic share the current step asked for. |  | Optional: \{\} <br /> |
 | `currentWeight` _integer_ | CurrentWeight is the configured replica share after quantisation.<br />Reported separately from DesiredWeight because replica-based splitting<br />cannot configure 20% with 3 pods: the nearest share is 33%. This field is<br />derived from desired replica counts, not measured request distribution;<br />connection reuse can make observed traffic differ from the pod ratio. |  | Optional: \{\} <br /> |
+| `observedWeight` _integer_ | ObservedWeight is the rounded percentage of inference requests started at<br />canary shims over ObservationWindow. It is absent when evidence is missing,<br />stale or below the traffic floor. It never drives rollout decisions. |  | Maximum: 100 <br />Minimum: 0 <br />Optional: \{\} <br /> |
+| `observedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#time-v1-meta)_ | ObservedAt is the shared Prometheus evaluation timestamp of the last<br />observation attempt, including attempts that yielded an unknown weight. |  | Optional: \{\} <br /> |
+| `observationWindow` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#duration-v1-meta)_ | ObservationWindow is the lookback used for the request-start rates. |  | Optional: \{\} <br /> |
+| `observationReason` _string_ | ObservationReason explains whether the measurement is available. An<br />unknown observation does not spend any rollout failure or error budget. |  | Optional: \{\} <br /> |
+| `metricScopeReady` _boolean_ | MetricScopeReady reports whether the controller has observed a complete<br />analysis window from shims carrying this ModelDeployment's namespace and<br />name labels. Automatic analysis holds while this is false so metrics from<br />another resource, or from a pinned legacy shim, cannot drive the rollout. |  | Optional: \{\} <br /> |
 | `step` _integer_ | Step is the zero-based index into the weight ladder. |  | Optional: \{\} <br /> |
 | `steps` _integer_ | Steps is how many steps the ladder has. |  | Optional: \{\} <br /> |
 | `failedChecks` _integer_ | FailedChecks counts rounds that produced a Fail. Not reset by a<br />subsequent Pass. |  | Optional: \{\} <br /> |
@@ -320,6 +351,9 @@ _Appears in:_
 | `startTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#time-v1-meta)_ | StartTime is when this canary began. |  | Optional: \{\} <br /> |
 | `lastAnalysisTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#time-v1-meta)_ | LastAnalysisTime is when the last round ran. It is what the interval is<br />measured from. |  | Optional: \{\} <br /> |
 | `availableSince` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#time-v1-meta)_ | AvailableSince is when the canary's pods first became ready.<br />The warm-up delay is measured from here rather than from StartTime,<br />because a canary that spent four minutes pulling a model image has not<br />been warm for four minutes — and measuring a cold inference pod's first<br />requests would fail every canary that was ever going to be fine. |  | Optional: \{\} <br /> |
+| `readinessTarget` _[CanaryReadinessTarget](#canaryreadinesstarget)_ | ReadinessTarget binds AvailableSince to the current rung, capacity and<br />candidate Deployment. A change requires fresh warm-up and evidence. |  | Optional: \{\} <br /> |
+| `readyReplicas` _integer_ | ReadyReplicas is the observed ready candidate count, distinct from the<br />desired count in ReadinessTarget. Old-generation pods do not satisfy the gate. |  | Optional: \{\} <br /> |
+| `availableReplicas` _integer_ | AvailableReplicas is the observed available candidate count. |  | Optional: \{\} <br /> |
 | `message` _string_ | Message is a human-readable summary of the current state. |  | Optional: \{\} <br /> |
 
 
@@ -689,10 +723,10 @@ happens to coincide with shorter prompts. An SLO built on it burns budget for
 reasons the service cannot act on.
 
 Time to first token is length-independent: it is how long the user waits
-before anything happens. Time per output token is the other half, also
-length-independent. That is exactly why OpenTelemetry's gen_ai semantic
-conventions define the two separately rather than shipping one latency
-metric, and it is why this operator's SLIs are TTFT and availability.
+before anything happens. The shim also records time between observable
+content-bearing stream events, but one event is not necessarily one
+tokenizer token, so that measurement is a diagnostic rather than an SLI.
+This operator's generated SLIs are TTFT and availability.
 
 
 

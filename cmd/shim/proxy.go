@@ -31,8 +31,12 @@ import (
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/naming"
 )
 
-// contentTypeSSE identifies a streamed response.
-const contentTypeSSE = "text/event-stream"
+const (
+	// contentTypeSSE identifies a streamed response.
+	contentTypeSSE = "text/event-stream"
+	// contentTypeJSON identifies a non-streaming OpenAI-compatible response.
+	contentTypeJSON = "application/json"
+)
 
 // stateKeyType is the private context key type for per-request state.
 type stateKeyType struct{}
@@ -57,10 +61,14 @@ type requestState struct {
 	// stream a request that asked to.
 	streamed bool
 
-	sawFirstToken bool
-	ttft          time.Duration
-	tokens        int
-	sawDone       bool
+	sawFirstToken  bool
+	ttft           time.Duration
+	tokens         int
+	sawDone        bool
+	lastContent    time.Time
+	interChunk     func(float64)
+	reportedTokens int64
+	hasUsage       bool
 
 	duration time.Duration
 
@@ -178,6 +186,12 @@ func (p *proxy) serveProxy(w http.ResponseWriter, r *http.Request) {
 		start:     p.now(),
 		operation: llmcpmetrics.NormalizeOperation(r.URL.Path),
 	}
+	if r.Method == http.MethodPost {
+		switch st.operation {
+		case llmcpmetrics.OperationChat, llmcpmetrics.OperationCompletion, llmcpmetrics.OperationEmbeddings:
+			p.metrics.requestsStarted.WithLabelValues(st.operation).Inc()
+		}
+	}
 
 	p.metrics.begin()
 	defer p.metrics.end()
@@ -239,9 +253,14 @@ func (p *proxy) modifyResponse(resp *http.Response) error {
 		return nil
 	}
 	if !isEventStream(resp.Header.Get("Content-Type")) {
+		mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if mediaType == contentTypeJSON {
+			resp.Body = &usageObserver{upstream: resp.Body, state: st}
+		}
 		return nil
 	}
 	st.streamed = true
+	st.interChunk = p.metrics.interChunk.Observe
 	resp.Body = newStreamObserver(resp.Body, st, p.now)
 	return nil
 }

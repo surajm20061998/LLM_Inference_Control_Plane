@@ -51,11 +51,13 @@ func newTestProxy(t *testing.T, upstream string, opts ...func(*config)) (*proxy,
 		t.Fatalf("parsing upstream: %v", err)
 	}
 	cfg := config{
-		upstream:       u,
-		healthPath:     "/health",
-		model:          "test-model",
-		variant:        "primary",
-		maxConcurrency: 2,
+		upstream:        u,
+		healthPath:      testHealthPath,
+		model:           "test-model",
+		namespace:       testNamespace,
+		modelDeployment: testDeployment,
+		variant:         "primary",
+		maxConcurrency:  2,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -63,6 +65,8 @@ func newTestProxy(t *testing.T, upstream string, opts ...func(*config)) (*proxy,
 	m := newMetrics(cfg)
 	return newProxy(cfg, m, discardLogger(), time.Now), m
 }
+
+const testHealthPath = "/health"
 
 // roundTripFunc adapts a function into an http.RoundTripper. Tests that are
 // about the proxy's downstream behaviour can provide an exact upstream

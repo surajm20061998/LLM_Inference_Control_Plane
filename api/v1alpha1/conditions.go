@@ -68,6 +68,11 @@ const (
 	// status.canary.
 	ConditionCanaryHealthy = "CanaryHealthy"
 
+	// ConditionMetricScopeReady reports whether automatic decisions are using
+	// a complete window of resource-scoped shim metrics. It remains separate
+	// from CanaryHealthy because schema compatibility is not a quality verdict.
+	ConditionMetricScopeReady = "MetricScopeReady"
+
 	// ConditionTrafficRoutingReady reports whether the traffic split the canary
 	// asked for is actually in place.
 	//
@@ -108,6 +113,7 @@ func AllConditionTypes() []string {
 		ConditionSpecValid,
 		ConditionMetricsRegistered,
 		ConditionCanaryHealthy,
+		ConditionMetricScopeReady,
 		ConditionTrafficRoutingReady,
 		ConditionAutoscalingReady,
 	}
@@ -192,6 +198,13 @@ const (
 
 	// Canary reasons.
 
+	// ReasonMetricsScopePending holds analysis while old or newly rolled shims
+	// have not supplied a complete resource-scoped measurement window.
+	ReasonMetricsScopePending = "MetricsScopePending"
+
+	// ReasonMetricsScopeReady indicates the scoped schema handshake completed.
+	ReasonMetricsScopeReady = "MetricsScopeReady"
+
 	// ReasonCanaryNotRunning indicates no canary is in flight.
 	ReasonCanaryNotRunning = "CanaryNotRunning"
 
@@ -253,12 +266,11 @@ const (
 	ReasonNoLastGoodRevision = "NoLastGoodRevision"
 
 	// ReasonInsufficientReplicas indicates spec.replicas is too small to divide
-	// between two variants, so the revision is rolled out directly.
+	// between two variants, so the stable revision is held until capacity grows.
 	//
-	// Reported explicitly rather than allowed to become a stall. A canary
-	// Deployment created with zero replicas never becomes available, and the
-	// rollout would sit at "waiting for canary replicas" indefinitely with no
-	// indication that it never can.
+	// Reported explicitly rather than creating a zero-replica candidate that
+	// can never become available. The hold does not start or spend the candidate
+	// progress deadline.
 	ReasonInsufficientReplicas = "InsufficientReplicas"
 
 	// Autoscaling reasons.

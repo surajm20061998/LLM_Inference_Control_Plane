@@ -19,12 +19,17 @@ package analysis
 import (
 	"context"
 	"fmt"
+	"math"
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 )
 
 // Request is one analysis round's inputs.
 type Request struct {
+	// Namespace and ModelDeployment scope every built-in decision.
+	Namespace       string
+	ModelDeployment string
+
 	// Model is spec.model.name, the `model` label on every series.
 	Model string
 
@@ -34,6 +39,9 @@ type Request struct {
 	// MinRequestRate is the traffic floor, in requests per second, below which
 	// the round is Inconclusive.
 	MinRequestRate float64
+
+	// MinUsageSamples is the per-variant reported-token sample floor (default 20).
+	MinUsageSamples int32
 
 	// Metrics are the checks to run.
 	Metrics []inferencev1alpha1.AnalysisMetric
@@ -71,14 +79,18 @@ type Analyzer struct {
 // unreachable provider says nothing about how much traffic the canary received.
 func (a *Analyzer) Run(ctx context.Context, req Request) []inferencev1alpha1.MetricCheck {
 	canaryCtx := QueryContext{
-		Model:   req.Model,
-		Variant: string(inferencev1alpha1.VariantCanary),
-		Window:  req.Window,
+		Namespace:       req.Namespace,
+		ModelDeployment: req.ModelDeployment,
+		Model:           req.Model,
+		Variant:         string(inferencev1alpha1.VariantCanary),
+		Window:          req.Window,
 	}
 	primaryCtx := QueryContext{
-		Model:   req.Model,
-		Variant: string(inferencev1alpha1.VariantPrimary),
-		Window:  req.Window,
+		Namespace:       req.Namespace,
+		ModelDeployment: req.ModelDeployment,
+		Model:           req.Model,
+		Variant:         string(inferencev1alpha1.VariantPrimary),
+		Window:          req.Window,
 	}
 
 	if checks, gated := a.gateOnTraffic(ctx, req, canaryCtx); gated {
@@ -87,7 +99,7 @@ func (a *Analyzer) Run(ctx context.Context, req Request) []inferencev1alpha1.Met
 
 	checks := make([]inferencev1alpha1.MetricCheck, 0, len(req.Metrics))
 	for i := range req.Metrics {
-		checks = append(checks, a.runOne(ctx, req.Metrics[i], canaryCtx, primaryCtx))
+		checks = append(checks, a.runOne(ctx, req.Metrics[i], canaryCtx, primaryCtx, req.MinUsageSamples))
 	}
 	return checks
 }
@@ -102,7 +114,11 @@ func (a *Analyzer) gateOnTraffic(
 		return nil, false
 	}
 
-	sample, err := a.Provider.Query(ctx, RequestRateQuery(canaryCtx))
+	query, err := RequestRateQuery(canaryCtx)
+	var sample Sample
+	if err == nil {
+		sample, err = a.Provider.Query(ctx, query)
+	}
 	if err != nil {
 		return allChecks(req.Metrics, func(m inferencev1alpha1.AnalysisMetric) inferencev1alpha1.MetricCheck {
 			return Errored(m, "could not measure the canary's request rate: "+err.Error())
@@ -113,6 +129,11 @@ func (a *Analyzer) gateOnTraffic(
 		return allChecks(req.Metrics, func(m inferencev1alpha1.AnalysisMetric) inferencev1alpha1.MetricCheck {
 			return Inconclusive(m, "the canary has produced no request metrics at all; "+
 				"either it is receiving no traffic or its shim is not being scraped")
+		}), true
+	}
+	if sample.Count != 1 || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) || sample.Value < 0 {
+		return allChecks(req.Metrics, func(m inferencev1alpha1.AnalysisMetric) inferencev1alpha1.MetricCheck {
+			return Inconclusive(m, "the canary request rate is not one finite nonnegative measurement")
 		}), true
 	}
 
@@ -132,7 +153,30 @@ func (a *Analyzer) runOne(
 	ctx context.Context,
 	m inferencev1alpha1.AnalysisMetric,
 	canaryCtx, primaryCtx QueryContext,
+	minUsageSamples int32,
 ) inferencev1alpha1.MetricCheck {
+	if m.Query == "" && m.Builtin != nil && *m.Builtin == inferencev1alpha1.MetricOutputTokenRate {
+		if minUsageSamples < 1 {
+			minUsageSamples = 20
+		}
+		contexts := []QueryContext{canaryCtx}
+		if m.CompareToPrimaryEnabled() {
+			contexts = append(contexts, primaryCtx)
+		}
+		for _, qc := range contexts {
+			query, err := UsageSamplesQuery(qc)
+			var sample Sample
+			if err == nil {
+				sample, err = a.Provider.Query(ctx, query)
+			}
+			if err != nil {
+				return Errored(m, "could not measure reported-usage samples: "+err.Error())
+			}
+			if sample.Count != 1 || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) || sample.Value < float64(minUsageSamples) {
+				return Inconclusive(m, fmt.Sprintf("%s requires at least %d usage-bearing completions before evaluating reported token throughput", qc.Variant, minUsageSamples))
+			}
+		}
+	}
 	canaryQuery, err := Query(m, canaryCtx)
 	if err != nil {
 		// A metric the operator cannot render is a spec problem, not a provider

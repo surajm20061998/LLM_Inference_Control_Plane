@@ -1,0 +1,239 @@
+# Prove the complete 25 -> 50 -> 75 replica ladder on a real cluster.
+#
+# The assertions bind readiness to the controller-persisted rung target, not
+# merely to "at least one ready pod". Each observed split is copied from live
+# Deployment specs into ladder-evidence. Advancement events then prove the
+# preceding rung supplied a passing analysis round after its full warm-up and
+# measurement window. The final manual gate keeps 75% observable long enough
+# to assert without introducing a timing sleep.
+#
+# Requires kube-prometheus-stack: make monitoring-install
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: canary-ladder
+spec:
+  timeouts:
+    assert: 10m
+  steps:
+    - name: establish-the-stable-revision
+      try:
+        - apply:
+            file: modeldeployment.yaml
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: ladder-demo
+              status:
+                phase: Available
+                readyReplicas: 4
+
+    - name: start-load-before-changing-the-workload
+      try:
+        - apply:
+            file: loadgen.yaml
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              # A semantically harmless latency change creates a distinct
+              # workload revision while keeping the candidate inside the 1.5x
+              # comparison threshold.
+              kubectl -n "$NAMESPACE" patch modeldeployment ladder-demo --type=merge -p '
+              {"spec":{"engine":{"env":[
+                {"name":"LLMCP_FAKE_TTFT_MS","value":"70"},
+                {"name":"LLMCP_FAKE_TOKENS","value":"24"}
+              ]}}}'
+
+    - name: record-the-complete-25-percent-rung
+      try:
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: ladder-demo
+              status:
+                phase: Canarying
+                canary:
+                  desiredWeight: 25
+                  currentWeight: 25
+                  readyReplicas: 1
+                  availableReplicas: 1
+                  readinessTarget:
+                    step: 0
+                    weight: 25
+                    totalReplicas: 4
+                    canaryReplicas: 1
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: ladder-demo-primary
+              spec:
+                replicas: 3
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: ladder-demo-canary
+              spec:
+                replicas: 1
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              primary=$(kubectl -n "$NAMESPACE" get deployment ladder-demo-primary \
+                -o jsonpath='{.spec.replicas}')
+              canary=$(kubectl -n "$NAMESPACE" get deployment ladder-demo-canary \
+                -o jsonpath='{.spec.replicas}')
+              split="${primary}/${canary}"
+              kubectl -n "$NAMESPACE" create configmap ladder-evidence \
+                --from-literal=rung-25="${split}"
+
+    - name: record-the-complete-50-percent-rung
+      try:
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: ladder-demo
+              status:
+                phase: Canarying
+                canary:
+                  step: 1
+                  desiredWeight: 50
+                  currentWeight: 50
+                  readyReplicas: 2
+                  availableReplicas: 2
+                  readinessTarget:
+                    step: 1
+                    weight: 50
+                    totalReplicas: 4
+                    canaryReplicas: 2
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: ladder-demo-primary
+              spec:
+                replicas: 2
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: ladder-demo-canary
+              spec:
+                replicas: 2
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              primary=$(kubectl -n "$NAMESPACE" get deployment ladder-demo-primary \
+                -o jsonpath='{.spec.replicas}')
+              canary=$(kubectl -n "$NAMESPACE" get deployment ladder-demo-canary \
+                -o jsonpath='{.spec.replicas}')
+              split="${primary}/${canary}"
+              kubectl -n "$NAMESPACE" patch configmap ladder-evidence --type=merge \
+                -p "{\"data\":{\"rung-50\":\"${split}\"}}"
+
+    - name: record-the-complete-75-percent-rung
+      try:
+        - assert:
+            resource:
+              apiVersion: inference.llmcp.io/v1alpha1
+              kind: ModelDeployment
+              metadata:
+                name: ladder-demo
+              status:
+                # The final rung has passed. requireApproval keeps the split in
+                # place and makes that outcome stable enough to inspect.
+                phase: Paused
+                canary:
+                  step: 2
+                  steps: 3
+                  desiredWeight: 75
+                  currentWeight: 75
+                  metricScopeReady: true
+                  readyReplicas: 3
+                  availableReplicas: 3
+                  readinessTarget:
+                    step: 2
+                    weight: 75
+                    totalReplicas: 4
+                    canaryReplicas: 3
+                  (checks[?verdict == 'Pass'] | length(@)): 1
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: ladder-demo-primary
+              spec:
+                replicas: 1
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: ladder-demo-canary
+              spec:
+                replicas: 3
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              primary=$(kubectl -n "$NAMESPACE" get deployment ladder-demo-primary \
+                -o jsonpath='{.spec.replicas}')
+              canary=$(kubectl -n "$NAMESPACE" get deployment ladder-demo-canary \
+                -o jsonpath='{.spec.replicas}')
+              split="${primary}/${canary}"
+              last_analysis=$(kubectl -n "$NAMESPACE" get modeldeployment ladder-demo \
+                -o jsonpath='{.status.canary.lastAnalysisTime}')
+              test -n "${last_analysis}"
+              kubectl -n "$NAMESPACE" patch configmap ladder-evidence --type=merge \
+                -p "{\"data\":{\"rung-75\":\"${split}\",\"final-analysis\":\"${last_analysis}\"}}"
+
+    - name: prove-each-prior-rung-passed-before-advancing
+      try:
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: ladder-evidence
+              data:
+                rung-25: 3/1
+                rung-50: 2/2
+                rung-75: 1/3
+        - script:
+            shell: bash
+            content: |
+              set -euo pipefail
+              messages=$(kubectl -n "$NAMESPACE" get events \
+                --field-selector reason=CanaryAdvanced \
+                -o jsonpath='{range .items[*]}{.message}{"\n"}{end}')
+              printf '%s\n' "${messages}" >&2
+              grep -q 'advancing to 50% traffic' <<< "${messages}"
+              grep -q 'advancing to 75% traffic' <<< "${messages}"
+      catch:
+        - events: {}
+        - describe:
+            apiVersion: inference.llmcp.io/v1alpha1
+            kind: ModelDeployment
+        - describe:
+            apiVersion: apps/v1
+            kind: Deployment
+      cleanup:
+        - delete:
+            ref:
+              apiVersion: batch/v1
+              kind: Job
+              name: ladder-load

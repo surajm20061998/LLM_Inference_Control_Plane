@@ -1,0 +1,69 @@
+apiVersion: inference.llmcp.io/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: ladder-demo
+spec:
+  # Four is the smallest total that expresses every requested rung exactly:
+  # 25% = 1/4, 50% = 2/4, and 75% = 3/4.
+  replicas: 4
+  model:
+    name: stub-model
+    source:
+      image:
+        image: localhost:5001/llmcp-model:dev
+        path: /weights/model.gguf
+        pullPolicy: Always
+  engine:
+    type: llamacpp
+    image: localhost:5001/llmcp-fakeengine:dev
+    imagePullPolicy: Always
+    contextSize: 4096
+    maxConcurrency: 4
+    env:
+      - name: LLMCP_FAKE_TTFT_MS
+        value: "60"
+      - name: LLMCP_FAKE_TOKENS
+        value: "24"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+  serving:
+    port: 8080
+    startupTimeout: 60s
+  rollout:
+    type: Canary
+    # Three fresh post-readiness windows plus image scheduling must fit inside
+    # the one rollout-wide deadline.
+    progressDeadline: 480s
+    autoRollback: true
+    canary:
+      stepWeights: [25, 50, 75]
+      requireApproval: true
+      trafficRouting:
+        mode: Replica
+      analysis:
+        interval: 10s
+        window: 30s
+        initialDelay: 10s
+        failureThreshold: 2
+        consecutiveErrorLimit: 6
+        inconclusiveLimit: 12
+        onInconclusive: Wait
+        minRequestRate: "500m"
+        provider:
+          type: Prometheus
+          address: http://prometheus-operated.monitoring.svc:9090
+        metrics:
+          - name: ttft-vs-primary
+            builtin: ttft-p95
+            compareToPrimary: true
+            thresholdRange:
+              max: "1500m"
+  observability:
+    serviceMonitor:
+      enabled: true
+      interval: 5s

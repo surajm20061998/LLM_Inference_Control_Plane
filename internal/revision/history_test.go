@@ -136,6 +136,73 @@ func TestRecordCreatesControllerRevision(t *testing.T) {
 	}
 }
 
+func TestRecordStoresVersionedSnapshotBytes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	md := newModelDeployment("versioned")
+	md.Spec = *versionedSpec()
+	rec := newRecorder(t, md)
+	snapshot, err := NewSnapshot(&md.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cr, created, err := rec.Record(ctx, md, snapshot.Revision, snapshot.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("first versioned snapshot was not created")
+	}
+	if !slices.Equal(cr.Data.Raw, snapshot.Raw) {
+		t.Fatalf("stored payload = %s, want %s", cr.Data.Raw, snapshot.Raw)
+	}
+	decoded, err := Decode(cr.Data.Raw)
+	if err != nil || decoded.Version != PayloadVersionV2 {
+		t.Fatalf("decoded version = %q, err = %v", decoded.Version, err)
+	}
+}
+
+func TestRecordRejectsPayloadIdentityMismatch(t *testing.T) {
+	t.Parallel()
+
+	md := newModelDeployment("mismatch")
+	md.Spec = *versionedSpec()
+	rec := newRecorder(t, md)
+	snapshot, err := NewSnapshot(&md.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rec.Record(context.Background(), md, "not-the-payload-hash", snapshot.Raw); err == nil {
+		t.Fatal("Record accepted payload bytes under a different identity")
+	}
+}
+
+func TestRecordRejectsExistingPayloadDrift(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	md := newModelDeployment("drift")
+	md.Spec = *versionedSpec()
+	rec := newRecorder(t, md)
+	snapshot, err := NewSnapshot(&md.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cr, _, err := rec.Record(ctx, md, snapshot.Revision, snapshot.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cr.Data.Raw = []byte(`{"version":"v2","workload":{}}`)
+	if err := rec.Client.Update(ctx, cr); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rec.Record(ctx, md, snapshot.Revision, snapshot.Raw); err == nil {
+		t.Fatal("Record accepted different bytes from an existing revision identity")
+	}
+}
+
 // TestRecordIsIdempotent is the property a reconcile loop depends on: it will
 // call Record on every pass, and an unchanged spec must not churn the API or
 // inflate the sequence number.

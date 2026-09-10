@@ -40,8 +40,10 @@ import (
 // The `level:metric:operation` convention reads as "over what, of what, how":
 // llmcp is the level, ttft_sli the metric, ratio_rate5m the operation.
 const (
-	recordTTFTSLI  = "llmcp:ttft_sli:ratio_rate"
-	recordAvailSLI = "llmcp:availability_sli:ratio_rate"
+	recordTTFTSLI               = "llmcp:ttft_sli:ratio_rate"
+	recordAvailSLI              = "llmcp:availability_sli:ratio_rate"
+	recordTTFTObjective         = "llmcp:slo_ttft:objective"
+	recordAvailabilityObjective = "llmcp:slo_availability:objective"
 )
 
 // burnWindow is one rung of the multiwindow burn-rate ladder.
@@ -172,7 +174,7 @@ func BuildPrometheusRule(in PrometheusRuleInput) *unstructured.Unstructured {
 			// being recomputed every 15s, and each evaluation is a range query
 			// over every series the selector matches.
 			fieldInterval: "30s",
-			fieldRules:    recordingRules(in.Model, threshold, windows),
+			fieldRules:    recordingRules(in, threshold, windows),
 		},
 		map[string]any{
 			fieldName:     in.Name + ".slo",
@@ -238,9 +240,9 @@ const ComponentSLO = "slo"
 //
 // The `le` value must be an exact bucket boundary and is formatted the way the
 // client library formats one. See internal/metrics/buckets.go.
-func recordingRules(model string, threshold float64, windows []string) []any {
+func recordingRules(in PrometheusRuleInput, threshold float64, windows []string) []any {
 	le := llmcpmetrics.FormatBucket(threshold)
-	sel := fmt.Sprintf(`%s=%q`, llmcpmetrics.LabelModel, model)
+	sel := resourceSelector(in)
 
 	rules := make([]any, 0, len(windows)*2)
 
@@ -253,7 +255,7 @@ func recordingRules(model string, threshold float64, windows []string) []any {
 				llmcpmetrics.TTFTSeconds, sel, w,
 				llmcpmetrics.TTFTSeconds, sel, le, w,
 				llmcpmetrics.TTFTSeconds, sel, w),
-			fieldLabels: map[string]any{llmcpmetrics.LabelModel: model},
+			fieldLabels: ruleIdentityLabels(in),
 		})
 	}
 
@@ -265,11 +267,44 @@ func recordingRules(model string, threshold float64, windows []string) []any {
 					`/ clamp_min(sum(rate(%s{%s}[%s])), 1e-9))`,
 				llmcpmetrics.RequestsTotal, sel, llmcpmetrics.LabelCode, w,
 				llmcpmetrics.RequestsTotal, sel, w),
-			fieldLabels: map[string]any{llmcpmetrics.LabelModel: model},
+			fieldLabels: ruleIdentityLabels(in),
 		})
 	}
 
+	var slo *inferencev1alpha1.SLOSpec
+	if in.Spec != nil {
+		slo = in.Spec.SLO
+	}
+	for _, objective := range []struct {
+		name  string
+		value float64
+	}{
+		{recordTTFTObjective, slo.ResolvedTTFTObjective()},
+		{recordAvailabilityObjective, slo.ResolvedAvailabilityObjective()},
+	} {
+		rules = append(rules, map[string]any{
+			fieldRecord: objective.name,
+			fieldExpr:   "vector(" + formatG(objective.value) + ")",
+			fieldLabels: ruleIdentityLabels(in),
+		})
+	}
 	return rules
+}
+
+// Each rule belongs to one resource, even when several resources serve the
+// same model. Keep both input selectors and recorded labels scoped.
+func resourceSelector(in PrometheusRuleInput) string {
+	return fmt.Sprintf(`%s=%q,%s=%q`,
+		llmcpmetrics.LabelNamespace, in.Namespace,
+		llmcpmetrics.LabelModelDeployment, in.Name)
+}
+
+func ruleIdentityLabels(in PrometheusRuleInput) map[string]any {
+	return map[string]any{
+		llmcpmetrics.LabelNamespace:       in.Namespace,
+		llmcpmetrics.LabelModelDeployment: in.Name,
+		llmcpmetrics.LabelModel:           in.Model,
+	}
 }
 
 // alertRules renders the burn-rate ladder for both SLOs.
@@ -345,19 +380,19 @@ func burnAlert(in burnAlertInput) map[string]any {
 	limit := in.Rung.Factor * budget
 
 	expr := fmt.Sprintf(
-		"(1 - %s%s{%s=%q}) > %s\nand\n(1 - %s%s{%s=%q}) > %s",
-		in.Record, in.Rung.Long, llmcpmetrics.LabelModel, in.MD.Model, formatG(limit),
-		in.Record, in.Rung.Short, llmcpmetrics.LabelModel, in.MD.Model, formatG(limit))
+		"(1 - %s%s{%s}) > %s\nand\n(1 - %s%s{%s}) > %s",
+		in.Record, in.Rung.Long, resourceSelector(in.MD), formatG(limit),
+		in.Record, in.Rung.Short, resourceSelector(in.MD), formatG(limit))
 
 	return map[string]any{
 		fieldAlert: in.Alert,
 		fieldExpr:  expr,
 		fieldFor:   in.Rung.For,
 		fieldLabels: map[string]any{
-			labelSeverity:               in.Rung.Severity,
-			labelSLO:                    in.SLO,
-			llmcpmetrics.LabelModel:     in.MD.Model,
-			naming.LabelModelDeployment: in.MD.Name,
+			labelSeverity:                     in.Rung.Severity,
+			labelSLO:                          in.SLO,
+			llmcpmetrics.LabelModel:           in.MD.Model,
+			llmcpmetrics.LabelModelDeployment: in.MD.Name,
 			// The namespace is a label rather than only metadata so that a
 			// routing tree can send a team's alerts to that team without
 			// needing to know which ModelDeployments they own.
@@ -392,18 +427,18 @@ func noTrafficAlert(in PrometheusRuleInput) map[string]any {
 	return map[string]any{
 		fieldAlert: alertNoTraffic,
 		fieldExpr: fmt.Sprintf(
-			`sum(rate(%s{%s=%q}[10m])) == 0 and on() (sum(%s{%s=%q}) > 0)`,
-			llmcpmetrics.RequestsTotal, llmcpmetrics.LabelModel, in.Model,
-			llmcpmetrics.ShimInfo, llmcpmetrics.LabelModel, in.Model),
+			`sum(rate(%s{%s}[10m])) == 0 and on() (sum(%s{%s}) > 0)`,
+			llmcpmetrics.RequestsTotal, resourceSelector(in),
+			llmcpmetrics.ShimInfo, resourceSelector(in)),
 		// Fifteen minutes, because a genuinely idle deployment is normal
 		// overnight and this must not page for it. It is a warning, not a page.
 		fieldFor: "15m",
 		fieldLabels: map[string]any{
-			labelSeverity:               severityWarning,
-			labelSLO:                    "traffic",
-			llmcpmetrics.LabelModel:     in.Model,
-			naming.LabelModelDeployment: in.Name,
-			fieldNamespace:              in.Namespace,
+			labelSeverity:                     severityWarning,
+			labelSLO:                          "traffic",
+			llmcpmetrics.LabelModel:           in.Model,
+			llmcpmetrics.LabelModelDeployment: in.Name,
+			fieldNamespace:                    in.Namespace,
 		},
 		fieldAnnotations: map[string]any{
 			annotationSummary: fmt.Sprintf("%s has shims reporting but no requests for 10 minutes", in.Name),

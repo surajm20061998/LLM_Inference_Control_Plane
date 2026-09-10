@@ -57,14 +57,19 @@ var (
 type metrics struct {
 	registry *prometheus.Registry
 
-	requests    *prometheus.CounterVec
-	duration    *prometheus.HistogramVec
-	ttft        prometheus.Observer
-	tpot        prometheus.Observer
-	outTokens   prometheus.Counter
-	inFlight    prometheus.GaugeFunc
-	queueDepth  prometheus.GaugeFunc
-	upstreamErr *prometheus.CounterVec
+	requests        *prometheus.CounterVec
+	requestsStarted *prometheus.CounterVec
+	duration        *prometheus.HistogramVec
+	ttft            prometheus.Observer
+	tpot            prometheus.Observer
+	outTokens       prometheus.Counter
+	outChunks       prometheus.Counter
+	reportedTokens  prometheus.Counter
+	usageRequests   prometheus.Counter
+	interChunk      prometheus.Observer
+	inFlight        prometheus.GaugeFunc
+	queueDepth      prometheus.GaugeFunc
+	upstreamErr     *prometheus.CounterVec
 
 	// concurrency mirrors the engine's --parallel and is the subtrahend in the
 	// queue-depth derivation.
@@ -93,13 +98,20 @@ func newMetrics(cfg config) *metrics {
 	)
 
 	constLabels := prometheus.Labels{
-		llmcpmetrics.LabelModel:   cfg.model,
-		llmcpmetrics.LabelVariant: cfg.variant,
+		llmcpmetrics.LabelNamespace:       cfg.namespace,
+		llmcpmetrics.LabelModelDeployment: cfg.modelDeployment,
+		llmcpmetrics.LabelModel:           cfg.model,
+		llmcpmetrics.LabelVariant:         cfg.variant,
 	}
 
 	m := &metrics{
 		registry:    reg,
 		concurrency: int64(cfg.maxConcurrency),
+		requestsStarted: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        llmcpmetrics.RequestsStartedTotal,
+			Help:        "Inference POST requests admitted, before upstream completion, by operation.",
+			ConstLabels: constLabels,
+		}, []string{llmcpmetrics.LabelOperation}),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name:        llmcpmetrics.RequestsTotal,
 			Help:        "Inference requests completed, by operation and HTTP status code.",
@@ -112,8 +124,25 @@ func newMetrics(cfg config) *metrics {
 			ConstLabels: constLabels,
 		}, []string{llmcpmetrics.LabelOperation}),
 		outTokens: prometheus.NewCounter(prometheus.CounterOpts{
-			Name:        llmcpmetrics.OutputTokensTotal,
-			Help:        "Generated tokens observed on streamed responses.",
+			Name: llmcpmetrics.OutputTokensTotal,
+			Help: "Deprecated: content-bearing SSE chunks, not tokenizer tokens. " +
+				"Use llmcp_inference_output_chunks_total.",
+			ConstLabels: constLabels,
+		}),
+		outChunks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name:        llmcpmetrics.OutputChunksTotal,
+			Help:        "First-choice SSE events carrying content, reasoning, or tool-call output.",
+			ConstLabels: constLabels,
+		}),
+		reportedTokens: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: llmcpmetrics.ReportedOutputTokensTotal,
+			Help: "Explicit completion_tokens reported by successful completed responses; " +
+				"missing usage is not estimated.",
+			ConstLabels: constLabels,
+		}),
+		usageRequests: prometheus.NewCounter(prometheus.CounterOpts{
+			Name:        llmcpmetrics.UsageRequestsTotal,
+			Help:        "Successful completed responses supplying valid completion_tokens usage.",
 			ConstLabels: constLabels,
 		}),
 
@@ -125,18 +154,27 @@ func newMetrics(cfg config) *metrics {
 	}
 
 	ttft := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:        llmcpmetrics.TTFTSeconds,
-		Help:        "Time to the first generated token, in seconds. Streaming requests only.",
+		Name: llmcpmetrics.TTFTSeconds,
+		Help: "Time to the first content-bearing SSE event, including reasoning and tool output, " +
+			"in seconds. Streaming requests only.",
 		Buckets:     ttftBuckets,
 		ConstLabels: constLabels,
 	})
 	tpot := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:        llmcpmetrics.TPOTSeconds,
-		Help:        "Mean time per output token after the first, in seconds.",
+		Name: llmcpmetrics.TPOTSeconds,
+		Help: "Deprecated: response duration after first content divided by remaining content chunks; " +
+			"not time per tokenizer token.",
 		Buckets:     tpotBuckets,
 		ConstLabels: constLabels,
 	})
 	m.ttft, m.tpot = ttft, tpot
+	interChunk := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:        llmcpmetrics.InterChunkSeconds,
+		Help:        "Time between successive content-bearing SSE events as read from upstream, in seconds.",
+		Buckets:     tpotBuckets,
+		ConstLabels: constLabels,
+	})
+	m.interChunk = interChunk
 
 	// PULLED at scrape time, not pushed on every begin/end.
 	//
@@ -165,17 +203,20 @@ func newMetrics(cfg config) *metrics {
 		Name: llmcpmetrics.ShimInfo,
 		Help: "Always 1. Carries shim build and target metadata as labels.",
 		ConstLabels: prometheus.Labels{
-			llmcpmetrics.LabelModel:   cfg.model,
-			llmcpmetrics.LabelVariant: cfg.variant,
-			"upstream":                cfg.upstream.String(),
-			"version":                 version,
+			llmcpmetrics.LabelNamespace:       cfg.namespace,
+			llmcpmetrics.LabelModelDeployment: cfg.modelDeployment,
+			llmcpmetrics.LabelModel:           cfg.model,
+			llmcpmetrics.LabelVariant:         cfg.variant,
+			"upstream":                        cfg.upstream.String(),
+			"version":                         version,
 		},
 	})
 	info.Set(1)
 
 	reg.MustRegister(
-		m.requests, m.duration, ttft, tpot,
-		m.outTokens, m.inFlight, m.queueDepth, m.upstreamErr, info,
+		m.requests, m.requestsStarted, m.duration, ttft, tpot,
+		m.outTokens, m.outChunks, m.reportedTokens, m.usageRequests, interChunk,
+		m.inFlight, m.queueDepth, m.upstreamErr, info,
 	)
 
 	// Publish the zero values immediately.
@@ -195,6 +236,13 @@ func newMetrics(cfg config) *metrics {
 		llmcpmetrics.OperationCompletion,
 	} {
 		m.requests.WithLabelValues(op, strconv.Itoa(200)).Add(0)
+	}
+	for _, op := range []string{
+		llmcpmetrics.OperationChat,
+		llmcpmetrics.OperationCompletion,
+		llmcpmetrics.OperationEmbeddings,
+	} {
+		m.requestsStarted.WithLabelValues(op).Add(0)
 	}
 
 	return m
@@ -228,11 +276,16 @@ func (m *metrics) observe(st *requestState, code int) {
 	m.requests.WithLabelValues(st.operation, strconv.Itoa(code)).Inc()
 
 	if !st.streamed {
+		m.observeUsage(st, code)
 		return
+	}
+	if st.sawDone {
+		m.observeUsage(st, code)
 	}
 
 	if st.tokens > 0 {
 		m.outTokens.Add(float64(st.tokens))
+		m.outChunks.Add(float64(st.tokens))
 	}
 	if !st.sawFirstToken {
 		return
@@ -245,6 +298,13 @@ func (m *metrics) observe(st *requestState, code int) {
 		if decode > 0 {
 			m.tpot.Observe(decode.Seconds() / float64(st.tokens-1))
 		}
+	}
+}
+
+func (m *metrics) observeUsage(st *requestState, code int) {
+	if st.hasUsage && st.readErr == nil && code >= 200 && code < 300 {
+		m.reportedTokens.Add(float64(st.reportedTokens))
+		m.usageRequests.Inc()
 	}
 }
 

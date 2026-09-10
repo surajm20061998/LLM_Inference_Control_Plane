@@ -156,14 +156,9 @@ type CanarySpec struct {
 	// +optional
 	TrafficRouting TrafficRoutingSpec `json:"trafficRouting,omitempty"`
 
-	// Scale decouples the canary's replica count from its traffic weight.
-	//
-	// Borrowed from Argo Rollouts' canaryScale, and it earns its place for
-	// inference specifically: a model server has a long, expensive warm-up, so
-	// a canary that is scaled up in lockstep with its weight spends the first
-	// analysis window of every step loading a model rather than serving. Fixing
-	// the replica count up front means the canary is warm before it is
-	// measured.
+	// Scale is reserved for routing that can weight traffic independently of
+	// capacity. Replica mode rejects replicas and matchTrafficWeight=false:
+	// every rung must size the candidate proportionally to its requested weight.
 	//
 	// +optional
 	Scale *CanaryScaleSpec `json:"scale,omitempty"`
@@ -214,7 +209,9 @@ type TrafficRoutingSpec struct {
 	Mode TrafficRoutingMode `json:"mode,omitempty"`
 }
 
-// CanaryScaleSpec decouples canary replicas from canary traffic weight.
+// CanaryScaleSpec configures candidate capacity. Replica routing supports only
+// an omitted value or matchTrafficWeight=true. Fixed capacity requires a future
+// routing mode that weights requests independently of pod counts.
 //
 // Exactly one member may be set.
 //
@@ -230,6 +227,23 @@ type CanaryScaleSpec struct {
 	// the default behaviour.
 	// +optional
 	MatchTrafficWeight *bool `json:"matchTrafficWeight,omitempty"`
+}
+
+// CanaryReadinessTarget identifies the rung and Deployment incarnation whose
+// readiness starts the evidence clock. All fields are persisted across restarts.
+type CanaryReadinessTarget struct {
+	// Step is the rung index associated with this readiness observation.
+	Step int32 `json:"step"`
+	// Weight is the requested configured share for this rung.
+	Weight int32 `json:"weight"`
+	// TotalReplicas is the fleet capacity used to compute this rung.
+	TotalReplicas int32 `json:"totalReplicas"`
+	// CanaryReplicas is the complete candidate capacity required to be ready.
+	CanaryReplicas int32 `json:"canaryReplicas"`
+	// Generation is the candidate Deployment generation being observed.
+	Generation int64 `json:"generation"`
+	// DeploymentUID distinguishes a deleted and recreated Deployment.
+	DeploymentUID string `json:"deploymentUID"`
 }
 
 // Resolved accessors. Each returns the effective value including defaults, so
