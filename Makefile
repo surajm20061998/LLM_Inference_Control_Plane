@@ -548,6 +548,7 @@ verify: manifests generate fmt vet lint test api-docs-check docs-mermaid-check c
 CRD_REF_DOCS_VERSION ?= v0.3.0
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
 MERMAID_CLI_VERSION ?= 11.16.0
+MERMAID_PUPPETEER_CONFIG ?=
 
 .PHONY: crd-ref-docs
 crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary.
@@ -592,7 +593,9 @@ docs-mermaid-check: ## Parse and render every Mermaid diagram in README.md.
 	tmp="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp"' EXIT; \
 	"$(NPX)" --yes --package="@mermaid-js/mermaid-cli@$(MERMAID_CLI_VERSION)" \
-		mmdc --quiet --input README.md --output "$$tmp/README.md"; \
+		mmdc --quiet \
+		$(if $(MERMAID_PUPPETEER_CONFIG),--puppeteerConfigFile "$(MERMAID_PUPPETEER_CONFIG)") \
+		--input README.md --output "$$tmp/README.md"; \
 	echo "README.md: $$blocks Mermaid diagrams valid (mermaid-cli $(MERMAID_CLI_VERSION))"
 
 .PHONY: load

@@ -59,8 +59,11 @@ jobs:
       # GitHub renders Mermaid directly from README.md. Render every fenced
       # diagram with the exact parser version pinned in the Makefile so a
       # syntax regression is caught before the repository page is published.
+      # GitHub's hosted Linux image does not expose a Chromium sandbox, so this
+      # unprivileged, secret-free job uses the repository's CI-only Puppeteer
+      # launch configuration. Local runs retain Chromium's normal sandbox.
       - name: Validate README diagrams
-        run: make docs-mermaid-check
+        run: make docs-mermaid-check MERMAID_PUPPETEER_CONFIG=hack/mermaid-puppeteer-ci.json
 
       - name: Run tests
         run: make test
