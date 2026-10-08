@@ -213,6 +213,7 @@ func main() {
 
 	if err := (&controller.ModelDeploymentReconciler{
 		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
 		Discovery: prober,
 		ShimImage: shimImage,

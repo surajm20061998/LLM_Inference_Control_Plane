@@ -228,14 +228,26 @@ func histogramQuantile(q float64, metric, sel, window string) string {
 // model name that does not exist, a context window overflow — and counting one
 // against the server would let a single misbehaving caller roll back a
 // perfectly good release.
+//
+// # Zero errors is a measurement, not an absence
+//
+// A counter series exists per label set only once it has been incremented,
+// so a variant that has served no 5xx has NO code=~"5.." series at all. The
+// numerator was then an empty vector, the division was empty, and every round
+// reported "the query matched no series" — a healthy canary could never pass
+// this check and, under onInconclusive: Wait, never promoted.
+//
+// The fallback is "0 *" the request rate, never a bare vector(0): it yields a
+// zero only when the variant actually served traffic in the window. With no
+// traffic at all the result stays empty, so the absence of a measurement is
+// still reported as exactly that rather than as a perfect score.
 func errorRateQuery(qc QueryContext) string {
 	base := selector(qc)
 	errSel := base + `,` + llmcpmetrics.LabelCode + `=~"5.."`
+	total := fmt.Sprintf("sum(rate(%s{%s}[%s]))", llmcpmetrics.RequestsTotal, base, qc.Window)
 
-	return fmt.Sprintf("sum(rate(%s{%s}[%s])) / clamp_min(sum(rate(%s{%s}[%s])), %s)",
-		llmcpmetrics.RequestsTotal, errSel, qc.Window,
-		llmcpmetrics.RequestsTotal, base, qc.Window,
-		clampFloor)
+	return fmt.Sprintf("(sum(rate(%s{%s}[%s])) or 0 * %s) / clamp_min(%s, %s)",
+		llmcpmetrics.RequestsTotal, errSel, qc.Window, total, total, clampFloor)
 }
 
 // selector renders the label matcher shared by every built-in.

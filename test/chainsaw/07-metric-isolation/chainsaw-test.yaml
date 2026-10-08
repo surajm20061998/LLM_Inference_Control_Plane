@@ -139,7 +139,7 @@ spec:
                 name: isolation-bad
               status:
                 phase: Available
-                (canary.failedRevision != ''): true
+                (canary.failedRevision != null && canary.failedRevision != ''): true
         - assert:
             timeout: 8m
             resource:

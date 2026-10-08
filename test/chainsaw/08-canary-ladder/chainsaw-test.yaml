@@ -169,7 +169,10 @@ spec:
                     weight: 75
                     totalReplicas: 4
                     canaryReplicas: 3
-                  (checks[?verdict == 'Pass'] | length(@)): 1
+                  # Null-safe. On every rung change the controller clears checks
+                  # (prior evidence is void), and length(null) is a JMESPath TYPE
+                  # error, which Chainsaw treats as fatal instead of polling.
+                  (length(checks[?verdict == 'Pass'] || `[]`)): 1
         - assert:
             resource:
               apiVersion: apps/v1

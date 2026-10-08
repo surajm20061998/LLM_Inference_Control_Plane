@@ -17,16 +17,20 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	testingclock "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/surajm20061998/LLM_Inference_Control_Plane/api/v1alpha1"
 	"github.com/surajm20061998/LLM_Inference_Control_Plane/internal/analysis"
@@ -338,6 +342,97 @@ var _ = Describe("Canary rollout", func() {
 				"the rejected revision must not come back")
 	})
 
+	It("audits a rollback as CanaryRolledBack and settles back to Available", func() {
+		// Both halves failed on a real cluster while every envtest passed: the
+		// rollback was announced as a progress-deadline stall (so the
+		// CanaryRolledBack audit event never fired), and the resource then sat
+		// in Progressing forever because updatedReplicas only counts pods on
+		// the TARGET revision — which a rollback deliberately does not run.
+		h := newCanaryHarness(trafficOK(), ttft(9.0))
+		h.provider.Repeat = true
+		rec := events.NewFakeRecorder(200)
+		h.r.Recorder = rec
+
+		h.establishBaseline()
+		good := mdtGet(h.mdKey).Status.LastGoodRevision
+		h.switchToCanary()
+		h.reconcile()
+		h.markCanaryAvailable()
+		h.reconcile()
+		h.analysisRound()
+		drainEvents(rec)
+
+		By("recording the rollback as a rollback, not as a stall")
+		h.analysisRound()
+		emitted := drainEvents(rec)
+		Expect(emitted).To(ContainElement(HavePrefix(
+			corev1.EventTypeWarning + " " + inferencev1alpha1.EventReasonCanaryRolledBack + " ")))
+		Expect(emitted).NotTo(ContainElement(ContainSubstring(inferencev1alpha1.EventReasonRolloutStalled)))
+
+		By("staying quiet on the passes that only keep the rejection in force")
+		h.reconcile()
+		h.reconcile()
+		Expect(drainEvents(rec)).NotTo(ContainElement(ContainSubstring(inferencev1alpha1.EventReasonRolloutStalled)))
+
+		By("returning to Available once the primary has converged on the known-good revision")
+		Expect(helpers.MarkDeploymentAvailable(ctx, k8sClient, h.primaryKey, 5)).To(Succeed())
+		h.reconcile()
+
+		md := mdtGet(h.mdKey)
+		Expect(md.Status.Phase).To(Equal(inferencev1alpha1.PhaseAvailable))
+		cond := mdtExpectCondition(md, inferencev1alpha1.ConditionProgressing, metav1.ConditionFalse)
+		Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonRevisionRejected))
+		Expect(md.Status.Canary.FailedRevision).NotTo(BeEmpty(), "the rejection must stay visible")
+		Expect(md.Status.LastGoodRevision).To(Equal(good), "the rejected revision must never be banked")
+		Expect(h.canaryExists()).To(BeFalse())
+	})
+
+	It("never resurrects a rolled-back canary from a stale read of its own status", func() {
+		// On a real cluster the rollback deletes the canary Deployment, whose
+		// watch event triggers the next pass before the rollback's status write
+		// has reached the informer cache. That pass planned from the stale copy
+		// (a canary still in flight), recreated the canary, and — through a
+		// conflict retry that re-read the object but kept the stale plan —
+		// wrote "still canarying" over the rollback. envtest reads straight
+		// from the API server, so only an explicitly lagging reader shows it.
+		h := newCanaryHarness(trafficOK(), ttft(9.0))
+		h.provider.Repeat = true
+
+		h.establishBaseline()
+		h.switchToCanary()
+		h.reconcile()
+		h.markCanaryAvailable()
+		h.reconcile()
+		h.analysisRound()
+
+		beforeRollback := mdtGet(h.mdKey)
+		h.analysisRound()
+		Expect(h.canaryExists()).To(BeFalse())
+		rejected := h.status().FailedRevision
+		Expect(rejected).NotTo(BeEmpty())
+
+		By("planning from the API server even while the cache still shows the canary")
+		h.r.Client = &laggingReader{Client: k8sClient, stale: beforeRollback, staleReads: 1000}
+		h.r.APIReader = k8sClient
+		h.reconcile()
+		Expect(h.canaryExists()).To(BeFalse(), "the rejected revision must not get a second canary")
+		Expect(h.status().FailedRevision).To(Equal(rejected))
+
+		By("refusing to write a status planned from a read that was stale")
+		h.r.Client = k8sClient
+		h.r.APIReader = &laggingReader{Client: k8sClient, stale: beforeRollback, staleReads: 1}
+		h.reconcile()
+		md := mdtGet(h.mdKey)
+		Expect(md.Status.Canary.FailedRevision).To(Equal(rejected), "a stale plan must never overwrite the rollback")
+		Expect(md.Status.Phase).NotTo(Equal(inferencev1alpha1.PhaseCanarying))
+
+		By("and converging again on the next fresh pass")
+		h.r.APIReader = k8sClient
+		h.reconcile()
+		Expect(h.canaryExists()).To(BeFalse())
+		Expect(h.status().FailedRevision).To(Equal(rejected))
+	})
+
 	It("reports Error, never a rollback, when the metric provider is down", func() {
 		// The safety property that separates this from a naive canary
 		// controller: a monitoring outage must not cause a production
@@ -615,3 +710,37 @@ var _ = Describe("Automatic rollback of a stalled rollout", func() {
 
 // boolPtr returns a pointer to b.
 func boolPtr(b bool) *bool { return &b }
+
+// laggingReader stands in for an informer cache that has not yet caught up:
+// its first staleReads reads of the ModelDeployment return a snapshot taken
+// earlier, and everything else goes to the API server.
+type laggingReader struct {
+	client.Client
+	stale      *inferencev1alpha1.ModelDeployment
+	staleReads int
+}
+
+func (l *laggingReader) Get(
+	ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+) error {
+	if md, ok := obj.(*inferencev1alpha1.ModelDeployment); ok &&
+		l.staleReads > 0 && key == client.ObjectKeyFromObject(l.stale) {
+		l.staleReads--
+		l.stale.DeepCopyInto(md)
+		return nil
+	}
+	return l.Client.Get(ctx, key, obj, opts...)
+}
+
+// drainEvents returns every event recorded so far.
+func drainEvents(rec *events.FakeRecorder) []string {
+	var out []string
+	for {
+		select {
+		case e := <-rec.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}

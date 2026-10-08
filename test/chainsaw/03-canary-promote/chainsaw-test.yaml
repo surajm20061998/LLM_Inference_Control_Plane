@@ -44,6 +44,29 @@ spec:
         - apply:
             file: loadgen.yaml
 
+    - name: ship-a-healthy-new-revision
+      try:
+        # Without this step nothing is ever canaried. The first revision of a
+        # ModelDeployment rolls out directly — entering Canarying requires a
+        # non-empty lastGoodRevision, because a canary with nothing to roll
+        # back TO is not a canary — so the resource sits at Available until
+        # its spec changes. This suite once went straight from create to
+        # asserting Canarying and timed out on every nightly run.
+        #
+        # The change is a marker variable only: the latency the stub is told
+        # to produce is unchanged, so the canary is as healthy as the primary
+        # and the ttft ratio it is judged on stays near 1.0, well inside the
+        # 1.5x threshold.
+        - script:
+            shell: bash
+            content: |
+              kubectl -n $NAMESPACE patch modeldeployment promote-demo --type=merge -p '
+              {"spec":{"engine":{"env":[
+                {"name":"LLMCP_FAKE_TTFT_MS","value":"60"},
+                {"name":"LLMCP_FAKE_TOKENS","value":"24"},
+                {"name":"LLMCP_E2E_REVISION","value":"2"}
+              ]}}}'
+
     - name: the-canary-starts
       try:
         - assert:

@@ -532,11 +532,23 @@ e2e-chainsaw: chainsaw ## Run one suite, or every non-destructive suite, against
 
 .PHONY: e2e-observability-resync
 e2e-observability-resync: chainsaw ## Run the cluster-scoped resync suite on a disposable *observability-resync* Kind cluster.
+	@# The context-name guard has to live HERE, not in the suite: Chainsaw runs
+	@# scripts against a kubeconfig of its own whose context is always named
+	@# "chainsaw". The suite re-checks the cluster by node providerID instead.
+	@context=$$(kubectl config current-context); \
+	case "$$context" in \
+		kind-*observability-resync*) ;; \
+		*) echo "Refusing context $$context: use a dedicated Kind context containing observability-resync" >&2; exit 1 ;; \
+	esac
 	@LLMCP_OBSERVABILITY_RESYNC_E2E=1 \
 		"$(CHAINSAW)" test test/chainsaw/09-observability-resync --config test/chainsaw/config.yaml
 
+.PHONY: preflight
+preflight: ## Check Docker memory, free disk and competing clusters before building anything.
+	@CLUSTER_NAME=$(CLUSTER_NAME) bash hack/preflight.sh
+
 .PHONY: e2e-up
-e2e-up: kind-up dev-images dev-deploy ## Bring up a cluster with the operator and the stub images.
+e2e-up: preflight kind-up dev-images dev-deploy ## Bring up a cluster with the operator and the stub images.
 	@echo "Cluster ready. A full standard run also needs: make loadgen-image monitoring-install"
 	@echo "Then run: make e2e-chainsaw"
 

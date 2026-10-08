@@ -98,7 +98,7 @@ spec:
                 # rollback. The durable terminal evidence is the stable phase,
                 # sticky failed identity, absent candidate, and audit Event.
                 phase: Available
-                (canary.failedRevision != ''): true
+                (canary.failedRevision != null && canary.failedRevision != ''): true
         - error:
             resource:
               apiVersion: apps/v1

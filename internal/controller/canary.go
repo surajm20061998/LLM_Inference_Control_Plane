@@ -72,9 +72,19 @@ type rollout struct {
 	// RequeueAfter is when to look again.
 	RequeueAfter time.Duration
 
-	// RolledBack marks a pass that reverted a stalled non-canary rollout, so
-	// status can say so.
+	// RolledBack marks a pass on which the primary is deliberately NOT running
+	// the target, because the target was rejected: by guardAgainstStall, or by
+	// holdRejectedRevision keeping an earlier rejection in force — which
+	// includes the very pass on which a canary's own analysis rolled it back.
 	RolledBack bool
+
+	// StallReverted marks only the pass on which guardAgainstStall itself
+	// reverted a stalled rollout. It is what the RolloutStalled event keys on.
+	// Keying that event on RolledBack instead mislabelled every canary
+	// rollback as a progress-deadline stall, suppressed the CanaryRolledBack
+	// event the audit trail depends on, and re-announced a "stall" on every
+	// later pass that merely kept the rejected revision held.
+	StallReverted bool
 }
 
 // planRollout decides what should be running this pass.
@@ -228,6 +238,7 @@ func (r *ModelDeploymentReconciler) guardAgainstStall(
 	res.CanaryRevision = ""
 	res.CanaryReplicas = 0
 	res.RolledBack = true
+	res.StallReverted = true
 
 	// Record the rejection on the canary state too, so a canary strategy does
 	// not immediately start evaluating the very revision that just failed to
@@ -682,7 +693,7 @@ func (r *ModelDeploymentReconciler) emitRolloutEvents(
 	prevPhase := md.Status.Phase
 	prevCanary := md.Status.Canary
 
-	if res.RolledBack {
+	if res.StallReverted {
 		if prevPhase != inferencev1alpha1.PhaseDegraded {
 			r.event(md, corev1.EventTypeWarning, inferencev1alpha1.EventReasonRolloutStalled, "Rollback",
 				"Rollout exceeded its progress deadline; reverting to revision "+res.PrimaryRevision)

@@ -3,8 +3,9 @@
 #
 # SAFETY: this suite creates and deletes the cluster-scoped, canonical
 # monitoring.coreos.com CRDs. It deliberately refuses to run unless both an
-# explicit opt-in is set and the current context names a dedicated Kind
-# cluster. Never include it in a shared-cluster run:
+# explicit opt-in is set and the cluster is a dedicated Kind cluster (checked
+# by context name in `make e2e-observability-resync`, and by node providerID
+# here). Never include it in a shared-cluster run:
 #
 #   kind create cluster --name llmcp-observability-resync
 #   make e2e-observability-resync
@@ -23,17 +24,34 @@ spec:
       try:
         - script:
             shell: bash
+            # The cluster is identified by its nodes, NOT by
+            # `kubectl config current-context`. Chainsaw runs every script
+            # against a kubeconfig it generates itself, whose only context is
+            # named "chainsaw" — so a context-name check in here can never pass
+            # anywhere, and did not: this suite failed at this step on every
+            # nightly run. The context-name check lives in the Makefile target,
+            # which still sees the caller's kubeconfig; this one proves the
+            # cluster Chainsaw actually talks to is a Kind cluster whose name
+            # contains observability-resync. Kind sets every node's providerID
+            # to kind://<provider>/<cluster>/<node>.
             content: |
               set -euo pipefail
-              context=$(kubectl config current-context)
               if [[ "${LLMCP_OBSERVABILITY_RESYNC_E2E:-}" != "1" ]]; then
                 echo 'Refusing cluster-scoped CRD mutation: set LLMCP_OBSERVABILITY_RESYNC_E2E=1' >&2
                 exit 1
               fi
-              if [[ "${context}" != kind-*observability-resync* ]]; then
-                echo "Refusing context ${context}: use a dedicated Kind context containing observability-resync" >&2
+              provider_ids=$(kubectl get nodes \
+                -o jsonpath='{range .items[*]}{.spec.providerID}{"\n"}{end}')
+              if [[ -z "${provider_ids}" ]]; then
+                echo 'Refusing cluster with no nodes reporting a providerID' >&2
                 exit 1
               fi
+              while IFS= read -r provider_id; do
+                if [[ "${provider_id}" != kind://*/*observability-resync*/* ]]; then
+                  echo "Refusing node ${provider_id:-<no providerID>}: use a dedicated Kind cluster whose name contains observability-resync" >&2
+                  exit 1
+                fi
+              done <<< "${provider_ids}"
               for crd in servicemonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com; do
                 if kubectl get crd "${crd}" >/dev/null 2>&1; then
                   echo "Refusing to replace pre-existing ${crd}" >&2
@@ -124,7 +142,7 @@ spec:
               spec:
                 (endpoints[?port == 'metrics'] | [0].interval): 5s
                 (endpoints[?port == 'metrics'] | [0].scrapeTimeout): 3s
-                (endpoints[?port == 'engine'] | length(@)): 1
+                (length(endpoints[?port == 'engine'] || `[]`)): 1
         - assert:
             resource:
               apiVersion: monitoring.coreos.com/v1
@@ -151,10 +169,15 @@ spec:
               set -euo pipefail
               # Delete only CRDs this suite proved did not pre-exist and whose
               # ownership marker still matches. The context guard is repeated
-              # at the destructive boundary rather than trusted from step one.
-              context=$(kubectl config current-context)
+              # at the destructive boundary rather than trusted from step one,
+              # by node providerID for the reason given in the first step.
               [[ "${LLMCP_OBSERVABILITY_RESYNC_E2E:-}" == "1" ]]
-              [[ "${context}" == kind-*observability-resync* ]]
+              provider_ids=$(kubectl get nodes \
+                -o jsonpath='{range .items[*]}{.spec.providerID}{"\n"}{end}')
+              [[ -n "${provider_ids}" ]]
+              while IFS= read -r provider_id; do
+                [[ "${provider_id}" == kind://*/*observability-resync*/* ]]
+              done <<< "${provider_ids}"
               for crd in servicemonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com; do
                 owner=$(kubectl get crd "${crd}" -o jsonpath='{.metadata.labels.llmcp\.io/e2e-owner}')
                 test "${owner}" = observability-resync

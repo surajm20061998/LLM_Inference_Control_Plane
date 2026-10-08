@@ -483,6 +483,36 @@ func setProgressing(
 		}
 	}
 
+	// A held rollback is a settled state, not a rollout that never finishes.
+	//
+	// updatedReplicas counts pods on the TARGET revision, and after a rollback
+	// the primary deliberately runs the last known-good one instead — so the
+	// check below can never pass, and a correctly rolled-back resource sat in
+	// Progressing forever instead of returning to Available. Completeness here
+	// is whether the primary has converged on the revision the controller
+	// CHOSE, with the canary gone.
+	if obs.Rollout.RolledBack && obs.PrimaryRevision != "" && obs.PrimaryRevision != obs.Revision {
+		dep := obs.Deployment
+		reverted := obs.CanaryDeployment == nil &&
+			dep.Status.ObservedGeneration >= dep.Generation &&
+			dep.Status.UpdatedReplicas == obs.DesiredReplicas &&
+			dep.Status.Replicas == obs.DesiredReplicas &&
+			dep.Status.AvailableReplicas == obs.DesiredReplicas
+		if reverted {
+			cond.Status = metav1.ConditionFalse
+			cond.Reason = inferencev1alpha1.ReasonRevisionRejected
+			cond.Message = fmt.Sprintf("Revision %s was rejected and every replica runs the last known-good "+
+				"revision %s; change the spec to roll out again", obs.Revision, obs.PrimaryRevision)
+			setCondition(status, cond)
+			return false, false
+		}
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = inferencev1alpha1.ReasonRolloutInProgress
+		cond.Message = "Reverting to the last known-good revision " + obs.PrimaryRevision
+		setCondition(status, cond)
+		return true, false
+	}
+
 	rolloutComplete := status.UpdatedReplicas == obs.DesiredReplicas &&
 		status.Replicas == obs.DesiredReplicas &&
 		status.AvailableReplicas == obs.DesiredReplicas &&

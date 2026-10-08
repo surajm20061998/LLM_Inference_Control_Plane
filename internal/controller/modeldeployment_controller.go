@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -64,6 +65,20 @@ type ModelDeploymentReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
+
+	// APIReader reads the ModelDeployment itself straight from the API
+	// server, bypassing the informer cache. Nil falls back to Client.
+	//
+	// Every rollout decision is a function of the PREVIOUS pass's status, and
+	// the cache can lag the status this controller just wrote. A canary
+	// rollback deletes the canary Deployment, whose watch event triggers the
+	// next reconcile within milliseconds — often before the rollback's own
+	// status write has reached the cache. Planned from that stale copy, the
+	// next pass saw a canary still in flight, recreated it, and overwrote the
+	// rollback in status: the rejected revision got a second full canary.
+	// One uncached GET per reconcile is the price of never planning from a
+	// status older than our own last write.
+	APIReader client.Reader
 
 	// Clock is injected so that anything time-dependent is deterministic under
 	// test. Production passes a real clock; tests pass a fake one and step it.
@@ -137,7 +152,7 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	log := logf.FromContext(ctx)
 
 	var md inferencev1alpha1.ModelDeployment
-	if err := r.Get(ctx, req.NamespacedName, &md); err != nil {
+	if err := r.reader().Get(ctx, req.NamespacedName, &md); err != nil {
 		if apierrors.IsNotFound(err) {
 			// The normal path after a delete: every child carries an owner
 			// reference, so garbage collection has already cleaned up the
@@ -269,6 +284,10 @@ func (r *ModelDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	obs.Scaling = scaling
 
 	if err := r.updateStatus(ctx, &md, obs); err != nil {
+		if errors.Is(err, errStalePlan) {
+			log.V(1).Info("Skipped status planned from a stale ModelDeployment; replanning")
+			return ctrl.Result{RequeueAfter: staleRequeue}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -583,42 +602,74 @@ func (r *ModelDeploymentReconciler) observe(
 // bumps resourceVersion, which fires the watch, which triggers another
 // reconcile — a hot loop that never converges and is invisible until it is
 // saturating the API server.
+//
+// # Never retried with the same observation
+//
+// obs, and the canary decision inside it, were derived from md as this pass
+// read it. If the object has changed since — most importantly, a status this
+// controller wrote that the pass did not see — the observation is stale, and
+// writing it would replace newer state with older. That is not hypothetical:
+// a RetryOnConflict loop here re-read the object and wrote the stale plan on
+// top of it, erasing a canary rollback recorded a moment earlier. So a changed
+// object (or a conflict on write) returns errStalePlan, and the pass is
+// replanned from fresh input instead.
 func (r *ModelDeploymentReconciler) updateStatus(
 	ctx context.Context,
 	md *inferencev1alpha1.ModelDeployment,
 	obs observed,
 ) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var latest inferencev1alpha1.ModelDeployment
-		if err := r.Get(ctx, client.ObjectKeyFromObject(md), &latest); err != nil {
-			return client.IgnoreNotFound(err)
-		}
+	var latest inferencev1alpha1.ModelDeployment
+	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(md), &latest); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if latest.ResourceVersion != md.ResourceVersion {
+		return errStalePlan
+	}
 
-		// Read BEFORE computeStatus, not after. computeStatus copies the
-		// condition slice so this is no longer load-bearing, but reading a
-		// "before" value after the call that computes the "after" one is the
-		// shape of the bug rather than a detail of it — the ordering is the
-		// thing that makes the transition detectable.
-		wasReady := isConditionTrue(latest.Status.Conditions, inferencev1alpha1.ConditionReady)
+	// Read BEFORE computeStatus, not after. computeStatus copies the
+	// condition slice so this is no longer load-bearing, but reading a
+	// "before" value after the call that computes the "after" one is the
+	// shape of the bug rather than a detail of it — the ordering is the
+	// thing that makes the transition detectable.
+	wasReady := isConditionTrue(latest.Status.Conditions, inferencev1alpha1.ConditionReady)
 
-		newStatus := computeStatus(&latest, obs, latest.Status)
-		if apiequality.Semantic.DeepEqual(latest.Status, newStatus) {
-			return nil
-		}
-
-		nowReady := isConditionTrue(newStatus.Conditions, inferencev1alpha1.ConditionReady)
-
-		latest.Status = newStatus
-		if err := r.Status().Update(ctx, &latest); err != nil {
-			return err
-		}
-
-		if !wasReady && nowReady {
-			r.event(md, corev1.EventTypeNormal, inferencev1alpha1.EventReasonRolloutComplete,
-				"Rollout", fmt.Sprintf("Revision %s is serving", obs.Revision))
-		}
+	newStatus := computeStatus(&latest, obs, latest.Status)
+	if apiequality.Semantic.DeepEqual(latest.Status, newStatus) {
 		return nil
-	})
+	}
+
+	nowReady := isConditionTrue(newStatus.Conditions, inferencev1alpha1.ConditionReady)
+
+	latest.Status = newStatus
+	if err := r.Status().Update(ctx, &latest); err != nil {
+		if apierrors.IsConflict(err) {
+			return errStalePlan
+		}
+		return err
+	}
+
+	if !wasReady && nowReady {
+		r.event(md, corev1.EventTypeNormal, inferencev1alpha1.EventReasonRolloutComplete,
+			"Rollout", fmt.Sprintf("Revision %s is serving", obs.Revision))
+	}
+	return nil
+}
+
+// errStalePlan reports that the ModelDeployment changed after this pass read
+// it, so the status the pass computed must not be written.
+var errStalePlan = errors.New("ModelDeployment changed after this pass read it")
+
+// staleRequeue is how soon a pass that planned from a stale object is redone.
+// Short, because the change that made it stale is usually this controller's
+// own status write, and the next read will already see it.
+const staleRequeue = 250 * time.Millisecond
+
+// reader returns the uncached reader for the ModelDeployment. See APIReader.
+func (r *ModelDeploymentReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // failTerminally records an unusable spec and stops retrying.

@@ -17,7 +17,7 @@ COPY go.mod go.mod
 COPY go.sum go.sum
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 # Copy the Go source (relies on .dockerignore to filter)
 COPY . .
@@ -27,7 +27,19 @@ COPY . .
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+#
+# Cache mounts, and no `-a`, in all four Go Dockerfiles. `go build -a` forced a
+# full recompile of every Kubernetes dependency, and with no cache mount the
+# resulting build cache was baked into an image layer: every source change left
+# four fresh multi-GB layers in BuildKit's cache, one per image. On a laptop
+# whose Docker disk had no limit of its own, that grew until the HOST disk was
+# full and Docker's store started failing with I/O errors. The mounts below are
+# shared by id (their target path) across this file, Dockerfile.shim,
+# Dockerfile.fakeengine and Dockerfile.loadgen, so modules are downloaded and
+# dependencies compiled once, and image layers carry only the binary.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details

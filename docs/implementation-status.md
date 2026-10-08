@@ -45,6 +45,40 @@ host access. Those cluster-only evidence items remain open rather than being rep
 by mock dashboard values. The nightly workflow now contains the live lanes, but it is
 not evidence until GitHub Actions has executed it successfully.
 
+## 2026-10-08 nightly lane: root causes and live Kind evidence
+
+`e2e-monitoring.yml` had failed every scheduled run since it was added. Each
+suite hid the next, because the canary step runs under `set -e`; running them
+one by one on Kind found these faults:
+
+| Where | Fault | Fix |
+|---|---|---|
+| 03 | Never changed the spec, so no canary could start (a first revision is not canaried) | Ship a healthy new revision before asserting `Canarying` |
+| 09 | Guarded on `kubectl config current-context`, which is always `chainsaw` inside Chainsaw | Context check in the Makefile; node `providerID` check in the suite |
+| 08 | `length(null)` on cleared checks is a JMESPath type error, which Chainsaw does not retry | Empty-list fallback inside `length()`; guarded by `TestChainsawExpressionsAreNullSafe` |
+| 04, 07 | `failedRevision != ''` is true when status.canary is absent, so it could pass vacuously | Also exclude `null` |
+| controller | A canary rollback was reported as `RolloutStalled`; `CanaryRolledBack` never fired | `StallReverted` keys the stall event |
+| controller | After a rollback the phase stayed `Progressing` forever | Converged rollback reports `Progressing=False/RevisionRejected`, phase `Available` |
+| controller | The pass after a rollback planned from a stale cache read, recreated the canary, and its conflict retry overwrote the rollback | Uncached `APIReader` read; `updateStatus` refuses a stale plan |
+| analysis | `error-rate` matched no series for a variant with zero 5xx, so a healthy canary was Inconclusive forever | Traffic-tied zero: `(5xx or 0 * total) / total` |
+
+Every new unit/envtest guard was checked by reintroducing the bug it catches.
+Local Kind (Docker 8 GiB / 6 CPU), each job's steps run verbatim from the workflow
+(the canary suites in one `set -e` pass, final code):
+
+```text
+09-observability-resync   PASS (612s)
+03-canary-promote         PASS (181s)
+04-canary-rollback        PASS (89s)
+07-metric-isolation       PASS (138s)
+08-canary-ladder          PASS (151s)
+make verify-ttft          PASS (ttft_p95/duration_p95 = 0.200 < 0.50)
+make verify               PASS (0 lint issues, every package)
+```
+
+Not yet evidence: a green GitHub Actions run of the workflow, which needs these
+changes pushed.
+
 ## PR-04 revision/configuration safety
 
 The hardening now:

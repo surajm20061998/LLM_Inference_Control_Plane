@@ -244,6 +244,58 @@ func TestChainsawExpressionKeysAreFullyParenthesized(t *testing.T) {
 	t.Logf("checked %d expression-shaped keys", checked)
 }
 
+// TestChainsawExpressionsAreNullSafe guards two ways a JMESPath key can stop
+// meaning what it says when the field it reads is ABSENT — which status fields
+// routinely are, between the moments the controller fills them in.
+//
+// length() on null is a type error, not a mismatch, and Chainsaw treats an
+// evaluation error as fatal instead of polling. The canary clears
+// status.canary.checks on every rung change, so
+//
+//	(checks[?verdict == 'Pass'] | length(@)): 1
+//
+// failed the ladder suite the instant it caught the rung boundary. Give
+// length() an empty-list fallback:
+//
+//	(length(checks[?verdict == 'Pass'] || `[]`)): 1
+//
+// And x != ” is TRUE when x is null (JMESPath compares across types as
+// unequal), so (canary.failedRevision != ”): true passed with no canary
+// status at all — proving nothing about a rejection. Exclude null too.
+func TestChainsawExpressionsAreNullSafe(t *testing.T) {
+	t.Parallel()
+
+	checked := 0
+	for _, suite := range chainsawFiles(t) {
+		var doc any
+		if err := yaml.Unmarshal(suite.body, &doc); err != nil {
+			t.Fatalf("%s: %v", suite.path, err)
+		}
+
+		for _, key := range mapKeys(doc) {
+			if strings.Contains(key, "length(") {
+				checked++
+				if !strings.Contains(key, "|| `[]`") {
+					t.Errorf("%s: %q calls length() with no `[]` fallback; on an absent field that is a "+
+						"type error Chainsaw does not retry. Write length(x || `[]`).", suite.path, key)
+				}
+			}
+			if strings.Contains(key, "!= ''") {
+				checked++
+				if !strings.Contains(key, "!= null") {
+					t.Errorf("%s: %q is true when the field is absent (null != ''); "+
+						"add `x != null &&` so the assertion cannot pass vacuously.", suite.path, key)
+				}
+			}
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("no length() or != '' keys were found; either the suites have none or the scan is broken")
+	}
+	t.Logf("checked %d null-sensitive keys", checked)
+}
+
 // Mirrors the decorations Chainsaw's expression parser strips before it decides
 // whether what is left is a parenthesised expression.
 var (

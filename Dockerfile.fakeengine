@@ -13,13 +13,15 @@ WORKDIR /workspace
 # source changes.
 COPY go.mod go.mod
 COPY go.sum go.sum
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 # Copy the Go source (relies on .dockerignore to filter)
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -a -o /out/fakeengine ./cmd/fakeengine
+# Cache mounts, no `-a`: see the note in ./Dockerfile.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o /out/fakeengine ./cmd/fakeengine
 
 # Distroless static: no shell, no package manager, nonroot by default.
 FROM gcr.io/distroless/static:nonroot

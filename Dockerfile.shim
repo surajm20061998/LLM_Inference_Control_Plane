@@ -8,22 +8,28 @@ FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
-# VERSION is stamped into the llmcp_shim_info gauge, which is how a running
-# fleet can be checked for version skew between the shim and the controller
-# that queries the metrics it emits.
-ARG VERSION=dev
-
 WORKDIR /workspace
 
 # Module manifests first, so the dependency layer survives source changes.
 COPY go.mod go.mod
 COPY go.sum go.sum
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -a -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/shim ./cmd/shim
+# VERSION is stamped into the llmcp_shim_info gauge, which is how a running
+# fleet can be checked for version skew between the shim and the controller
+# that queries the metrics it emits.
+#
+# Declared HERE, after the module download: a build arg is part of the
+# environment of every RUN that follows it, and the Makefile passes the git
+# SHA, so declaring it above `go mod download` re-ran that step on every commit.
+ARG VERSION=dev
+
+# Cache mounts, no `-a`: see the note in ./Dockerfile.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/shim ./cmd/shim
 
 # Distroless static: no shell, no package manager, nonroot by default.
 #

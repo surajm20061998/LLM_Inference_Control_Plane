@@ -23,7 +23,8 @@ it and writes back.
 ## Running
 
 ```bash
-make e2e-up                           # cluster + stub images + operator
+make preflight                        # Docker memory, free disk, competing clusters
+make e2e-up                           # cluster + stub images + operator (runs preflight first)
 make loadgen-image monitoring-install # prerequisites for suites 03/04/07/08
 make e2e-chainsaw                     # all non-destructive suites
 make e2e-chainsaw SUITE=05-scale-subresource

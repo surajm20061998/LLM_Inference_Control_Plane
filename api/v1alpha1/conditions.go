@@ -143,6 +143,11 @@ const (
 	// ReasonRolloutComplete indicates every replica runs the target revision.
 	ReasonRolloutComplete = "RolloutComplete"
 
+	// ReasonRevisionRejected indicates the target revision was rolled back and
+	// every replica has converged on the last known-good revision instead.
+	// Nothing is in flight: the rejection holds until the spec changes.
+	ReasonRevisionRejected = "RevisionRejected"
+
 	// ReasonProgressDeadlineExceeded indicates a rollout stopped making
 	// progress within spec.rollout.progressDeadline.
 	ReasonProgressDeadlineExceeded = "ProgressDeadlineExceeded"

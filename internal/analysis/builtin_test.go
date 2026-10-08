@@ -65,8 +65,9 @@ func TestBuiltinQueriesAreGolden(t *testing.T) {
 		inferencev1alpha1.MetricRequestDurationP95: `histogram_quantile(0.95, sum by (le) ` +
 			`(rate(llmcp_inference_request_duration_seconds_bucket{namespace="team-a",model_deployment="chat",variant="canary"}[60s])))`,
 
-		inferencev1alpha1.MetricErrorRate: `sum(rate(llmcp_inference_requests_total` +
-			`{namespace="team-a",model_deployment="chat",variant="canary",code=~"5.."}[60s])) / ` +
+		inferencev1alpha1.MetricErrorRate: `(sum(rate(llmcp_inference_requests_total` +
+			`{namespace="team-a",model_deployment="chat",variant="canary",code=~"5.."}[60s])) or ` +
+			`0 * sum(rate(llmcp_inference_requests_total{namespace="team-a",model_deployment="chat",variant="canary"}[60s]))) / ` +
 			`clamp_min(sum(rate(llmcp_inference_requests_total{namespace="team-a",model_deployment="chat",variant="canary"}[60s])), 1e-9)`,
 
 		inferencev1alpha1.MetricQueueDepth: `avg(avg_over_time(llmcp_inference_queue_depth` +
@@ -108,6 +109,30 @@ func TestEveryRatioClampsItsDenominator(t *testing.T) {
 		if strings.Contains(got, "/") && !strings.Contains(got, "clamp_min") {
 			t.Errorf("%s divides without clamping its denominator: %s", b, got)
 		}
+	}
+}
+
+func TestErrorRateMeasuresZeroErrorsAsZero(t *testing.T) {
+	t.Parallel()
+
+	// A variant that has served no 5xx has no code=~"5.." series at all, so a
+	// bare numerator is an EMPTY vector and the whole ratio matches no series:
+	// a healthy canary is Inconclusive forever and never promotes. This was
+	// found on a live cluster, where every round for a clean canary reported
+	// "the query matched no series".
+	//
+	// The zero must be tied to traffic (0 * the request rate), never a bare
+	// vector(0): with no requests at all the result has to stay empty, or the
+	// absence of a measurement would score as a perfect error rate.
+	got, err := Query(builtin(inferencev1alpha1.MetricErrorRate), canaryCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, ` or 0 * sum(rate(llmcp_inference_requests_total{`) {
+		t.Errorf("error-rate has no traffic-tied zero fallback for its 5xx numerator: %s", got)
+	}
+	if strings.Contains(got, "vector(0)") {
+		t.Errorf("error-rate falls back to a bare vector(0), which scores no traffic as no errors: %s", got)
 	}
 }
 
